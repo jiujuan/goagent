@@ -8,9 +8,10 @@ import (
 
 // Adapt turns a subscriber channel into a pull-style iter.Seq2 — the bridge
 // that preserves v1's `for ev, err := range stream` ergonomics on top of v2's
-// push bus (ADR 0023). It ends the stream on the terminal events: RunFailed
-// yields its error, RunDone yields then stops. Run.Iter() will wrap this over
-// its own subscription.
+// push bus (ADR 0023). It ends the stream on any terminal event: RunFailed
+// yields its error then stops; RunDone (success) and Interrupted (paused,
+// awaiting Resume) yield then stop. Run.Iter() will wrap this over its own
+// subscription.
 //
 // Adapt does not own the channel's lifecycle: the caller that obtained ch from
 // Subscribe is responsible for calling cancel (see Iter for the owned variant).
@@ -24,7 +25,8 @@ func Adapt(ch <-chan event.Event) iter.Seq2[event.Event, error] {
 			if !yield(ev, nil) {
 				return
 			}
-			if _, ok := ev.(event.RunDone); ok {
+			switch ev.(type) {
+			case event.RunDone, event.Interrupted:
 				return
 			}
 		}
