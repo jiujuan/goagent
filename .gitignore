@@ -1,0 +1,39 @@
+# 忽略编译出的二进制文件 (Go 默认产物和插件)
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 忽略 go test -c 生成的测试二进制文件
+*.test
+
+# 忽略 go cover 覆盖率分析文件
+*.out
+*.prof
+*.cgo1.go
+*.cgo2.c
+_cgo_gotypes.go
+_cgo_export.c
+_cgo_export.h
+
+# 忽略 IDE 和编辑器生成的配置文件
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.claude
+
+docs/
+README.md
+
+# 忽略本地开发环境和凭证文件
+.env
+secret.json
+config.local.yaml
+
+# 忽略打包及构建目录
+dist/
+build/
+bin/
