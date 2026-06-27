@@ -79,3 +79,51 @@ func TestEnqueueAgentBackgroundRun(t *testing.T) {
 		t.Fatalf("background result = %q", res.Message.Text())
 	}
 }
+
+func TestRegistryHandlerForSerializableJob(t *testing.T) {
+	// A Type+Payload job (the shape Redis uses) is run by the pool's Registry.
+	got := make(chan string, 1)
+	q := scheduler.NewMemQueue(4)
+	_ = q.Enqueue(context.Background(), scheduler.Job{
+		ID: "j1", Type: "echo", Payload: []byte("hello"),
+	})
+	q.Close()
+
+	pool := scheduler.NewPool(q, 1).WithRegistry(scheduler.Registry{
+		"echo": func(_ context.Context, payload []byte) error {
+			got <- string(payload)
+			return nil
+		},
+	})
+	go pool.Run(context.Background())
+
+	select {
+	case v := <-got:
+		if v != "hello" {
+			t.Fatalf("handler got %q, want hello", v)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler not invoked")
+	}
+}
+
+func TestNewInProcessBackend(t *testing.T) {
+	q, c, err := scheduler.New() // no WithRedis -> MemQueue
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	_ = q.Enqueue(context.Background(), scheduler.Job{Run: func(context.Context) error {
+		close(done)
+		return nil
+	}})
+	if mq, ok := c.(*scheduler.MemQueue); ok {
+		mq.Close()
+	}
+	go scheduler.NewPool(c, 1).Run(context.Background())
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-process job not run")
+	}
+}
