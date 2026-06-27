@@ -43,7 +43,7 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 		rc.publish(core.ToolDone{Result: tr})
 	}
 
-	if l.spec.Loop.ToolExecution == Sequential {
+	if l.toolExec == Sequential {
 		for i := range calls {
 			rc.publish(core.ToolStarted{Call: calls[i]})
 			run(i, calls[i])

@@ -1,37 +1,41 @@
-package runtime
+package agent
 
 import (
 	"context"
 	"iter"
 	"sync"
 
-	"github.com/jiujuan/goagent/agent"
 	"github.com/jiujuan/goagent/bus"
 	"github.com/jiujuan/goagent/core"
 )
 
-// Run is a non-blocking handle to one in-flight (or pending) agent run. The
-// loop is driven lazily on first observation, so subscribing via Iter/Events
-// before driving means no events are missed.
+// Run is a non-blocking handle to one in-flight (or paused) run. The loop is
+// driven lazily on first observation, so subscribing via Iter/Events before
+// driving means no events are missed.
 //
-// Usage is single-consumer: stream with Iter() (which also records the terminal
-// result for Wait), or call Wait() for just the result. Mixing both works but
-// prefer Iter() first.
+// Stream with Iter() (which also records the terminal result for Wait), or call
+// Wait() for just the result. On an Interrupted (HITL) pause, record decisions
+// with Decide(...) then call Resume(ctx) to continue.
 type Run struct {
 	ID       string
 	ThreadID string
 
+	agent    *Agent
 	bus      *bus.Bus
 	topic    bus.Topic
-	rc       *agent.RunContext
-	compiled agent.Runnable
+	rc       *RunContext
+	runnable Runnable
 	cancel   context.CancelFunc
+	startErr error
 
 	startOnce sync.Once
 	doneOnce  sync.Once
 	done      chan struct{}
 	result    core.Result
 	err       error
+
+	mu        sync.Mutex
+	decisions []Approval
 }
 
 // Iter streams the run's events as a pull iterator. The run starts on first
@@ -51,9 +55,8 @@ func (r *Run) Iter() iter.Seq2[core.Event, error] {
 	}
 }
 
-// Events returns a raw subscription channel and a cancel func, for callers that
-// want a specific DeliveryMode (e.g. Lossy for a UI). It does not start the run;
-// call Iter or Wait, or drive() indirectly, to begin.
+// Events returns a raw subscription channel and cancel func for a chosen
+// DeliveryMode (e.g. Lossy for a UI). Call Iter or Wait to begin driving.
 func (r *Run) Events(mode bus.DeliveryMode) (<-chan core.Event, func()) {
 	return r.bus.Subscribe(r.topic, mode)
 }
@@ -94,7 +97,13 @@ func (r *Run) Cancel() { r.cancel() }
 // drive launches the loop exactly once.
 func (r *Run) drive() {
 	r.startOnce.Do(func() {
-		go agent.Drive(r.rc, r.compiled)
+		go func() {
+			if r.startErr != nil {
+				r.bus.Publish(r.topic, core.RunFailed{Err: r.startErr})
+				return
+			}
+			r.runnable.run(r.rc)
+		}()
 	})
 }
 

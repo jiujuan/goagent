@@ -15,30 +15,36 @@ var ErrMaxStepsExceeded = errors.New("agent: loop exceeded MaxSteps")
 
 const defaultMaxSteps = 16
 
-// AgentLoop is v2's controllable loop, an explicit phase machine. One step =
-// PrepareTurn (drain steering, BeforeModel) → CallModel (ModifyRequest, stream,
-// AfterModel) → ExecuteTools (BeforeTool gate, run, AfterTool) → Checkpoint →
-// ApplyDirectives. Each phase publishes observational events to the run's Bus.
+// AgentLoop is the runtime's controllable loop, an explicit phase machine. One
+// step = PrepareTurn (drain steering, BeforeModel) → CallModel (ModifyRequest,
+// stream, AfterModel) → ExecuteTools (BeforeTool gate, run, AfterTool) →
+// Checkpoint → ApplyDirectives. Each phase publishes observational events to
+// the run's Bus. It is built from a config by newLoop and holds no Spec.
 type AgentLoop struct {
-	spec     Spec
-	mw       *Stack
-	byName   map[string]tool.Tool
-	schemas  []llm.ToolSchema
-	maxSteps int
+	model       llm.Model
+	instruction string
+	modelOpts   []llm.Option
+	toolExec    ToolExecMode
+	mw          *Stack
+	byName      map[string]tool.Tool
+	schemas     []llm.ToolSchema
+	maxSteps    int
 }
 
-func newLoop(spec Spec) *AgentLoop {
-	ms := spec.Loop.MaxSteps
+func newLoop(c config) *AgentLoop {
+	ms := c.maxSteps
 	if ms <= 0 {
 		ms = defaultMaxSteps
 	}
-	byName, schemas := spec.compileTools()
 	return &AgentLoop{
-		spec:     spec,
-		mw:       NewStack(spec.Middleware...),
-		byName:   byName,
-		schemas:  schemas,
-		maxSteps: ms,
+		model:       c.model,
+		instruction: c.instruction,
+		modelOpts:   c.modelOpts,
+		toolExec:    c.toolExec,
+		mw:          NewStack(c.middleware...),
+		byName:      tool.ByName(c.tools),
+		schemas:     tool.Schemas(c.tools),
+		maxSteps:    ms,
 	}
 }
 
@@ -48,7 +54,6 @@ func (l *AgentLoop) run(rc *RunContext) {
 	rc.publish(core.RunStarted{RunID: rc.RunID, ThreadID: rc.ThreadID})
 
 	history := append([]core.Message(nil), rc.State.Messages...)
-	system := l.spec.Instruction
 
 	for step := 0; step < l.maxSteps; step++ {
 		lc := &LoopContext{RunContext: rc, Step: step, History: history}
@@ -67,8 +72,8 @@ func (l *AgentLoop) run(rc *RunContext) {
 		}
 
 		// Phase 2 — CallModel: ModifyRequest → stream → AfterModel.
-		req := &llm.Request{System: system, Messages: history, Tools: l.schemas}
-		req.Options.Apply(l.spec.ModelOptions...)
+		req := &llm.Request{System: l.instruction, Messages: history, Tools: l.schemas}
+		req.Options.Apply(l.modelOpts...)
 		lc.Request = req
 		if err := l.mw.ModifyRequest(lc, req); err != nil {
 			rc.publish(core.RunFailed{Err: err})
@@ -106,6 +111,9 @@ func (l *AgentLoop) run(rc *RunContext) {
 				return
 			}
 			if d.Kind == core.Interrupt {
+				// Persist history including the assistant tool-call message, plus
+				// the still-pending calls, so Resume can apply approvals.
+				rc.State.Messages = history
 				l.checkpoint(rc, step, &checkpoint.PendingHITL{Step: step, Pending: calls[i:]})
 				rc.publish(core.Interrupted{Pending: pendingFrom(calls[i:])})
 				return
@@ -152,7 +160,7 @@ func (l *AgentLoop) handleTerminal(rc *RunContext, d core.Directive) bool {
 // MessageDone for the final message. The bool is false if the model errored.
 func (l *AgentLoop) streamModel(rc *RunContext, lc *LoopContext, req *llm.Request) (core.Message, bool) {
 	var final core.Message
-	for resp, err := range l.spec.Model.Generate(rc, req) {
+	for resp, err := range l.model.Generate(rc, req) {
 		if err != nil {
 			_, _ = l.mw.OnError(lc, err) // retry middleware consulted; real retry lands later
 			rc.publish(core.RunFailed{Err: err})
@@ -168,8 +176,8 @@ func (l *AgentLoop) streamModel(rc *RunContext, lc *LoopContext, req *llm.Reques
 	return final, true
 }
 
-// checkpoint snapshots the current State for resume/branch/time-travel. A
-// nil Store (e.g. in a lightweight test) is a no-op.
+// checkpoint snapshots the current State for resume/branch/time-travel. A nil
+// Store is a no-op.
 func (l *AgentLoop) checkpoint(rc *RunContext, step int, pending *checkpoint.PendingHITL) {
 	if rc.Store == nil {
 		return
