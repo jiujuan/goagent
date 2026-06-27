@@ -4,6 +4,7 @@ import (
 	"github.com/jiujuan/goagent/bus"
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/llm"
+	"github.com/jiujuan/goagent/prompt"
 	"github.com/jiujuan/goagent/tool"
 )
 
@@ -14,6 +15,7 @@ type config struct {
 	name        string
 	description string
 	instruction string
+	prompt      *prompt.Builder
 	model       llm.Model
 	tools       []tool.Tool
 	middleware  []Middleware
@@ -49,6 +51,11 @@ func WithDescription(s string) Option { return func(c *config) { c.description =
 
 // WithInstruction sets the system prompt.
 func WithInstruction(s string) Option { return func(c *config) { c.instruction = s } }
+
+// WithPrompt builds the system prompt from composable prompt.Sections (Identity,
+// Environment, ToolGuidance, SessionState, custom). It is rendered once per run
+// and takes precedence over WithInstruction.
+func WithPrompt(b *prompt.Builder) Option { return func(c *config) { c.prompt = b } }
 
 // WithTools adds tools (additive across calls).
 func WithTools(ts ...tool.Tool) Option {

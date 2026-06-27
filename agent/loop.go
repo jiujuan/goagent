@@ -6,6 +6,7 @@ import (
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/llm"
+	"github.com/jiujuan/goagent/prompt"
 	"github.com/jiujuan/goagent/tool"
 )
 
@@ -23,10 +24,14 @@ const defaultMaxTurns = 16
 type AgentLoop struct {
 	model       llm.Model
 	instruction string
+	prompt      *prompt.Builder
+	name        string
+	description string
 	outputKey   string
 	modelOpts   []llm.Option
 	toolExec    ToolExecMode
 	mw          *Stack
+	tools       []tool.Tool
 	byName      map[string]tool.Tool
 	schemas     []llm.ToolSchema
 	maxTurns    int
@@ -40,10 +45,14 @@ func newLoop(c config) *AgentLoop {
 	return &AgentLoop{
 		model:       c.model,
 		instruction: c.instruction,
+		prompt:      c.prompt,
+		name:        c.name,
+		description: c.description,
 		outputKey:   c.outputKey,
 		modelOpts:   c.modelOpts,
 		toolExec:    c.toolExec,
 		mw:          NewStack(c.middleware...),
+		tools:       c.tools,
 		byName:      tool.ByName(c.tools),
 		schemas:     tool.Schemas(c.tools),
 		maxTurns:    ms,
@@ -66,6 +75,24 @@ func (l *AgentLoop) addTool(t tool.Tool) {
 func (l *AgentLoop) run(rc *RunContext) runOutcome {
 	history := append([]core.Message(nil), rc.State.Messages...)
 
+	// Render the system prompt once per run: a prompt.Builder (if set) wins over
+	// the static instruction. The builder sees the tools, state and identity.
+	usePrompt := l.prompt != nil
+	system := l.instruction
+	if usePrompt {
+		s, err := l.prompt.Build(prompt.Context{
+			Context:   rc,
+			State:     rc.State,
+			AgentName: l.name,
+			AgentDesc: l.description,
+			Tools:     l.tools,
+		})
+		if err != nil {
+			return runOutcome{Err: err}
+		}
+		system = s
+	}
+
 	for step := 0; step < l.maxTurns; step++ {
 		lc := &LoopContext{RunContext: rc, Step: step, History: history}
 		rc.publish(core.TurnStarted{Step: step})
@@ -82,7 +109,11 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		}
 
 		// Phase 2 — CallModel: ModifyRequest → stream → AfterModel.
-		req := &llm.Request{System: renderTemplate(l.instruction, rc.State.KV), Messages: history, Tools: l.schemas}
+		sys := system
+		if !usePrompt {
+			sys = renderTemplate(l.instruction, rc.State.KV)
+		}
+		req := &llm.Request{System: sys, Messages: history, Tools: l.schemas}
 		req.Options.Apply(l.modelOpts...)
 		lc.Request = req
 		if err := l.mw.ModifyRequest(lc, req); err != nil {
