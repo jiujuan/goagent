@@ -63,19 +63,26 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 	}
 	// Stash decisions in a generic State slot so non-LLM runnables (the DAG plan
 	// executor) can consume them too; the LLM path below still uses applyApprovals.
+	// Merge into any existing decisions so per-node approvals accumulate across
+	// multiple pause/resume waves.
 	if len(approvals) > 0 {
 		if state.KV == nil {
 			state.KV = map[string]any{}
 		}
-		m := map[string]any{}
-		for _, ap := range approvals {
-			if ap.Approve {
-				m[ap.CallID] = "allow"
-			} else {
-				m[ap.CallID] = "reject"
+		merged := map[string]any{}
+		if old, ok := state.KV[approvalsKey].(map[string]any); ok {
+			for k, v := range old {
+				merged[k] = v
 			}
 		}
-		state.KV[approvalsKey] = m
+		for _, ap := range approvals {
+			if ap.Approve {
+				merged[ap.CallID] = "allow"
+			} else {
+				merged[ap.CallID] = "reject"
+			}
+		}
+		state.KV[approvalsKey] = merged
 	}
 	run := a.newRunHandle(ctx, threadID, &state)
 

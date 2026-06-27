@@ -35,6 +35,10 @@ type Node struct {
 	Worker *Agent
 	// DependsOn lists node IDs that must complete (done) before this node runs.
 	DependsOn []string
+	// Approve requires a human decision before this node runs (per-node HITL):
+	// the plan pauses (Interrupted) with this node in Pending; approve/reject via
+	// Run.Decide + Run.Resume. Independent branches keep running while it waits.
+	Approve bool
 	// MaxRetries re-runs the node on failure up to this many times.
 	MaxRetries int
 }
@@ -180,15 +184,34 @@ func (p *planRunner) run(rc *RunContext) runOutcome {
 	var failFastErr error
 
 	for {
-		// Launch every ready node up to the concurrency cap.
+		// Launch every ready node up to the concurrency cap. A node marked
+		// Approve waits for a human decision before it runs: allow → launch,
+		// reject → drop it (cascades to its dependents), undecided → collect it
+		// and pause once no other work is in flight.
+		var awaiting []core.ApprovalRequest
 		for _, id := range p.order {
 			if failFastErr != nil || inflight >= p.cfg.concurrency {
 				break
 			}
-			if st.Status[id] != "pending" || !depsDone(st, p.nodes[id]) {
+			node := p.nodes[id]
+			if st.Status[id] != "pending" || !depsDone(st, node) {
 				continue
 			}
-			node := p.nodes[id]
+			if node.Approve {
+				switch approvalFor(rc.State, id) {
+				case "allow":
+					// approved → fall through to launch
+				case "reject":
+					st.Status[id] = "rejected"
+					rc.publish(core.PlanNodeDone{NodeID: id, Status: "rejected"})
+					continue
+				default:
+					awaiting = append(awaiting, core.ApprovalRequest{
+						CallID: id, Tool: "approve_node", Args: []byte(node.Task),
+					})
+					continue
+				}
+			}
 			input := renderTemplate(node.Task, rc.State.KV)
 			st.Status[id] = "running"
 			inflight++
@@ -203,8 +226,13 @@ func (p *planRunner) run(rc *RunContext) runOutcome {
 			if failFastErr != nil {
 				return runOutcome{Err: failFastErr}
 			}
+			if len(awaiting) > 0 {
+				// Pause for per-node approval (independent branches have drained).
+				p.save(rc, st, step)
+				return runOutcome{Control: core.Directive{Kind: core.Interrupt}, Pending: awaiting}
+			}
 			if p.skipBlocked(st, rc) {
-				continue // cascade-skip nodes blocked by failed/skipped deps
+				continue // cascade-skip nodes blocked by failed/skipped/rejected deps
 			}
 			break // every node is terminal
 		}
@@ -278,7 +306,7 @@ func (p *planRunner) skipBlocked(st *planState, rc *RunContext) bool {
 			continue
 		}
 		for _, d := range p.nodes[id].DependsOn {
-			if s := st.Status[d]; s == "failed" || s == "skipped" {
+			if s := st.Status[d]; s == "failed" || s == "skipped" || s == "rejected" {
 				st.Status[id] = "skipped"
 				rc.publish(core.PlanNodeDone{NodeID: id, Status: "skipped"})
 				changed = true
