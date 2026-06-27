@@ -22,6 +22,11 @@ type config struct {
 	toolExec    ToolExecMode
 	modelOpts   []llm.Option
 
+	// delegation toggles (see transfer.go)
+	noTransfer       bool
+	noTransferParent bool
+	noTransferPeers  bool
+
 	// Execution-environment infrastructure. Each defaults to a fresh instance;
 	// inject shared ones (e.g. across a multi-agent run) via WithBus /
 	// WithCheckpointer.
@@ -55,10 +60,15 @@ func WithMiddleware(mw ...Middleware) Option {
 }
 
 // WithSubAgents registers delegation targets (additive). Sub-agents are full
-// *Agent values; transfer/workflow wiring lands in a later stage.
+// *Agent values; the model can hand off to them via the auto-injected
+// transfer_to_agent tool.
 func WithSubAgents(subs ...*Agent) Option {
 	return func(c *config) { c.subAgents = append(c.subAgents, subs...) }
 }
+
+// WithoutTransfer disables the auto-injected transfer_to_agent tool even when
+// sub-agents are configured.
+func WithoutTransfer() Option { return func(c *config) { c.noTransfer = true } }
 
 // WithMaxSteps caps the model<->tool loop (default 16).
 func WithMaxSteps(n int) Option { return func(c *config) { c.maxSteps = n } }

@@ -24,6 +24,8 @@ import (
 // (non-blocking, returns a *Run for live events and control).
 type Agent struct {
 	cfg      config
+	loop     *AgentLoop // the LLM loop (nil for workflow agents)
+	parent   *Agent     // set when this agent is a sub-agent of another
 	runnable Runnable
 	bus      *bus.Bus
 	store    checkpoint.Checkpointer
@@ -45,7 +47,16 @@ func New(opts ...Option) (*Agent, error) {
 		c.store = checkpoint.NewMemory()
 	}
 	a := &Agent{cfg: c, bus: c.bus, store: c.store}
-	a.runnable = newLoop(c)
+	a.loop = newLoop(c)
+	a.runnable = &llmRunner{agent: a, loop: a.loop}
+	// Wire the delegation tree: become the parent of each sub-agent, then
+	// advertise the transfer tool for the resolved targets.
+	for _, s := range c.subAgents {
+		s.parent = a
+	}
+	if tt := transferToolFor(a.transferTargets()); tt != nil {
+		a.loop.addTool(tt)
+	}
 	return a, nil
 }
 

@@ -27,7 +27,26 @@ type RunContext struct {
 	State    *core.State
 	branch   string // set for a parallel sub-branch (isolation label)
 
+	transferDepth int // delegation chain depth, bounded in transfer.go
+
 	steering steeringQueue
+}
+
+// deeper returns a child execution environment one delegation level down,
+// sharing the same State (so the delegate continues the conversation) and
+// Bus/Topic/Store. A fresh steering queue is intentional.
+func (rc *RunContext) deeper() *RunContext {
+	return &RunContext{
+		Context:       rc.Context,
+		RunID:         rc.RunID,
+		ThreadID:      rc.ThreadID,
+		Bus:           rc.Bus,
+		Topic:         rc.Topic,
+		Store:         rc.Store,
+		State:         rc.State,
+		branch:        rc.branch,
+		transferDepth: rc.transferDepth + 1,
+	}
 }
 
 // forBranch derives a child execution environment for a parallel sub-agent: a

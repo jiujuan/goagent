@@ -50,6 +50,17 @@ func newLoop(c config) *AgentLoop {
 
 var _ Runnable = (*AgentLoop)(nil)
 
+// addTool registers an extra tool (e.g. the synthetic transfer_to_agent) after
+// construction, advertising it to the model.
+func (l *AgentLoop) addTool(t tool.Tool) {
+	l.byName[t.Name()] = t
+	l.schemas = append(l.schemas, llm.ToolSchema{
+		Name:        t.Name(),
+		Description: t.Description(),
+		Parameters:  t.Schema(),
+	})
+}
+
 func (l *AgentLoop) run(rc *RunContext) runOutcome {
 	history := append([]core.Message(nil), rc.State.Messages...)
 
