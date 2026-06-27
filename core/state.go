@@ -48,6 +48,8 @@ const (
 	OpSetKV StateOpKind = iota
 	// OpAddTodo appends Value (a Todo) to State.Todos.
 	OpAddTodo
+	// OpSetTodos replaces State.Todos with Value ([]Todo).
+	OpSetTodos
 )
 
 // Apply folds the given ops into the State in order.
@@ -62,6 +64,10 @@ func (s *State) Apply(ops ...StateOp) {
 		case OpAddTodo:
 			if t, ok := op.Value.(Todo); ok {
 				s.Todos = append(s.Todos, t)
+			}
+		case OpSetTodos:
+			if ts, ok := op.Value.([]Todo); ok {
+				s.Todos = ts
 			}
 		}
 	}
