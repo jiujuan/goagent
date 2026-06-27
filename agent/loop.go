@@ -119,12 +119,19 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 			if err != nil {
 				return runOutcome{Err: err}
 			}
-			if d.Kind == core.Interrupt {
+			switch d.Kind {
+			case core.Interrupt:
 				// Persist history (incl. the assistant tool-call message) plus the
 				// still-pending calls, so Resume can apply approvals.
 				rc.State.Messages = history
 				l.checkpoint(rc, step, &checkpoint.PendingHITL{Step: step, Pending: calls[i:]})
 				return runOutcome{Control: core.Directive{Kind: core.Interrupt}, Pending: pendingFrom(calls[i:])}
+			case core.Stop, core.Escalate, core.Transfer:
+				// A gate denied/redirected before any tool ran; end this unit with
+				// that control directive.
+				rc.State.Messages = history
+				l.checkpoint(rc, step, nil)
+				return runOutcome{Result: core.Result{Message: final}, Control: d}
 			}
 		}
 
