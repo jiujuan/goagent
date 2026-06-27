@@ -61,6 +61,22 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 	if state.Files == nil {
 		state.Files = vfs.NewInState()
 	}
+	// Stash decisions in a generic State slot so non-LLM runnables (the DAG plan
+	// executor) can consume them too; the LLM path below still uses applyApprovals.
+	if len(approvals) > 0 {
+		if state.KV == nil {
+			state.KV = map[string]any{}
+		}
+		m := map[string]any{}
+		for _, ap := range approvals {
+			if ap.Approve {
+				m[ap.CallID] = "allow"
+			} else {
+				m[ap.CallID] = "reject"
+			}
+		}
+		state.KV[approvalsKey] = m
+	}
 	run := a.newRunHandle(ctx, threadID, &state)
 
 	if cp.Pending != nil && len(cp.Pending.Pending) > 0 {

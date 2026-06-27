@@ -49,6 +49,26 @@ func (rc *RunContext) deeper() *RunContext {
 	}
 }
 
+// subRun derives an isolated child execution environment seeded with a single
+// input message (fresh State, shared Files / Bus / Topic / Store). Used by
+// AsTool and the DAG plan executor to run a unit on just its input, returning
+// only its final text — the parent's conversation is not shared.
+func (rc *RunContext) subRun(input core.Message) *RunContext {
+	st := &core.State{Messages: []core.Message{input}}
+	if rc.State != nil {
+		st.Files = rc.State.Files
+	}
+	return &RunContext{
+		Context:  rc.Context,
+		RunID:    rc.RunID,
+		ThreadID: rc.ThreadID,
+		Bus:      rc.Bus,
+		Topic:    rc.Topic,
+		Store:    rc.Store,
+		State:    st,
+	}
+}
+
 // forBranch derives a child execution environment for a parallel sub-agent: a
 // cloned State (so concurrent branches don't race), but the same Bus/Topic/Store
 // (so events merge into one observable stream and snapshots share a thread). A

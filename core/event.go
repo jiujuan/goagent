@@ -73,20 +73,33 @@ type Interrupted struct{ Pending []ApprovalRequest }
 // events (media generation, background work).
 type Progress struct{ Job ProgressInfo }
 
+// PlanNodeStarted is emitted when a DAG plan node begins executing.
+type PlanNodeStarted struct{ NodeID string }
+
+// PlanNodeDone is emitted when a DAG plan node settles. Status is
+// "done" | "failed" | "skipped" | "retry"; Err is set on failure/retry.
+type PlanNodeDone struct {
+	NodeID string
+	Status string
+	Err    error
+}
+
 // --- Marker -----------------------------------------------------------------
 
-func (RunStarted) isEvent()   {}
-func (RunDone) isEvent()      {}
-func (RunFailed) isEvent()    {}
-func (TurnStarted) isEvent()  {}
-func (TurnDone) isEvent()     {}
-func (MessageDelta) isEvent() {}
-func (MessageDone) isEvent()  {}
-func (ToolStarted) isEvent()  {}
-func (ToolUpdate) isEvent()   {}
-func (ToolDone) isEvent()     {}
-func (Interrupted) isEvent()  {}
-func (Progress) isEvent()     {}
+func (RunStarted) isEvent()      {}
+func (RunDone) isEvent()         {}
+func (RunFailed) isEvent()       {}
+func (TurnStarted) isEvent()     {}
+func (TurnDone) isEvent()        {}
+func (MessageDelta) isEvent()    {}
+func (MessageDone) isEvent()     {}
+func (ToolStarted) isEvent()     {}
+func (ToolUpdate) isEvent()      {}
+func (ToolDone) isEvent()        {}
+func (Interrupted) isEvent()     {}
+func (Progress) isEvent()        {}
+func (PlanNodeStarted) isEvent() {}
+func (PlanNodeDone) isEvent()    {}
 
 // --- Payload types ----------------------------------------------------------
 
