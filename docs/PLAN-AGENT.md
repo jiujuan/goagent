@@ -34,7 +34,8 @@ answer, _ := pa.Run(ctx, "向量数据库选型")
 |---|---|
 | 固定的串/并/循环管道 | `Sequential` / `Parallel` / `Loop` / `Pipeline` |
 | 开放式、LLM 自己决定下一步 | `write_todos`(软计划) |
-| **任意依赖(DAG)、并发、审批、可恢复、可自我重写** | **PlanAgent** |
+| **任意依赖(DAG)、并发、审批、可恢复、可自我重写** | **PlanAgent**(`NewPlan`) |
+| **给一句任务,让 LLM 自动拆成 DAG 并执行** | **PlanAgent**(`NewLLMPlan`,见 4.8) |
 
 ---
 
@@ -218,8 +219,10 @@ true,主循环 `continue` 再扫,直到稳定)。
 | `WithConcurrency(n)` | 并发上限 | 8 |
 | `WithErrorPolicy(p)` | `FailFast` / `ContinueOnError` | FailFast |
 | `WithFinalApproval()` | 整盘完成后审批一次 | 关 |
-| `WithReplanner(*Agent)` | 启用动态重规划 | 关 |
+| `WithReplanner(*Agent)` | 启用动态重规划(执行中扩展) | 关 |
 | `WithMaxReplanRounds(n)` | 重规划轮数上限 | 3 |
+| `WithPlanner(*Agent)` | 由 LLM 生成初始 DAG(见 4.8) | 关 |
+| `WithMaxPlanAttempts(n)` | 规划失败重试次数 | 3 |
 
 `Node` 字段:`ID / Task / Worker / DependsOn / Approve / MaxRetries`。
 
@@ -311,6 +314,32 @@ plan := agent.Plan{Nodes: []agent.Node{
 > 节点 Worker 是完整 `*Agent`,自带 tools / middleware / 子 agent —— 节点内可以是一个会用工具、
 > 会委派、会自我循环的复杂 agent。
 
+### 4.8 LLM 生成计划(`NewLLMPlan`)
+
+不手写 DAG,而是给一个 **planner** agent,让它把任务自动拆成 DAG:
+
+```go
+planner, _ := agent.New(agent.WithModel(model)) // 框架会补充"输出 JSON DAG"的指令
+worker, _  := agent.New(agent.WithModel(model))
+
+pa := agent.NewLLMPlan("auto", planner,
+    agent.WithWorker(worker),
+    agent.WithReplanner(planner),     // 可选:执行后再补步骤 → 全自动闭环
+)
+answer, _ := pa.Run(ctx, "把竞品 A/B/C 的定价做成对比报告")
+```
+
+**原理**:`NewLLMPlan` = 空静态计划 + `WithPlanner`。`run()` 起始多一个**规划相位**:跑 planner →
+解析 JSON `{nodes:[...]}` → 校验(环/坏依赖/重复 ID)→ 合并为动态节点 → 之后完全复用调度器。
+
+- 生成的计划进 `planState`(`Planned=true`),**可恢复**:resume 不重新规划。
+- planner 产坏 DAG 时,把错误回喂它**重试**(`WithMaxPlanAttempts`,默认 3);仍失败则 run 报错。
+- planner 输出 `{"nodes":[]}`(任务无需拆分)→ 执行器退化为**单节点**直接跑 worker on `{{input}}`。
+- 规划阶段发合成事件 `PlanNodeStarted/Done{"__planner__"}`(前端可显示"正在规划")。
+- 与 `WithReplanner` 组合 = **plan → execute → replan → execute** 全自动闭环。
+
+> 静态 `NewPlan` 与 `NewLLMPlan` 共用同一执行器;前者开发者写死 DAG,后者 LLM 生成 DAG。
+
 ---
 
 ## 五、参考表
@@ -336,6 +365,7 @@ plan := agent.Plan{Nodes: []agent.Node{
 | `input` | 计划原始输入(`{{input}}`) |
 | `<nodeID>` | 各节点输出(供 `{{nodeID}}`) |
 
+> 合成节点 ID:`__planner__`(LLM 初始规划)、`__replan__`(动态重规划)——只发事件,不进调度。
 > 节点 ID 勿用 `__` 前缀(保留),勿与上述键冲突。
 
 ---
@@ -356,6 +386,7 @@ plan := agent.Plan{Nodes: []agent.Node{
 | [examples/plan-dag](../examples/plan-dag) | 静态 DAG · 并发 · `{{id}}` 传值 · 最终审批 |
 | [examples/plan-approval](../examples/plan-approval) | 节点级审批 · 独立分支照跑 · 拒绝级联 · 多波恢复 |
 | [examples/plan-replan](../examples/plan-replan) | 动态重规划:执行→追加 synthesis→再执行 |
+| [examples/plan-llm](../examples/plan-llm) | LLM 生成初始 DAG(`NewLLMPlan`)+ 重规划全自动闭环 |
 
 设计取舍详见 [ADR 0024](adr/0024-clean-v2-layout.md);PlanAgent 三步实现见 git 历史
 (`feat(agent): DAG PlanAgent — Step 1/2/3`)。
