@@ -104,3 +104,18 @@ func newRedisClient(url string) (*redis.Client, error) {
 	}
 	return redis.NewClient(opt), nil
 }
+
+// NewBus builds the progress Bus for the same backend as New: an in-process
+// MemBus by default, or a Redis Pub/Sub bus with WithRedis(url). Taking the same
+// Options lets one WithRedis switch the queue and the bus together.
+func NewBus(opts ...Option) (Bus, error) {
+	c := apply(opts)
+	if c.redisURL == "" {
+		return NewMemBus(), nil
+	}
+	rdb, err := newRedisClient(c.redisURL)
+	if err != nil {
+		return nil, err
+	}
+	return newRedisBus(rdb), nil
+}
