@@ -147,7 +147,7 @@ func demoMiddleware(ctx context.Context, model llm.Model) {
 	a, _ := agent.New(
 		agent.WithModel(model),
 		agent.WithInstruction("你是一个助手。"),
-		agent.WithMiddleware(logMW{}, budgetMW{maxSteps: 3}),
+		agent.WithMiddleware(logMW{}, budgetMW{maxTurns: 3}),
 	)
 	answer, err := a.Run(ctx, "简短介绍一下 Go 语言的并发模型。")
 	if err != nil {
@@ -168,15 +168,15 @@ func (logMW) AfterTool(_ *agent.LoopContext, tr *core.ToolResult) (core.Directiv
 	return core.Directive{}, nil
 }
 
-// budgetMW:改逻辑(改控制流)—— 超过 maxSteps 就返回 Stop 结束运行。
+// budgetMW:改逻辑(改控制流)—— 超过 maxTurns 就返回 Stop 结束运行。
 type budgetMW struct {
 	agent.BaseMiddleware
-	maxSteps int
+	maxTurns int
 }
 
 func (m budgetMW) AfterModel(lc *agent.LoopContext, _ *llm.Response) (core.Directive, error) {
-	if lc.Step+1 >= m.maxSteps {
-		fmt.Printf("   [budget] 到达步数上限 %d,停止。\n", m.maxSteps)
+	if lc.Step+1 >= m.maxTurns {
+		fmt.Printf("   [budget] 到达轮数上限 %d,停止。\n", m.maxTurns)
 		return core.Directive{Kind: core.Stop}, nil
 	}
 	return core.Directive{}, nil

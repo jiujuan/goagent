@@ -9,11 +9,11 @@ import (
 	"github.com/jiujuan/goagent/tool"
 )
 
-// ErrMaxStepsExceeded is the terminal error when the loop runs MaxSteps without
+// ErrMaxTurnsExceeded is the terminal error when the loop runs MaxTurns without
 // the model producing a tool-call-free reply.
-var ErrMaxStepsExceeded = errors.New("agent: loop exceeded MaxSteps")
+var ErrMaxTurnsExceeded = errors.New("agent: loop exceeded MaxTurns")
 
-const defaultMaxSteps = 16
+const defaultMaxTurns = 16
 
 // AgentLoop is the runtime's controllable loop, an explicit phase machine. One
 // step = PrepareTurn (drain steering, BeforeModel) → CallModel (ModifyRequest,
@@ -29,13 +29,13 @@ type AgentLoop struct {
 	mw          *Stack
 	byName      map[string]tool.Tool
 	schemas     []llm.ToolSchema
-	maxSteps    int
+	maxTurns    int
 }
 
 func newLoop(c config) *AgentLoop {
-	ms := c.maxSteps
+	ms := c.maxTurns
 	if ms <= 0 {
-		ms = defaultMaxSteps
+		ms = defaultMaxTurns
 	}
 	return &AgentLoop{
 		model:       c.model,
@@ -46,7 +46,7 @@ func newLoop(c config) *AgentLoop {
 		mw:          NewStack(c.middleware...),
 		byName:      tool.ByName(c.tools),
 		schemas:     tool.Schemas(c.tools),
-		maxSteps:    ms,
+		maxTurns:    ms,
 	}
 }
 
@@ -66,7 +66,7 @@ func (l *AgentLoop) addTool(t tool.Tool) {
 func (l *AgentLoop) run(rc *RunContext) runOutcome {
 	history := append([]core.Message(nil), rc.State.Messages...)
 
-	for step := 0; step < l.maxSteps; step++ {
+	for step := 0; step < l.maxTurns; step++ {
 		lc := &LoopContext{RunContext: rc, Step: step, History: history}
 		rc.publish(core.TurnStarted{Step: step})
 
@@ -143,7 +143,7 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		}
 	}
 
-	return runOutcome{Err: ErrMaxStepsExceeded}
+	return runOutcome{Err: ErrMaxTurnsExceeded}
 }
 
 // terminalFromDirective turns a Before/AfterModel directive into a terminal

@@ -1,6 +1,7 @@
-// Command quickstart is the v2 minimal closed loop with the merged agent API:
-// agent.New(...options) → agent.Run(...). It uses the mock provider (no API key,
-// no network) so it runs deterministically.
+// Command quickstart is the offline smoke test: the v2 closed loop on the mock
+// provider (no API key, no network), so `go run ./examples/quickstart` always
+// works. For a copy-paste starter against a real model, see the sibling
+// quickstart-chat / quickstart-tool / quickstart-stream examples.
 //
 //	go run ./examples/quickstart
 package main
@@ -26,19 +27,21 @@ func main() {
 			return in.City + ": sunny, 25°C", nil
 		})
 
-	// A mock model that calls the tool once, then answers from its result.
+	// A mock model: on the first turn it calls the tool (echoing the city from
+	// the user's message), then answers from the tool result.
 	model := mock.New("mock", func(req *llm.Request) *llm.Response {
 		if tr, ok := mock.LastToolResult(req); ok {
 			return mock.Text("Done — " + tr.Content[0].(core.Text).Text)
 		}
-		return mock.CallTool("c1", "get_weather", `{"city":"Beijing"}`)
+		city := lastUserText(req)
+		return mock.CallTool("c1", "get_weather", fmt.Sprintf(`{"city":%q}`, city))
 	})
 
-	// Build the agent with functional options.
 	a, err := agent.New(
 		agent.WithModel(model),
 		agent.WithInstruction("You are a friendly weather assistant."),
 		agent.WithTools(weather),
+		agent.WithMaxTurns(8), // safety cap on the model<->tool loop
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -46,16 +49,16 @@ func main() {
 
 	ctx := context.Background()
 
-	// A) One line to the answer: New + Run drives the LLM<->tool loop.
-	answer, err := a.Run(ctx, "What's the weather in Beijing?")
+	// A) One line to the answer.
+	answer, err := a.Run(ctx, "Beijing")
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("answer:", answer)
 
-	// B) Or stream the events of a run.
+	// B) Or stream the same run's events.
 	fmt.Println("--- streamed ---")
-	for ev, err := range a.Stream(ctx, "And in Shanghai?").Iter() {
+	for ev, err := range a.Stream(ctx, "Shanghai").Iter() {
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -68,4 +71,14 @@ func main() {
 			}
 		}
 	}
+}
+
+// lastUserText returns the text of the most recent user message.
+func lastUserText(req *llm.Request) string {
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role == core.RoleUser {
+			return req.Messages[i].Text()
+		}
+	}
+	return ""
 }

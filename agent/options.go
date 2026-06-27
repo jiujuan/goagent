@@ -18,7 +18,7 @@ type config struct {
 	tools       []tool.Tool
 	middleware  []Middleware
 	subAgents   []*Agent
-	maxSteps    int
+	maxTurns    int
 	toolExec    ToolExecMode
 	modelOpts   []llm.Option
 	outputKey   string
@@ -71,8 +71,13 @@ func WithSubAgents(subs ...*Agent) Option {
 // sub-agents are configured.
 func WithoutTransfer() Option { return func(c *config) { c.noTransfer = true } }
 
-// WithMaxSteps caps the model<->tool loop (default 16).
-func WithMaxSteps(n int) Option { return func(c *config) { c.maxSteps = n } }
+// WithMaxTurns caps how many model<->tool turns one run may take (default 16).
+// A "turn" is one model call plus any tools it triggers — it matches the
+// TurnStarted/TurnDone events. This is a safety bound on a single run, NOT a
+// "best of N" refinement count; for iterative refinement use a Loop workflow:
+//
+//	agent.Loop("refine", 3, drafter, critic)   // run up to 3 rounds
+func WithMaxTurns(n int) Option { return func(c *config) { c.maxTurns = n } }
 
 // WithToolExecution selects concurrent (default) or sequential tool execution.
 func WithToolExecution(m ToolExecMode) Option { return func(c *config) { c.toolExec = m } }

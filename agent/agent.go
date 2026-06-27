@@ -33,7 +33,7 @@ type Agent struct {
 
 // New builds an Agent from functional options. WithModel is required.
 func New(opts ...Option) (*Agent, error) {
-	c := config{maxSteps: defaultMaxSteps}
+	c := config{maxTurns: defaultMaxTurns}
 	for _, o := range opts {
 		o(&c)
 	}
