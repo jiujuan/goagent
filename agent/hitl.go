@@ -79,11 +79,14 @@ func (a *Agent) applyApprovals(rc *RunContext, pending []core.ToolCall, approval
 		byID[ap.CallID] = ap
 	}
 	parts := make([]core.Part, 0, len(pending))
+	// Approved calls execute via the underlying LLM loop (workflow agents have
+	// no single loop, so approval-execution applies to LLM agents).
+	loop, _ := a.runnable.(*AgentLoop)
 	for _, c := range pending {
 		ap, ok := byID[c.ID]
 		switch {
-		case ok && ap.Approve:
-			tr, _, ops := a.loop.callOne(rc, c)
+		case ok && ap.Approve && loop != nil:
+			tr, _, ops := loop.callOne(rc, c)
 			rc.State.Apply(ops...)
 			parts = append(parts, tr)
 		default:

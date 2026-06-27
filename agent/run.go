@@ -94,15 +94,31 @@ func (r *Run) Steer(msg core.Message) { r.rc.Steer(msg) }
 // Cancel aborts the run.
 func (r *Run) Cancel() { r.cancel() }
 
-// drive launches the loop exactly once.
+// drive launches the run exactly once. It owns the lifecycle events: RunStarted
+// before, and the single terminal event (RunDone/RunFailed/Interrupted) derived
+// from the runnable's outcome. Runnables (including nested workflow children)
+// never publish lifecycle, so the shared topic carries exactly one of each.
 func (r *Run) drive() {
 	r.startOnce.Do(func() {
 		go func() {
+			r.bus.Publish(r.topic, core.RunStarted{RunID: r.ID, ThreadID: r.ThreadID})
 			if r.startErr != nil {
 				r.bus.Publish(r.topic, core.RunFailed{Err: r.startErr})
+				r.finish(core.Result{}, r.startErr)
 				return
 			}
-			r.runnable.run(r.rc)
+			out := r.runnable.run(r.rc)
+			switch {
+			case out.Err != nil:
+				r.bus.Publish(r.topic, core.RunFailed{Err: out.Err})
+				r.finish(core.Result{}, out.Err)
+			case out.Control.Kind == core.Interrupt:
+				r.bus.Publish(r.topic, core.Interrupted{Pending: out.Pending})
+				r.finish(core.Result{}, nil)
+			default:
+				r.bus.Publish(r.topic, core.RunDone{Result: out.Result})
+				r.finish(out.Result, nil)
+			}
 		}()
 	})
 }

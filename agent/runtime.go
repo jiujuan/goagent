@@ -25,8 +25,28 @@ type RunContext struct {
 	Topic    bus.Topic
 	Store    checkpoint.Checkpointer
 	State    *core.State
+	branch   string // set for a parallel sub-branch (isolation label)
 
 	steering steeringQueue
+}
+
+// forBranch derives a child execution environment for a parallel sub-agent: a
+// cloned State (so concurrent branches don't race), but the same Bus/Topic/Store
+// (so events merge into one observable stream and snapshots share a thread). A
+// fresh steering queue is intentional. It does NOT struct-copy rc (that would
+// copy the steering mutex).
+func (rc *RunContext) forBranch(branch string) *RunContext {
+	st := cloneState(*rc.State)
+	return &RunContext{
+		Context:  rc.Context,
+		RunID:    rc.RunID,
+		ThreadID: rc.ThreadID,
+		Bus:      rc.Bus,
+		Topic:    rc.Topic,
+		Store:    rc.Store,
+		State:    &st,
+		branch:   branch,
+	}
 }
 
 // Steer injects a message to be delivered before the next model call. Safe to

@@ -23,10 +23,10 @@ import (
 // Build one with New, then call Run (blocking, returns the answer) or Stream
 // (non-blocking, returns a *Run for live events and control).
 type Agent struct {
-	cfg   config
-	loop  *AgentLoop
-	bus   *bus.Bus
-	store checkpoint.Checkpointer
+	cfg      config
+	runnable Runnable
+	bus      *bus.Bus
+	store    checkpoint.Checkpointer
 }
 
 // New builds an Agent from functional options. WithModel is required.
@@ -45,7 +45,7 @@ func New(opts ...Option) (*Agent, error) {
 		c.store = checkpoint.NewMemory()
 	}
 	a := &Agent{cfg: c, bus: c.bus, store: c.store}
-	a.loop = newLoop(c)
+	a.runnable = newLoop(c)
 	return a, nil
 }
 
@@ -142,7 +142,7 @@ func (a *Agent) newRunHandle(ctx context.Context, threadID string, state *core.S
 		bus:      a.bus,
 		topic:    topic,
 		rc:       rc,
-		runnable: a.loop,
+		runnable: a.runnable,
 		cancel:   cancel,
 		done:     make(chan struct{}),
 	}

@@ -84,8 +84,8 @@ func WithCheckpointer(s checkpoint.Checkpointer) Option {
 type ToolExecMode int
 
 const (
-	// Parallel runs a step's tool calls concurrently (default).
-	Parallel ToolExecMode = iota
-	// Sequential runs them one at a time, in the model's call order.
-	Sequential
+	// ToolParallel runs a step's tool calls concurrently (default).
+	ToolParallel ToolExecMode = iota
+	// ToolSequential runs them one at a time, in the model's call order.
+	ToolSequential
 )

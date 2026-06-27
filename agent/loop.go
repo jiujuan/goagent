@@ -18,8 +18,8 @@ const defaultMaxSteps = 16
 // AgentLoop is the runtime's controllable loop, an explicit phase machine. One
 // step = PrepareTurn (drain steering, BeforeModel) → CallModel (ModifyRequest,
 // stream, AfterModel) → ExecuteTools (BeforeTool gate, run, AfterTool) →
-// Checkpoint → ApplyDirectives. Each phase publishes observational events to
-// the run's Bus. It is built from a config by newLoop and holds no Spec.
+// Checkpoint → ApplyDirectives. It publishes internal events to the Bus and
+// returns a runOutcome (lifecycle events are the Run wrapper's job).
 type AgentLoop struct {
 	model       llm.Model
 	instruction string
@@ -50,9 +50,7 @@ func newLoop(c config) *AgentLoop {
 
 var _ Runnable = (*AgentLoop)(nil)
 
-func (l *AgentLoop) run(rc *RunContext) {
-	rc.publish(core.RunStarted{RunID: rc.RunID, ThreadID: rc.ThreadID})
-
+func (l *AgentLoop) run(rc *RunContext) runOutcome {
 	history := append([]core.Message(nil), rc.State.Messages...)
 
 	for step := 0; step < l.maxSteps; step++ {
@@ -65,10 +63,9 @@ func (l *AgentLoop) run(rc *RunContext) {
 			lc.History = history
 		}
 		if d, err := l.mw.BeforeModel(lc); err != nil {
-			rc.publish(core.RunFailed{Err: err})
-			return
-		} else if l.handleTerminal(rc, d) {
-			return
+			return runOutcome{Err: err}
+		} else if out, stop := terminalFromDirective(d, core.Message{}); stop {
+			return out
 		}
 
 		// Phase 2 — CallModel: ModifyRequest → stream → AfterModel.
@@ -76,20 +73,18 @@ func (l *AgentLoop) run(rc *RunContext) {
 		req.Options.Apply(l.modelOpts...)
 		lc.Request = req
 		if err := l.mw.ModifyRequest(lc, req); err != nil {
-			rc.publish(core.RunFailed{Err: err})
-			return
+			return runOutcome{Err: err}
 		}
 
-		final, ok := l.streamModel(rc, lc, req)
+		final, ok, err := l.streamModel(rc, lc, req)
 		if !ok {
-			return // model errored; RunFailed already published
+			return runOutcome{Err: err}
 		}
 
 		if d, err := l.mw.AfterModel(lc, &llm.Response{Message: final}); err != nil {
-			rc.publish(core.RunFailed{Err: err})
-			return
-		} else if l.handleTerminal(rc, d) {
-			return
+			return runOutcome{Err: err}
+		} else if out, stop := terminalFromDirective(d, final); stop {
+			return out
 		}
 
 		history = append(history, final)
@@ -99,24 +94,21 @@ func (l *AgentLoop) run(rc *RunContext) {
 			rc.State.Messages = history
 			l.checkpoint(rc, step, nil)
 			rc.publish(core.TurnDone{Step: step})
-			rc.publish(core.RunDone{Result: core.Result{Message: final}})
-			return
+			return runOutcome{Result: core.Result{Message: final}}
 		}
 
 		// Phase 3 — ExecuteTools: BeforeTool gate (HITL/permission) first.
 		for i := range calls {
 			d, err := l.mw.BeforeTool(lc, &calls[i])
 			if err != nil {
-				rc.publish(core.RunFailed{Err: err})
-				return
+				return runOutcome{Err: err}
 			}
 			if d.Kind == core.Interrupt {
-				// Persist history including the assistant tool-call message, plus
-				// the still-pending calls, so Resume can apply approvals.
+				// Persist history (incl. the assistant tool-call message) plus the
+				// still-pending calls, so Resume can apply approvals.
 				rc.State.Messages = history
 				l.checkpoint(rc, step, &checkpoint.PendingHITL{Step: step, Pending: calls[i:]})
-				rc.publish(core.Interrupted{Pending: pendingFrom(calls[i:])})
-				return
+				return runOutcome{Control: core.Directive{Kind: core.Interrupt}, Pending: pendingFrom(calls[i:])}
 			}
 		}
 
@@ -128,43 +120,37 @@ func (l *AgentLoop) run(rc *RunContext) {
 		l.checkpoint(rc, step, nil)
 		rc.publish(core.TurnDone{Step: step})
 
-		// Phase 5 — ApplyDirectives.
-		switch core.Resolve(dirs...).Kind {
-		case core.Stop, core.Escalate, core.Transfer:
-			// Transfer/Escalate wiring (sub-agent run, enclosing Loop) lands in
-			// a later stage; for now any of these ends the run cleanly.
-			rc.publish(core.RunDone{Result: core.Result{Message: final}})
-			return
+		// Phase 5 — ApplyDirectives. A tool/AfterTool directive (Stop/Escalate/
+		// Transfer) ends this unit and propagates up via the outcome.
+		if d := core.Resolve(dirs...); d.Kind != core.Continue {
+			return runOutcome{Result: core.Result{Message: final}, Control: d}
 		}
 	}
 
-	rc.publish(core.RunFailed{Err: ErrMaxStepsExceeded})
+	return runOutcome{Err: ErrMaxStepsExceeded}
 }
 
-// handleTerminal acts on a directive from a Before/AfterModel phase and reports
-// whether the loop should stop.
-func (l *AgentLoop) handleTerminal(rc *RunContext, d core.Directive) bool {
+// terminalFromDirective turns a Before/AfterModel directive into a terminal
+// outcome, reporting whether the loop should stop.
+func terminalFromDirective(d core.Directive, final core.Message) (runOutcome, bool) {
 	switch d.Kind {
 	case core.Interrupt:
-		rc.publish(core.Interrupted{})
-		return true
+		return runOutcome{Control: core.Directive{Kind: core.Interrupt}}, true
 	case core.Stop, core.Escalate, core.Transfer:
-		rc.publish(core.RunDone{})
-		return true
+		return runOutcome{Result: core.Result{Message: final}, Control: d}, true
 	default:
-		return false
+		return runOutcome{}, false
 	}
 }
 
 // streamModel runs one model call, publishing MessageDelta for partials and
-// MessageDone for the final message. The bool is false if the model errored.
-func (l *AgentLoop) streamModel(rc *RunContext, lc *LoopContext, req *llm.Request) (core.Message, bool) {
+// MessageDone for the final message. ok is false (with err) if the model errored.
+func (l *AgentLoop) streamModel(rc *RunContext, lc *LoopContext, req *llm.Request) (core.Message, bool, error) {
 	var final core.Message
 	for resp, err := range l.model.Generate(rc, req) {
 		if err != nil {
 			_, _ = l.mw.OnError(lc, err) // retry middleware consulted; real retry lands later
-			rc.publish(core.RunFailed{Err: err})
-			return core.Message{}, false
+			return core.Message{}, false, err
 		}
 		if resp.Partial {
 			rc.publish(core.MessageDelta{Delta: resp.Message})
@@ -173,7 +159,7 @@ func (l *AgentLoop) streamModel(rc *RunContext, lc *LoopContext, req *llm.Reques
 		final = resp.Message
 		rc.publish(core.MessageDone{Message: resp.Message, Usage: resp.Usage})
 	}
-	return final, true
+	return final, true, nil
 }
 
 // checkpoint snapshots the current State for resume/branch/time-travel. A nil
