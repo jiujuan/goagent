@@ -1,4 +1,4 @@
-// Command redis collects the Redis-backed scheduler demos. All need a Redis
+// Command redis collects the Redis-backed queue demos. All need a Redis
 // server; pick a demo with the first argument:
 //
 //	export REDIS_URL=redis://localhost:6379/0
@@ -22,7 +22,7 @@ import (
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/llm"
 	"github.com/jiujuan/goagent/llm/mock"
-	"github.com/jiujuan/goagent/scheduler"
+	"github.com/jiujuan/goagent/queue"
 )
 
 func main() {
@@ -61,14 +61,14 @@ func demoQueue(url string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	q, c, err := scheduler.New(scheduler.WithRedis(url), scheduler.WithGroup("demo-queue"))
+	q, c, err := queue.New(queue.WithRedis(url), queue.WithGroup("demo-queue"))
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	section("demo: 持久任务队列(Redis Streams)")
 	for _, name := range []string{"小明", "小红", "小刚"} {
-		if err := q.Enqueue(ctx, scheduler.Job{
+		if err := q.Enqueue(ctx, queue.Job{
 			ID: core.NewID("job"), Type: "greet", Payload: []byte(name),
 		}); err != nil {
 			log.Fatal(err)
@@ -77,7 +77,7 @@ func demoQueue(url string) {
 	}
 
 	done := make(chan struct{}, 3)
-	pool := scheduler.NewPool(c, 2).WithRegistry(scheduler.Registry{
+	pool := queue.NewPool(c, 2).WithRegistry(queue.Registry{
 		"greet": func(ctx context.Context, payload []byte) error {
 			a, _ := agent.New(agent.WithModel(greetModel()))
 			ans, err := a.Run(ctx, string(payload))
@@ -104,7 +104,7 @@ func demoQueue(url string) {
 // 一端订阅某 key 的事件,另一端发布。事件经 core.MarshalEvent 序列化走 Redis
 // Pub/Sub,所以发布方和订阅方可以是不同进程。
 func demoBus(url string) {
-	b, err := scheduler.NewBus(scheduler.WithRedis(url))
+	b, err := queue.NewBus(queue.WithRedis(url))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -136,10 +136,10 @@ func demoBus(url string) {
 
 // --- demo 3: agent 跑在 worker,进度桥接给 frontend --------------------------
 //
-// 完整故事:worker 跑一个 agent,用 scheduler.Bridge 把它的事件镜像到 Redis 总线;
+// 完整故事:worker 跑一个 agent,用 queue.Bridge 把它的事件镜像到 Redis 总线;
 // frontend(另一进程)订阅该 key,实时看到 agent 的流式进度。
 func demoFull(url string) {
-	b, err := scheduler.NewBus(scheduler.WithRedis(url))
+	b, err := queue.NewBus(queue.WithRedis(url))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func demoFull(url string) {
 	run := a.Stream(context.Background(), "讲个一句话的小故事")
 	evch, ecancel := run.Events(bus.Lossy)
 	defer ecancel()
-	go scheduler.Bridge(b, key, evch)
+	go queue.Bridge(b, key, evch)
 
 	if _, err := run.Wait(); err != nil {
 		log.Fatal(err)

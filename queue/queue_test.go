@@ -1,4 +1,4 @@
-package scheduler_test
+package queue_test
 
 import (
 	"context"
@@ -10,18 +10,18 @@ import (
 	"github.com/jiujuan/goagent/agent"
 	"github.com/jiujuan/goagent/llm"
 	"github.com/jiujuan/goagent/llm/mock"
-	"github.com/jiujuan/goagent/scheduler"
+	"github.com/jiujuan/goagent/queue"
 )
 
 func TestPoolRunsAllJobsBounded(t *testing.T) {
-	q := scheduler.NewMemQueue(64)
+	q := queue.NewMemQueue(64)
 	var ran, peak, cur int64
 
 	const n = 20
 	var wg sync.WaitGroup
 	wg.Add(n)
 	for i := 0; i < n; i++ {
-		_ = q.Enqueue(context.Background(), scheduler.Job{
+		_ = q.Enqueue(context.Background(), queue.Job{
 			Run: func(context.Context) error {
 				c := atomic.AddInt64(&cur, 1)
 				for { // track peak concurrency
@@ -40,7 +40,7 @@ func TestPoolRunsAllJobsBounded(t *testing.T) {
 	}
 	q.Close()
 
-	pool := scheduler.NewPool(q, 4)
+	pool := queue.NewPool(q, 4)
 	go pool.Run(context.Background())
 	wg.Wait()
 
@@ -61,14 +61,14 @@ func TestEnqueueAgentBackgroundRun(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	q := scheduler.NewMemQueue(8)
-	h, err := scheduler.EnqueueAgent(ctx, q, a, "go", agent.OnThread("t1"))
+	q := queue.NewMemQueue(8)
+	h, err := queue.EnqueueAgent(ctx, q, a, "go", agent.OnThread("t1"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	q.Close()
 
-	pool := scheduler.NewPool(q, 2)
+	pool := queue.NewPool(q, 2)
 	go pool.Run(ctx)
 
 	res, err := h.Wait()
@@ -83,13 +83,13 @@ func TestEnqueueAgentBackgroundRun(t *testing.T) {
 func TestRegistryHandlerForSerializableJob(t *testing.T) {
 	// A Type+Payload job (the shape Redis uses) is run by the pool's Registry.
 	got := make(chan string, 1)
-	q := scheduler.NewMemQueue(4)
-	_ = q.Enqueue(context.Background(), scheduler.Job{
+	q := queue.NewMemQueue(4)
+	_ = q.Enqueue(context.Background(), queue.Job{
 		ID: "j1", Type: "echo", Payload: []byte("hello"),
 	})
 	q.Close()
 
-	pool := scheduler.NewPool(q, 1).WithRegistry(scheduler.Registry{
+	pool := queue.NewPool(q, 1).WithRegistry(queue.Registry{
 		"echo": func(_ context.Context, payload []byte) error {
 			got <- string(payload)
 			return nil
@@ -108,19 +108,19 @@ func TestRegistryHandlerForSerializableJob(t *testing.T) {
 }
 
 func TestNewInProcessBackend(t *testing.T) {
-	q, c, err := scheduler.New() // no WithRedis -> MemQueue
+	q, c, err := queue.New() // no WithRedis -> MemQueue
 	if err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan struct{})
-	_ = q.Enqueue(context.Background(), scheduler.Job{Run: func(context.Context) error {
+	_ = q.Enqueue(context.Background(), queue.Job{Run: func(context.Context) error {
 		close(done)
 		return nil
 	}})
-	if mq, ok := c.(*scheduler.MemQueue); ok {
+	if mq, ok := c.(*queue.MemQueue); ok {
 		mq.Close()
 	}
-	go scheduler.NewPool(c, 1).Run(context.Background())
+	go queue.NewPool(c, 1).Run(context.Background())
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):

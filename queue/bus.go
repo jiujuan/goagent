@@ -1,4 +1,4 @@
-package scheduler
+package queue
 
 import (
 	"sync"
@@ -7,7 +7,7 @@ import (
 )
 
 // Bus is a key-scoped publish/subscribe channel for events — the cross-process
-// progress side of the scheduler. A worker publishes a background run's events
+// progress side of the queue. A worker publishes a background run's events
 // under a key; a frontend (possibly in another process, over Redis) subscribes
 // to that key to watch progress live.
 //
@@ -27,7 +27,7 @@ type Bus interface {
 //
 //	ch, cancel := run.Events(bus.Lossy)
 //	defer cancel()
-//	scheduler.Bridge(progressBus, key, ch)
+//	queue.Bridge(progressBus, key, ch)
 func Bridge(b Bus, key string, src <-chan core.Event) {
 	for ev := range src {
 		b.Publish(key, ev)

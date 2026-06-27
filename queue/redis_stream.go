@@ -1,4 +1,4 @@
-package scheduler
+package queue
 
 import (
 	"context"
@@ -74,7 +74,7 @@ func newRedisStreamQueue(rdb *redis.Client, c *config) *redisStreamQueue {
 // serialized onto the stream.
 func (q *redisStreamQueue) Enqueue(ctx context.Context, job Job) error {
 	if job.Type == "" {
-		return errors.New("scheduler: redis backend requires Job.Type (a Run closure cannot be serialized)")
+		return errors.New("queue: redis backend requires Job.Type (a Run closure cannot be serialized)")
 	}
 	data, err := json.Marshal(wireJob{ID: job.ID, Key: job.Key, Type: job.Type, Payload: job.Payload})
 	if err != nil {
@@ -216,7 +216,7 @@ func (q *redisStreamQueue) toDead(msg redis.XMessage, reason string) {
 func (q *redisStreamQueue) toJob(msg redis.XMessage) (Job, error) {
 	raw, ok := msg.Values["job"].(string)
 	if !ok {
-		return Job{}, errors.New("scheduler: stream entry missing job field")
+		return Job{}, errors.New("queue: stream entry missing job field")
 	}
 	var w wireJob
 	if err := json.Unmarshal([]byte(raw), &w); err != nil {

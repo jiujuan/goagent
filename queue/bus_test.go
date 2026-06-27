@@ -1,15 +1,15 @@
-package scheduler_test
+package queue_test
 
 import (
 	"testing"
 	"time"
 
 	"github.com/jiujuan/goagent/core"
-	"github.com/jiujuan/goagent/scheduler"
+	"github.com/jiujuan/goagent/queue"
 )
 
 func TestMemBusPubSub(t *testing.T) {
-	b := scheduler.NewMemBus()
+	b := queue.NewMemBus()
 	ch, cancel := b.Subscribe("job-1")
 	defer cancel()
 
@@ -27,7 +27,7 @@ func TestMemBusPubSub(t *testing.T) {
 }
 
 func TestBridgeForwardsEvents(t *testing.T) {
-	b := scheduler.NewMemBus()
+	b := queue.NewMemBus()
 	out, cancel := b.Subscribe("k")
 	defer cancel()
 
@@ -36,7 +36,7 @@ func TestBridgeForwardsEvents(t *testing.T) {
 	src <- core.PlanNodeDone{NodeID: "n1", Status: "done"}
 	close(src)
 
-	go scheduler.Bridge(b, "k", src)
+	go queue.Bridge(b, "k", src)
 
 	select {
 	case ev := <-out:
@@ -49,11 +49,11 @@ func TestBridgeForwardsEvents(t *testing.T) {
 }
 
 func TestNewBusInProcess(t *testing.T) {
-	b, err := scheduler.NewBus() // no WithRedis -> MemBus
+	b, err := queue.NewBus() // no WithRedis -> MemBus
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := b.(*scheduler.MemBus); !ok {
+	if _, ok := b.(*queue.MemBus); !ok {
 		t.Fatalf("NewBus() = %T, want *MemBus", b)
 	}
 }

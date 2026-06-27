@@ -1,4 +1,4 @@
-// Command background is a tutorial for the scheduler: fire-and-forget agent runs
+// Command background is a tutorial for the queue: fire-and-forget agent runs
 // processed by a bounded worker pool, off the caller's goroutine. Uses the mock
 // provider, so it runs offline.
 //
@@ -13,7 +13,7 @@ import (
 	"github.com/jiujuan/goagent/agent"
 	"github.com/jiujuan/goagent/llm"
 	"github.com/jiujuan/goagent/llm/mock"
-	"github.com/jiujuan/goagent/scheduler"
+	"github.com/jiujuan/goagent/queue"
 )
 
 func main() {
@@ -33,14 +33,14 @@ func main() {
 	}
 
 	// Queue + bounded pool (2 at a time).
-	q := scheduler.NewMemQueue(16)
-	pool := scheduler.NewPool(q, 2)
+	q := queue.NewMemQueue(16)
+	pool := queue.NewPool(q, 2)
 
 	// Fire-and-forget several agent runs; each returns a Handle immediately.
 	tasks := []string{"任务A", "任务B", "任务C", "任务D", "任务E"}
-	var handles []*scheduler.Handle
+	var handles []*queue.Handle
 	for i, task := range tasks {
-		h, err := scheduler.EnqueueAgent(ctx, q, a, task, agent.OnThread(fmt.Sprintf("job-%d", i)))
+		h, err := queue.EnqueueAgent(ctx, q, a, task, agent.OnThread(fmt.Sprintf("job-%d", i)))
 		if err != nil {
 			log.Fatal(err)
 		}
