@@ -1,6 +1,8 @@
 // Package tool defines the Tool contract and a generic constructor that derives
-// a JSON Schema from a typed handler. Tools decide nothing about control flow;
-// they are pure capabilities the agent's turn engine invokes by name.
+// a JSON Schema from a typed handler. Tools decide nothing about control flow on
+// their own; they are capabilities the agent's loop invokes by name. A tool may
+// however *request* control (Result.Control) and state mutations (Result.State),
+// which the loop applies explicitly.
 package tool
 
 import (
@@ -8,7 +10,6 @@ import (
 	"encoding/json"
 
 	"github.com/jiujuan/goagent/core"
-	"github.com/jiujuan/goagent/session"
 )
 
 // Tool is the capability contract. It is deliberately small: a name and
@@ -27,19 +28,21 @@ type Result struct {
 	Content []core.Part
 	// IsError marks the result as a failure to report back to the model.
 	IsError bool
+
+	// Control, when set, requests a control-flow change after this tool runs
+	// (e.g. Escalate to break a Loop, Stop to end the run). The loop folds it
+	// with other directives by precedence.
+	Control *core.Directive
+	// State holds declarative state mutations the loop applies immediately.
+	State []core.StateOp
 }
 
 // Context is handed to a tool on invocation. It embeds the request context and
-// exposes session state plus an Actions sink, so tools can read/write state and
-// request side effects (e.g. confirmation, escalation) declaratively.
+// exposes the live run State directly (no session indirection). CallID
+// correlates the invocation to its originating ToolCall.
 type Context struct {
 	context.Context
-	// State is the live session state.
-	State session.State
-	// Actions accumulates side effects requested by the tool; the turn engine
-	// folds them into the resulting event.
-	Actions *core.Actions
-	// CallID correlates this invocation to the originating ToolCall.
+	State  *core.State
 	CallID string
 }
 

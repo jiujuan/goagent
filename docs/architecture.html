@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>goagent · 分层架构设计图</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0d1117;
+    --bg-soft:#11161f;
+    --panel:#161b25;
+    --panel-2:#1b2230;
+    --line:#222b3a;
+    --line-soft:#1a212e;
+    --txt:#e6edf3;
+    --txt-dim:#9aa7b8;
+    --txt-faint:#6b7888;
+    --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:'Inter','Noto Sans SC',system-ui,-apple-system,sans-serif;
+
+    --l4:#f472b6;   /* orchestration - pink   */
+    --l3:#a78bfa;   /* agent         - violet */
+    --l2:#60a5fa;   /* middleware    - blue   */
+    --l1:#34d399;   /* primitives    - green  */
+    --cc:#fbbf24;   /* cross-cutting - amber  */
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    font-family:var(--sans);
+    background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(167,139,250,.10), transparent 60%),
+      radial-gradient(1000px 500px at 0% 110%, rgba(52,211,153,.08), transparent 55%),
+      var(--bg);
+    color:var(--txt);
+    line-height:1.5;
+    padding:48px 32px 80px;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1280px;margin:0 auto}
+
+  /* ---------- Header ---------- */
+  header{margin-bottom:42px;border-bottom:1px solid var(--line);padding-bottom:30px}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.32em;color:var(--txt-faint);text-transform:uppercase}
+  h1{font-size:54px;font-weight:800;letter-spacing:-.02em;margin:10px 0 6px;
+     background:linear-gradient(100deg,#fff 10%,#a78bfa 55%,#34d399 95%);
+     -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  .sub{font-size:16px;color:var(--txt-dim);max-width:760px}
+  .philo{font-family:var(--mono);font-size:13.5px;color:var(--l3);margin-top:14px;
+         padding-left:14px;border-left:2px solid var(--l3)}
+  .badges{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px}
+  .badge{font-family:var(--mono);font-size:11.5px;color:var(--txt-dim);
+         background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:5px 13px}
+  .badge b{color:var(--txt)}
+
+  /* ---------- Flow rail ---------- */
+  .stack{position:relative;padding-left:54px}
+  .rail{position:absolute;left:18px;top:6px;bottom:90px;width:2px;
+        background:linear-gradient(var(--l4),var(--l3),var(--l2),var(--l1))}
+  .rail::after{content:'';position:absolute;left:-5px;bottom:-10px;
+        border:6px solid transparent;border-top-color:var(--l1)}
+  .raillabel{position:absolute;left:-2px;writing-mode:vertical-rl;font-family:var(--mono);
+        font-size:10px;letter-spacing:.28em;color:var(--txt-faint);text-transform:uppercase}
+  .raillabel.down{top:60px}
+  .raillabel.up{bottom:140px;color:var(--l1)}
+
+  /* ---------- Layer ---------- */
+  .layer{position:relative;background:var(--panel);border:1px solid var(--line);
+         border-radius:16px;padding:22px 24px 24px;margin-bottom:22px;overflow:hidden}
+  .layer::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--accent)}
+  .layer .glow{position:absolute;right:-80px;top:-80px;width:240px;height:240px;border-radius:50%;
+         background:var(--accent);opacity:.06;filter:blur(20px);pointer-events:none}
+  .lhead{display:flex;align-items:baseline;gap:14px;margin-bottom:18px;flex-wrap:wrap}
+  .tag{font-family:var(--mono);font-weight:600;font-size:13px;color:#0d1117;
+       background:var(--accent);border-radius:7px;padding:4px 10px}
+  .ltitle{font-size:21px;font-weight:700;letter-spacing:-.01em}
+  .lpkg{font-family:var(--mono);font-size:12.5px;color:var(--accent)}
+  .ldesc{font-size:13px;color:var(--txt-dim);margin-left:auto;max-width:430px;text-align:right}
+
+  .grid{display:grid;gap:13px}
+  .g4{grid-template-columns:repeat(4,1fr)}
+  .g3{grid-template-columns:repeat(3,1fr)}
+  .g2{grid-template-columns:repeat(2,1fr)}
+
+  .card{background:var(--panel-2);border:1px solid var(--line-soft);border-radius:11px;
+        padding:14px 15px;transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease}
+  .card:hover{transform:translateY(-3px);border-color:var(--accent);
+        box-shadow:0 10px 30px -12px var(--accent)}
+  .cname{font-family:var(--mono);font-size:13.5px;font-weight:600;color:var(--txt);margin-bottom:3px;
+        display:flex;align-items:center;gap:7px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);flex:none}
+  .cpkg{font-family:var(--mono);font-size:11px;color:var(--txt-faint);margin-bottom:7px}
+  .cfn{font-size:12.5px;color:var(--txt-dim);line-height:1.45}
+  .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:9px}
+  .chip{font-family:var(--mono);font-size:10px;color:var(--txt-dim);
+        background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:5px;padding:2px 7px}
+
+  /* ---------- Cross-cutting ---------- */
+  .cc-band{background:linear-gradient(180deg,var(--panel),var(--bg-soft));
+        border:1px solid var(--line);border-radius:16px;padding:22px 24px 24px;margin-top:38px;position:relative}
+  .cc-band::before{content:'';position:absolute;left:0;top:0;right:0;height:3px;
+        background:linear-gradient(90deg,var(--cc),transparent)}
+  .cc-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:11px;margin-top:16px}
+  .cc-card{background:var(--panel-2);border:1px solid var(--line-soft);border-radius:10px;padding:12px 13px;
+        transition:transform .18s,border-color .18s}
+  .cc-card:hover{transform:translateY(-3px);border-color:var(--cc)}
+  .cc-card .cname{color:var(--cc)}
+  .cc-card .dot{background:var(--cc)}
+  .cc-sub{grid-column:span 6;display:grid;grid-template-columns:repeat(5,1fr);gap:11px;margin-top:2px}
+  .cc-sub .cc-card{background:rgba(251,191,36,.04)}
+
+  /* ---------- Footer stack ---------- */
+  .tech{margin-top:42px;border-top:1px solid var(--line);padding-top:28px}
+  .tech h3{font-family:var(--mono);font-size:12px;letter-spacing:.28em;color:var(--txt-faint);
+        text-transform:uppercase;margin-bottom:16px}
+  .tech-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:11px}
+  .tcell{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .tcell .k{font-size:11px;color:var(--txt-faint);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}
+  .tcell .v{font-family:var(--mono);font-size:12.5px;color:var(--txt)}
+
+  .legend{display:flex;flex-wrap:wrap;gap:18px;margin-top:30px;font-size:12px;color:var(--txt-dim)}
+  .legend span{display:flex;align-items:center;gap:7px;font-family:var(--mono)}
+  .sw{width:12px;height:12px;border-radius:3px}
+
+  footer{margin-top:42px;text-align:center;font-family:var(--mono);font-size:11.5px;color:var(--txt-faint)}
+
+  @media(max-width:980px){
+    .g4,.g3,.cc-grid,.cc-sub,.tech-grid{grid-template-columns:repeat(2,1fr)}
+    .ldesc{display:none}
+    h1{font-size:38px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="eyebrow">github.com/jiujuan/goagent · Layered Architecture</div>
+    <h1>goagent 分层架构</h1>
+    <p class="sub">一个模块化、可扩展的纯 Go Agent 框架，融合 pi / adk-go / langchaingo 三者精华。零外部依赖，全栈以统一事件流贯穿。</p>
+    <p class="philo">一切皆事件流 · 事件即数据 · 能力即中间件 · 接口尽量小</p>
+    <div class="badges">
+      <span class="badge"><b>Go 1.23+</b> · range-over-func</span>
+      <span class="badge"><b>零依赖</b> · 纯标准库</span>
+      <span class="badge">流式原语 <b>iter.Seq2[*Event,error]</b></span>
+      <span class="badge">配置 <b>Functional Options</b></span>
+      <span class="badge">持久化 <b>JSONL append-only</b></span>
+      <span class="badge">协议 <b>Anthropic / OpenAI / MCP</b></span>
+    </div>
+  </header>
+
+  <div class="stack">
+    <div class="rail"></div>
+    <div class="raillabel down">请求 · 自上而下 ▼</div>
+    <div class="raillabel up">▲ 事件流 · 自下而上 core.Stream</div>
+
+    <!-- L4 -->
+    <section class="layer" style="--accent:var(--l4)">
+      <div class="glow"></div>
+      <div class="lhead">
+        <span class="tag">L4</span>
+        <span class="ltitle">编排层 · Orchestration</span>
+        <span class="lpkg">runner/ · plan/</span>
+        <span class="ldesc">顶层入口：解析会话、提交事件、运行 root agent、持久化、后台异步与 DAG 计划执行</span>
+      </div>
+      <div class="grid g3">
+        <div class="card">
+          <div class="cname"><span class="dot"></span>Runner</div>
+          <div class="cpkg">runner/runner.go</div>
+          <div class="cfn">编排入口。解析会话 → 提交 user 事件 → 运行 root agent → 把非 partial 事件持久化到 Store。</div>
+        </div>
+        <div class="card">
+          <div class="cname"><span class="dot"></span>Background</div>
+          <div class="cpkg">runner/background.go</div>
+          <div class="cfn">把一次 agent run 封装为 queue.Job，桥接到工作池，实现 fire-and-forget 异步执行。</div>
+        </div>
+        <div class="card">
+          <div class="cname"><span class="dot"></span>Plan 引擎</div>
+          <div class="cpkg">plan/</div>
+          <div class="cfn">DAG 执行计划：Plan/Step 模型 + 依赖感知并发 Scheduler + Executor（工具/agent/函数）+ 重规划/审批/快照恢复。</div>
+          <div class="chips"><span class="chip">Scheduler</span><span class="chip">Executor</span><span class="chip">ErrorPolicy</span><span class="chip">Snapshot</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- L3 -->
+    <section class="layer" style="--accent:var(--l3)">
+      <div class="glow"></div>
+      <div class="lhead">
+        <span class="tag">L3</span>
+        <span class="ltitle">决策层 · Agent</span>
+        <span class="lpkg">agent/</span>
+        <span class="ldesc">Agent 契约与实现：LLM 驱动的 turn 引擎、确定性编排、流水线、委派与多模态 agent</span>
+      </div>
+      <div class="grid g4">
+        <div class="card">
+          <div class="cname"><span class="dot"></span>LLMAgent</div>
+          <div class="cpkg">agent.go</div>
+          <div class="cfn">核心 turn 引擎：model↔tool 循环（maxSteps=16），装配 middleware chain。</div>
+        </div>
+        <div class="card">
+          <div class="cname"><span class="dot"></span>Workflow</div>
+          <div class="cpkg">workflow.go</div>
+          <div class="cfn">确定性编排：Sequential 顺序 / Loop 循环(Escalate跳出) / Parallel 并发(分支隔离)。</div>
+        </div>
+        <div class="card">
+          <div class="cname"><span class="dot"></span>Pipeline</div>
+          <div class="cpkg">pipeline.go</div>
+          <div class="cfn">Fluent 声明式流水线 Pipeline().Then().ThenParallel().ThenLoop().Build()。</div>
+        </div>
+        <div class="card">
+          <div class="cname"><span class="dot"></span>Transfer</div>
+          <div class="cpkg">transfer.go</div>
+          <div class="cfn">LLM 驱动委派：注入 transfer_to_agent 工具 + 方向规则(sub/parent/peer) + 防环深度保护。</div>
+        </div>
+        <div class="card">
+          <div class="cname"><span class="dot"></span>ImageAgent</div>
+          <div class="cpkg">imageagent.go</div>
+          <div class="cfn">包装 llm.ImageModel 的图片生成 agent。</div>
+        </div>
+        <div class="card">
+          <div class="cname"><span class="dot"></span>VideoAgent</div>
+          <div class="cpkg">videoagent.go</div>
+          <div class="cfn">包装 llm.VideoModel 的视频生成 agent（异步轮询）。</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- L2 -->
+    <section class="layer" style="--accent:var(--l2)">
+      <div class="glow"></div>
+      <div class="lhead">
+        <span class="tag">L2</span>
+        <span class="ltitle">模型调用层 · Middleware</span>
+        <span class="lpkg">middleware/</span>
+        <span class="ldesc">能力即中间件 — Middleware = func(llm.Model) llm.Model，层层装饰模型，互不耦合</span>
+      </div>
+      <div class="grid g3" style="margin-bottom:13px">
+        <div class="card" style="grid-column:1/-1;background:rgba(96,165,250,.05)">
+          <div class="cpkg" style="color:var(--l2)">Chain 组装顺序（外 → 内）</div>
+          <div class="cfn" style="font-family:var(--mono);color:var(--txt)">RateLimit → Compaction → RAG → HITL → Retry → Steering → <b>bare Model</b></div>
+        </div>
+      </div>
+      <div class="grid g3">
+        <div class="card">
+          <div class="cname"><span class="dot"></span>Compaction</div>
+          <div class="cfn">历史过长时自动用 LLM 生成结构化摘要替换旧消息（上下文压缩）。</div>
+        </div>
+        <div class="card">
+          <div class="cname"><span class="dot"></span>Retry</div>
+          <div class="cfn">指数退避重试，仅在未产出 token 前重试，避免重复输出。</div>
+        </div>
+        <div class="card">
+          <div class="cname"><span class="dot"></span>RateLimit</div>
+          <div class="cfn">令牌桶限流 + 并发数控制。</div>
+        </div>
+        <div class="card">
+          <div class="cname"><span class="dot"></span>HumanInTheLoop</div>
+          <div class="cfn">危险工具人工审批门禁：approve / deny / editArgs。</div>
+        </div>
+        <div class="card">
+          <div class="cname"><span class="dot"></span>Steering</div>
+          <div class="cfn">运行中跨 goroutine 注入消息，实时"插话"引导。</div>
+        </div>
+        <div class="card">
+          <div class="cname"><span class="dot"></span>Resummarize</div>
+          <div class="cfn">持久化摘要，写入会话树 SummarizesTo 节点。</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- L1 -->
+    <section class="layer" style="--accent:var(--l1)">
+      <div class="glow"></div>
+      <div class="lhead">
+        <span class="tag">L1</span>
+        <span class="ltitle">原语层 · Primitives</span>
+        <span class="lpkg">core/ · llm/ · tool/</span>
+        <span class="ldesc">共享词汇表 — 定义全栈数据模型与最小接口，打破 import 循环，不依赖任何上层</span>
+      </div>
+      <div class="grid g3">
+        <div class="card">
+          <div class="cname"><span class="dot"></span>core</div>
+          <div class="cpkg">core/ · 共享 schema</div>
+          <div class="cfn">Message / Part(sealed union) 多模态消息；Event + Actions 流单元；Stream=iter.Seq2 全栈流式原语；NewID 随机 ID。</div>
+          <div class="chips"><span class="chip">Message</span><span class="chip">Event</span><span class="chip">Stream</span><span class="chip">Part</span></div>
+        </div>
+        <div class="card">
+          <div class="cname"><span class="dot"></span>llm</div>
+          <div class="cpkg">llm/ · 模型接口</div>
+          <div class="cfn">Model / ImageModel / VideoModel 统一抽象 + Functional Options。Provider：anthropic 原生、openaicompat 兼容、agnes 图/视频、mock。</div>
+          <div class="chips"><span class="chip">anthropic</span><span class="chip">openaicompat</span><span class="chip">agnes</span><span class="chip">mock</span></div>
+        </div>
+        <div class="card">
+          <div class="cname"><span class="dot"></span>tool</div>
+          <div class="cpkg">tool/ · 工具契约</div>
+          <div class="cfn">Tool 小接口 + 泛型 Func[In,Out]，用反射自动生成 JSON Schema。内建：exec 沙箱命令、web 联网搜索、mcp 外部工具。</div>
+          <div class="chips"><span class="chip">Func[In,Out]</span><span class="chip">exec</span><span class="chip">web</span><span class="chip">mcp</span></div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- Cross-cutting -->
+  <section class="cc-band">
+    <div class="lhead" style="margin-bottom:6px">
+      <span class="tag" style="background:var(--cc)">CC</span>
+      <span class="ltitle">横切关注点 · Cross-Cutting</span>
+      <span class="lpkg" style="color:var(--cc)">贯穿各层的可插拔基础服务</span>
+    </div>
+    <div class="cc-grid">
+      <div class="cc-card">
+        <div class="cname"><span class="dot"></span>session</div>
+        <div class="cfn">会话持久化：事件树(ParentID)、分支/fork、JSONL 日志、InMemory/FileStore。</div>
+      </div>
+      <div class="cc-card">
+        <div class="cname"><span class="dot"></span>memory</div>
+        <div class="cfn">长期记忆/RAG：向量库 + 余弦检索 + 检索注入中间件 + search_memory 工具。</div>
+      </div>
+      <div class="cc-card">
+        <div class="cname"><span class="dot"></span>prompt</div>
+        <div class="cfn">可组合 System Prompt：Section(Name/Order/Render) + Builder 按序拼接。</div>
+      </div>
+      <div class="cc-card">
+        <div class="cname"><span class="dot"></span>sandbox</div>
+        <div class="cfn">受控命令执行：五项限制(目录/超时/输出/白名单/环境)，跨平台进程后端。</div>
+      </div>
+      <div class="cc-card">
+        <div class="cname"><span class="dot"></span>queue</div>
+        <div class="cfn">后台执行：内存队列 + 发布订阅 Bus + 有界并发 Worker 池。</div>
+      </div>
+      <div class="cc-card">
+        <div class="cname"><span class="dot"></span>skill</div>
+        <div class="cfn">文件系统技能包：三层渐进加载(元数据→body→脚本)，基于 fs.FS。</div>
+      </div>
+
+      <div class="cc-sub">
+        <div class="cc-card">
+          <div class="cname"><span class="dot"></span>embeddings</div>
+          <div class="cfn">文本向量化抽象 Embedder：mock + OpenAI 兼容。</div>
+        </div>
+        <div class="cc-card">
+          <div class="cname"><span class="dot"></span>callbacks</div>
+          <div class="cfn">可观测性 Handler：7 个 On* hook，零开销 Noop。</div>
+        </div>
+        <div class="cc-card">
+          <div class="cname"><span class="dot"></span>memory/workingmem</div>
+          <div class="cfn">结构化 scratchpad(Goal/Todos/Notes)，穿越压缩不丢失。</div>
+        </div>
+        <div class="cc-card">
+          <div class="cname"><span class="dot"></span>memory/textmem · projectmem · rules</div>
+          <div class="cfn">Markdown 事实库 / AGENTS.md / 两级规则注入。</div>
+        </div>
+        <div class="cc-card">
+          <div class="cname"><span class="dot"></span>internal/sse</div>
+          <div class="cfn">最小 SSE 解析器，anthropic 与 openaicompat 共用。</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Tech stack -->
+  <section class="tech">
+    <h3>关键技术选型 · Technology Choices</h3>
+    <div class="tech-grid">
+      <div class="tcell"><div class="k">外部依赖</div><div class="v">零依赖 · 纯标准库</div></div>
+      <div class="tcell"><div class="k">流式原语</div><div class="v">iter.Seq2 (Go 1.23)</div></div>
+      <div class="tcell"><div class="k">HTTP / 序列化</div><div class="v">net/http · encoding/json</div></div>
+      <div class="tcell"><div class="k">LLM SDK</div><div class="v">自研 anthropic / openaicompat</div></div>
+      <div class="tcell"><div class="k">持久化</div><div class="v">JSONL append-only 文件</div></div>
+      <div class="tcell"><div class="k">向量库</div><div class="v">内存暴力余弦检索</div></div>
+      <div class="tcell"><div class="k">消息队列</div><div class="v">channel 内存队列 / Bus</div></div>
+      <div class="tcell"><div class="k">沙箱</div><div class="v">os/exec · unix+windows</div></div>
+      <div class="tcell"><div class="k">配置</div><div class="v">Functional Options</div></div>
+      <div class="tcell"><div class="k">MCP</div><div class="v">JSON-RPC 2.0 over stdio</div></div>
+      <div class="tcell"><div class="k">Schema 生成</div><div class="v">reflect 自动推导</div></div>
+      <div class="tcell"><div class="k">ID 生成</div><div class="v">crypto/rand + hex</div></div>
+    </div>
+
+    <div class="legend">
+      <span><span class="sw" style="background:var(--l4)"></span>L4 编排</span>
+      <span><span class="sw" style="background:var(--l3)"></span>L3 决策</span>
+      <span><span class="sw" style="background:var(--l2)"></span>L2 中间件</span>
+      <span><span class="sw" style="background:var(--l1)"></span>L1 原语</span>
+      <span><span class="sw" style="background:var(--cc)"></span>横切关注点</span>
+    </div>
+  </section>
+
+  <footer>goagent · 一次 turn 的数据流：Runner → Session.GetOrCreate → LLMAgent.Run → Middleware.Chain(Model).Generate → Tools/Transfer → Event ↑ Store.Append ↑ Callbacks</footer>
+
+</div>
+</body>
+</html>
