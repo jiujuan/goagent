@@ -21,6 +21,7 @@ type config struct {
 	maxSteps    int
 	toolExec    ToolExecMode
 	modelOpts   []llm.Option
+	outputKey   string
 
 	// delegation toggles (see transfer.go)
 	noTransfer       bool
@@ -75,6 +76,11 @@ func WithMaxSteps(n int) Option { return func(c *config) { c.maxSteps = n } }
 
 // WithToolExecution selects concurrent (default) or sequential tool execution.
 func WithToolExecution(m ToolExecMode) Option { return func(c *config) { c.toolExec = m } }
+
+// WithOutputKey writes this agent's final answer text into State.KV under key,
+// for inter-stage coordination in a workflow. Later stages reference it in their
+// instruction via a {{key}} placeholder (rendered before each model call).
+func WithOutputKey(key string) Option { return func(c *config) { c.outputKey = key } }
 
 // WithModelOptions applies llm options to every model request (additive).
 func WithModelOptions(o ...llm.Option) Option {

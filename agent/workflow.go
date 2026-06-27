@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -130,6 +131,20 @@ func mergeOutcomes(rs []runOutcome) runOutcome {
 		}
 	}
 	return runOutcome{Result: core.Result{Message: core.AssistantText(strings.Join(texts, "\n\n"))}}
+}
+
+// renderTemplate substitutes {{key}} placeholders in an instruction with values
+// from State.KV — the read side of WithOutputKey, letting a later workflow stage
+// reference an earlier stage's output.
+func renderTemplate(tmpl string, kv map[string]any) string {
+	if tmpl == "" || len(kv) == 0 || !strings.Contains(tmpl, "{{") {
+		return tmpl
+	}
+	out := tmpl
+	for k, v := range kv {
+		out = strings.ReplaceAll(out, "{{"+k+"}}", fmt.Sprint(v))
+	}
+	return out
 }
 
 // --- ExitLoopTool -----------------------------------------------------------

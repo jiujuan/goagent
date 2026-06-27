@@ -23,6 +23,7 @@ const defaultMaxSteps = 16
 type AgentLoop struct {
 	model       llm.Model
 	instruction string
+	outputKey   string
 	modelOpts   []llm.Option
 	toolExec    ToolExecMode
 	mw          *Stack
@@ -39,6 +40,7 @@ func newLoop(c config) *AgentLoop {
 	return &AgentLoop{
 		model:       c.model,
 		instruction: c.instruction,
+		outputKey:   c.outputKey,
 		modelOpts:   c.modelOpts,
 		toolExec:    c.toolExec,
 		mw:          NewStack(c.middleware...),
@@ -80,7 +82,7 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		}
 
 		// Phase 2 — CallModel: ModifyRequest → stream → AfterModel.
-		req := &llm.Request{System: l.instruction, Messages: history, Tools: l.schemas}
+		req := &llm.Request{System: renderTemplate(l.instruction, rc.State.KV), Messages: history, Tools: l.schemas}
 		req.Options.Apply(l.modelOpts...)
 		lc.Request = req
 		if err := l.mw.ModifyRequest(lc, req); err != nil {
@@ -102,6 +104,9 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 
 		calls := final.ToolCalls()
 		if len(calls) == 0 {
+			if l.outputKey != "" {
+				rc.State.Apply(core.StateOp{Kind: core.OpSetKV, Key: l.outputKey, Value: final.Text()})
+			}
 			rc.State.Messages = history
 			l.checkpoint(rc, step, nil)
 			rc.publish(core.TurnDone{Step: step})
