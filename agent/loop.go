@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 
 	"github.com/jiujuan/goagent/checkpoint"
@@ -120,12 +121,19 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 			return runOutcome{Err: err}
 		}
 
-		final, ok, err := l.streamModel(rc, lc, req)
+		// Derive the context for this model call. An observability middleware
+		// (ModelContexter) injects its span here so the provider call — and any
+		// downstream traceparent — nests under it. With no such middleware,
+		// genCtx == rc.Context.
+		genCtx := l.mw.ModelContext(lc, rc.Context)
+
+		finalResp, ok, err := l.streamModel(genCtx, rc, lc, req)
 		if !ok {
 			return runOutcome{Err: err}
 		}
+		final := finalResp.Message
 
-		if d, err := l.mw.AfterModel(lc, &llm.Response{Message: final}); err != nil {
+		if d, err := l.mw.AfterModel(lc, finalResp); err != nil {
 			return runOutcome{Err: err}
 		} else if out, stop := terminalFromDirective(d, final); stop {
 			return out
@@ -199,18 +207,21 @@ func terminalFromDirective(d core.Directive, final core.Message) (runOutcome, bo
 
 // streamModel runs one model call, publishing MessageDelta for partials and
 // MessageDone for the final message. ok is false (with err) if the model errored.
-func (l *AgentLoop) streamModel(rc *RunContext, lc *LoopContext, req *llm.Request) (core.Message, bool, error) {
-	var final core.Message
-	for resp, err := range l.model.Generate(rc, req) {
+// genCtx is the (possibly span-carrying) context to invoke the provider with;
+// rc remains the run environment for publishing and state. It returns the final
+// *llm.Response (carrying Usage and StopReason) so AfterModel can observe them.
+func (l *AgentLoop) streamModel(genCtx context.Context, rc *RunContext, lc *LoopContext, req *llm.Request) (*llm.Response, bool, error) {
+	final := &llm.Response{}
+	for resp, err := range l.model.Generate(genCtx, req) {
 		if err != nil {
 			_, _ = l.mw.OnError(lc, err) // retry middleware consulted; real retry lands later
-			return core.Message{}, false, err
+			return nil, false, err
 		}
 		if resp.Partial {
 			rc.publish(core.MessageDelta{Delta: resp.Message})
 			continue
 		}
-		final = resp.Message
+		final = resp
 		rc.publish(core.MessageDone{Message: resp.Message, Usage: resp.Usage})
 	}
 	return final, true, nil

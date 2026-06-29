@@ -23,7 +23,7 @@ import (
 	"github.com/jiujuan/goagent/llm"
 	"github.com/jiujuan/goagent/llm/mock"
 	"github.com/jiujuan/goagent/prompt"
-	"github.com/jiujuan/goagent/skill"
+	"github.com/jiujuan/goagent/skills"
 )
 
 //go:embed skills
@@ -35,7 +35,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	lib, err := skill.Load(sub)
+	lib, err := skills.Load(sub)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -54,9 +54,9 @@ func main() {
 		// Level 1:skill.PromptSection 把可用技能列进 system prompt。
 		agent.WithPrompt(prompt.New().
 			Add(prompt.Identity("你是一个助手。需要某种能力时,先用 use_skill 加载对应技能再行动。")).
-			Add(skill.PromptSection(lib))),
-		// Level 2/3 的入口工具(本例不跑脚本,故只挂 use_skill;脚本用 skill.ScriptTool(lib, sandbox))。
-		agent.WithTools(skill.Tool(lib)),
+			Add(skills.PromptSection(lib))),
+		// Level 2/3 的入口工具(本例不跑脚本,故只挂 use_skill;脚本用 skills.ScriptTool(lib, sandbox))。
+		agent.WithTools(skills.Tool(lib)),
 	)
 	if err != nil {
 		log.Fatal(err)

@@ -17,7 +17,7 @@
 // (LoadDir), an embed.FS compiled into the binary (Load), or a fstest.MapFS in
 // tests. The package depends only on prompt, tool, and core — never the other
 // way round — mirroring the tool/web and tool/exec batteries-included pattern.
-package skill
+package skills
 
 import (
 	"errors"

@@ -1,10 +1,14 @@
 // Command redis collects the Redis-backed queue demos. All need a Redis
 // server; pick a demo with the first argument:
 //
-//	export REDIS_URL=redis://localhost:6379/0
+//	export REDIS_URL=redis://localhost:6379/0   # 或 GOAGENT_REDIS_URL,或写进 config.yaml
 //	go run ./examples/redis queue   # durable job queue (producer + worker pool)
 //	go run ./examples/redis bus     # cross-process progress bus (publish/subscribe)
 //	go run ./examples/redis full    # agent run in a "worker", progress bridged to a "frontend"
+//
+// 配置经 config 包加载:Redis URL 与 queue 旋钮(stream/group/重试阈值…)都来自
+// config(默认值 < config.yaml < 环境变量),再由本文件的 queueOpts 映射到 queue
+// 的函数式 Option。config 不 import queue——值单向流入,DAG 不变。
 //
 // In production each side is a SEPARATE process sharing the same Redis; these
 // programs run both sides in one process so each is a single runnable demo.
@@ -19,6 +23,7 @@ import (
 
 	"github.com/jiujuan/goagent/agent"
 	"github.com/jiujuan/goagent/bus"
+	"github.com/jiujuan/goagent/config"
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/llm"
 	"github.com/jiujuan/goagent/llm/mock"
@@ -26,24 +31,22 @@ import (
 )
 
 func main() {
-	url := os.Getenv("REDIS_URL")
-	if url == "" {
-		fmt.Println("请先设置 REDIS_URL,如:")
-		fmt.Println("  export REDIS_URL=redis://localhost:6379/0")
-		usage()
-		return
-	}
+	// 一次加载。Redis URL 与 queue 旋钮都从这里来(默认 redis://localhost:6379,
+	// 可被 GOAGENT_REDIS_URL / 旧 REDIS_URL / config.yaml 覆盖)。
+	cfg := config.MustLoad()
+	fmt.Printf("使用 Redis: %s  (覆盖: REDIS_URL / GOAGENT_REDIS_URL / config.yaml)\n", cfg.Redis.URL)
+
 	cmd := "full"
 	if len(os.Args) > 1 {
 		cmd = os.Args[1]
 	}
 	switch cmd {
 	case "queue":
-		demoQueue(url)
+		demoQueue(cfg)
 	case "bus":
-		demoBus(url)
+		demoBus(cfg)
 	case "full":
-		demoFull(url)
+		demoFull(cfg)
 	default:
 		usage()
 	}
@@ -53,15 +56,43 @@ func usage() {
 	fmt.Println("用法: go run ./examples/redis [queue|bus|full]")
 }
 
+// queueOpts 把 config 里的 queue 旋钮映射成 queue 的函数式 Option。这一步刻意放在
+// 调用方(main 包):config 只产出强类型值,不 import queue;由这里把"值"装配成
+// "构造参数"。只有非零字段才下发,空值留给 queue 自己的默认(如 DeadStream)。
+func queueOpts(cfg *config.Config) []queue.Option {
+	opts := []queue.Option{queue.WithRedis(cfg.Redis.URL)}
+	q := cfg.Queue
+	if q.Stream != "" {
+		opts = append(opts, queue.WithStream(q.Stream))
+	}
+	if q.Group != "" {
+		opts = append(opts, queue.WithGroup(q.Group))
+	}
+	if q.DeadStream != "" {
+		opts = append(opts, queue.WithDeadStream(q.DeadStream))
+	}
+	if q.IdleThreshold > 0 {
+		opts = append(opts, queue.WithIdleThreshold(q.IdleThreshold))
+	}
+	if q.MaxDeliveries > 0 {
+		opts = append(opts, queue.WithMaxDeliveries(q.MaxDeliveries))
+	}
+	if q.MaxLen > 0 {
+		opts = append(opts, queue.WithMaxLen(q.MaxLen))
+	}
+	return opts
+}
+
 // --- demo 1: 持久任务队列 ----------------------------------------------------
 //
 // 生产者把可序列化任务(Type+Payload)写入 Redis Stream;工作池用 Registry 重建
 // 并执行。任务在 Redis 里,崩溃可恢复,多 worker 进程可共享同一队列。
-func demoQueue(url string) {
+func demoQueue(cfg *config.Config) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	q, c, err := queue.New(queue.WithRedis(url), queue.WithGroup("demo-queue"))
+	// config 提供的旋钮 + 本 demo 专属覆盖(WithGroup 后置 → 覆盖 config 默认组)。
+	q, c, err := queue.New(append(queueOpts(cfg), queue.WithGroup("demo-queue"))...)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -103,8 +134,8 @@ func demoQueue(url string) {
 //
 // 一端订阅某 key 的事件,另一端发布。事件经 core.MarshalEvent 序列化走 Redis
 // Pub/Sub,所以发布方和订阅方可以是不同进程。
-func demoBus(url string) {
-	b, err := queue.NewBus(queue.WithRedis(url))
+func demoBus(cfg *config.Config) {
+	b, err := queue.NewBus(queue.WithRedis(cfg.Redis.URL))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -138,8 +169,8 @@ func demoBus(url string) {
 //
 // 完整故事:worker 跑一个 agent,用 queue.Bridge 把它的事件镜像到 Redis 总线;
 // frontend(另一进程)订阅该 key,实时看到 agent 的流式进度。
-func demoFull(url string) {
-	b, err := queue.NewBus(queue.WithRedis(url))
+func demoFull(cfg *config.Config) {
+	b, err := queue.NewBus(queue.WithRedis(cfg.Redis.URL))
 	if err != nil {
 		log.Fatal(err)
 	}

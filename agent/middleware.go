@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"context"
+
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/llm"
 )
@@ -24,6 +26,17 @@ type Middleware interface {
 	BeforeTool(*LoopContext, *core.ToolCall) (core.Directive, error)
 	AfterTool(*LoopContext, *core.ToolResult) (core.Directive, error)
 	OnError(*LoopContext, error) (core.Directive, error)
+}
+
+// ModelContexter is an optional middleware capability. If a middleware
+// implements it, the loop calls ModelContext to derive the context.Context
+// passed to model.Generate for the current step. It exists so an observability
+// middleware can inject a tracing span (and a W3C traceparent for downstream
+// services) into the provider call. The core never imports any tracing library;
+// it only offers this seam. A middleware that does not implement it is a no-op
+// in the fold (Stack.ModelContext), so behaviour is unchanged.
+type ModelContexter interface {
+	ModelContext(lc *LoopContext, ctx context.Context) context.Context
 }
 
 // BaseMiddleware provides no-op defaults (every hook returns Continue, nil).
@@ -73,6 +86,19 @@ func (s *Stack) ModifyRequest(lc *LoopContext, req *llm.Request) error {
 		}
 	}
 	return nil
+}
+
+// ModelContext folds the optional ModelContexter capability across the stack:
+// each middleware that implements it derives a child context, threaded in
+// registration order. Middleware that does not implement it is skipped, so the
+// returned context equals the input when no observer is present.
+func (s *Stack) ModelContext(lc *LoopContext, ctx context.Context) context.Context {
+	for _, m := range s.mws {
+		if mc, ok := m.(ModelContexter); ok {
+			ctx = mc.ModelContext(lc, ctx)
+		}
+	}
+	return ctx
 }
 
 func (s *Stack) AfterModel(lc *LoopContext, resp *llm.Response) (core.Directive, error) {

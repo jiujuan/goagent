@@ -24,7 +24,6 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 
 	run := func(i int, c core.ToolCall) {
 		tr, control, ops := l.callOne(rc, c)
-		results[i] = tr
 		if len(ops) > 0 {
 			stateMu.Lock()
 			rc.State.Apply(ops...)
@@ -39,6 +38,10 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 		if d, err := l.mw.AfterTool(lc, &tr); err == nil {
 			ds = append(ds, d)
 		}
+		// Store the result AFTER AfterTool so a hook that rewrites tr (e.g. an
+		// eval ToolGuard marking a bad result IsError) is what the model sees in
+		// history — consistent with the ToolDone event published below.
+		results[i] = tr
 		dirs[i] = core.Resolve(ds...)
 		rc.publish(core.ToolDone{Result: tr})
 	}
