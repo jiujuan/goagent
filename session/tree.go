@@ -15,11 +15,9 @@ type Ref struct {
 	Active      bool   // whether this tip is the session's current active leaf
 }
 
-// TreeStore is an optional Store extension for sessions whose history is a tree.
-// It adds branch switching (Checkout), copy-from-a-node (Fork), and tip
-// enumeration (Branches) on top of the linear Store contract. Stores that do
-// not implement it remain perfectly usable for linear conversations; callers
-// detect support with a type assertion:
+// TreeStore is the backward-compatible name of the graph navigation extension.
+// It adds branch switching, graph-closure fork, and tip enumeration on top of
+// Store. Merge secondary edges are included when computing tips and fork data.
 //
 //	if ts, ok := store.(TreeStore); ok { ... }
 type TreeStore interface {
@@ -69,6 +67,9 @@ func (s *Session) tipsLocked() []string {
 		if e.ParentID != "" {
 			hasChild[e.ParentID] = true
 		}
+		for _, parent := range e.MergeParents {
+			hasChild[parent] = true
+		}
 	}
 	var tips []string
 	for _, e := range s.events {
@@ -89,6 +90,10 @@ func (s *Session) branchRefs() []Ref {
 
 func (s *Session) branchRefsLocked() []Ref {
 	tips := s.tipsLocked()
+	if s.leaf != "" && !slices.Contains(tips, s.leaf) {
+		tips = append(tips, s.leaf)
+		slices.Sort(tips)
+	}
 	refs := make([]Ref, 0, len(tips))
 	for _, id := range tips {
 		refs = append(refs, Ref{Name: branchName(id), LeafEventID: id, Active: id == s.leaf})
@@ -115,7 +120,10 @@ func (s *Session) forkEvents(fromID string) ([]*core.Event, error) {
 	if _, ok := s.byID[fromID]; !ok {
 		return nil, fmt.Errorf("session: fork from unknown event %q", fromID)
 	}
-	path := s.pathToLocked(fromID)
+	// A merge node depends on every detached branch reachable through its
+	// secondary parents. Copy the logical projection, which is a deterministic
+	// topological closure containing all referenced events before the merge.
+	path := s.logicalPathToLocked(fromID)
 	out := make([]*core.Event, len(path))
 	for i, e := range path {
 		out[i] = core.CloneEvent(e)

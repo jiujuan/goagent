@@ -1,14 +1,12 @@
-// Package session models conversation history and state. History is an
-// append-only event log, but each event carries a ParentID so the log forms a
-// tree: the active conversation a model sees is the path from the active leaf
-// back to the root. A purely linear session is the degenerate tree where every
-// event's parent is its predecessor, so existing linear usage is unchanged.
-// Branch switching, fork, and re-summarization (see docs/SESSION-TREE.md) layer
-// on top of this model without breaking the Store contract.
+// Package session models conversation history and state as an append-only event
+// graph. ParentID preserves a primary tree lineage; merge events add ordered
+// secondary parents so isolated parallel branches form a DAG. Linear sessions
+// remain the degenerate case where every event's parent is its predecessor.
 package session
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"slices"
 	"strings"
@@ -70,9 +68,9 @@ func (s *mapState) All() map[string]any {
 }
 
 // Session is one conversation: identity, mutable state, and an append-only
-// event tree. events holds every committed event across all branches in commit
-// order; byID indexes them; leaf is the active branch tip. The active history
-// (Messages/Events) is the path from leaf back to the root.
+// event graph. events holds physical commit order; byID indexes nodes; leaf is
+// the active published tip. Messages and Events expose a deterministic logical
+// projection that expands merge parents in declaration order.
 type Session struct {
 	ID      string
 	AppName string
@@ -140,7 +138,7 @@ func (s *Session) Revision() uint64 {
 func (s *Session) Snapshot() Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	path := s.pathToLocked(s.leaf)
+	path := s.logicalPathToLocked(s.leaf)
 	return Snapshot{
 		id:       s.ID,
 		appName:  s.AppName,
@@ -157,7 +155,7 @@ func (s *Session) Snapshot() Snapshot {
 func (s *Session) activePath() []*core.Event {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return cloneEvents(s.pathToLocked(s.leaf))
+	return cloneEvents(s.logicalPathToLocked(s.leaf))
 }
 
 // pathTo walks from the event id back to the root via ParentID and returns the
@@ -203,7 +201,46 @@ func (s *Session) allEvents() []*core.Event {
 func (s *Session) Messages() []core.Message {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return projectMessages(s.pathToLocked(s.leaf))
+	return projectMessages(s.logicalPathToLocked(s.leaf))
+}
+
+// logicalPathToLocked expands merge parents before their merge node while
+// preserving ParentID as the primary lineage. A seen set prevents malformed
+// graphs from duplicating events or recursing forever.
+func (s *Session) logicalPathToLocked(id string) []*core.Event {
+	primary := s.pathToLocked(id)
+	out := make([]*core.Event, 0, len(primary))
+	seen := map[string]bool{}
+	for _, event := range primary {
+		s.appendLogicalEventLocked(&out, event, seen)
+	}
+	return out
+}
+
+func (s *Session) appendLogicalEventLocked(out *[]*core.Event, event *core.Event, seen map[string]bool) {
+	if event == nil || seen[event.ID] {
+		return
+	}
+	for _, tip := range event.MergeParents {
+		for _, branchEvent := range s.segmentAfterLocked(event.ParentID, tip) {
+			s.appendLogicalEventLocked(out, branchEvent, seen)
+		}
+	}
+	seen[event.ID] = true
+	*out = append(*out, event)
+}
+
+func (s *Session) segmentAfterLocked(baseID, tipID string) []*core.Event {
+	path := s.pathToLocked(tipID)
+	if baseID == "" {
+		return path
+	}
+	for i, event := range path {
+		if event.ID == baseID {
+			return path[i+1:]
+		}
+	}
+	return nil
 }
 
 func projectMessages(path []*core.Event) []core.Message {
@@ -266,6 +303,82 @@ func (s *Session) commit(e *core.Event) {
 	s.commitLocked(e)
 }
 
+// append validates and commits an event under one Session lock. Stores call it
+// for in-memory commits; durable stores run the same validation before writing.
+func (s *Session) append(e *core.Event) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e.ParentID == "" {
+		e.ParentID = s.leaf
+	}
+	if err := s.validateAppendLocked(e); err != nil {
+		return err
+	}
+	s.commitLocked(e)
+	return nil
+}
+
+func (s *Session) validateAppendLocked(e *core.Event) error {
+	if e.ID == "" {
+		return fmt.Errorf("session: event ID is required")
+	}
+	if _, exists := s.byID[e.ID]; exists {
+		return fmt.Errorf("session: duplicate event ID %q", e.ID)
+	}
+	if e.ParentID != "" {
+		if _, exists := s.byID[e.ParentID]; !exists {
+			return fmt.Errorf("session: unknown parent event %q", e.ParentID)
+		}
+	} else if len(s.events) > 0 {
+		return fmt.Errorf("session: non-root event %q has no parent", e.ID)
+	}
+	seenParents := map[string]bool{}
+	for _, parent := range e.MergeParents {
+		if seenParents[parent] {
+			return fmt.Errorf("session: duplicate merge parent %q", parent)
+		}
+		seenParents[parent] = true
+		if _, exists := s.byID[parent]; !exists {
+			return fmt.Errorf("session: unknown merge parent %q", parent)
+		}
+		if !s.descendsFromLocked(parent, e.ParentID) {
+			return fmt.Errorf("session: merge parent %q does not descend from base %q", parent, e.ParentID)
+		}
+	}
+	if len(e.MergeParents) > 0 && !e.Detached && e.ParentID != s.leaf {
+		return fmt.Errorf("session: active merge base %q is not current leaf %q", e.ParentID, s.leaf)
+	}
+	deleting := map[string]bool{}
+	for _, key := range e.Actions.StateDelete {
+		deleting[key] = true
+	}
+	for key := range e.Actions.StateDelta {
+		if deleting[key] {
+			return fmt.Errorf("session: state key %q is both set and deleted", key)
+		}
+	}
+	return nil
+}
+
+func (s *Session) descendsFromLocked(id, ancestor string) bool {
+	if id == ancestor {
+		return true
+	}
+	seen := map[string]bool{}
+	for id != "" && !seen[id] {
+		seen[id] = true
+		event := s.byID[id]
+		if event == nil {
+			return false
+		}
+		id = event.ParentID
+		if id == ancestor {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Session) commitLocked(e *core.Event) {
 	if e.ParentID == "" {
 		e.ParentID = s.leaf
@@ -276,8 +389,18 @@ func (s *Session) commitLocked(e *core.Event) {
 	owned := core.CloneEvent(e)
 	s.byID[owned.ID] = owned
 	s.events = append(s.events, owned)
+	if e.Detached {
+		s.revision++
+		return
+	}
 	s.leaf = e.ID
 
+	for _, key := range e.Actions.StateDelete {
+		if strings.HasPrefix(key, "temp:") {
+			continue
+		}
+		delete(s.state, key)
+	}
 	for k, v := range e.Actions.StateDelta {
 		if strings.HasPrefix(k, "temp:") {
 			continue
@@ -305,6 +428,12 @@ func (s *Session) stateAlong(leaf string) State {
 func (s *Session) stateAlongLocked(leaf string) map[string]any {
 	state := map[string]any{}
 	for _, e := range s.pathToLocked(leaf) {
+		for _, key := range e.Actions.StateDelete {
+			if strings.HasPrefix(key, "temp:") {
+				continue
+			}
+			delete(state, key)
+		}
 		for k, v := range e.Actions.StateDelta {
 			if strings.HasPrefix(k, "temp:") {
 				continue

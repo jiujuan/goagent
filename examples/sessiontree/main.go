@@ -12,11 +12,13 @@
 //
 // # The model
 //
-// A session's history is an append-only event log, but every event carries a
-// ParentID, so the log is really a TREE. The "active conversation" a model sees
-// is the path from the active leaf back to the root. A purely linear chat is the
-// degenerate tree where each event's parent is its predecessor — so nothing
-// about ordinary usage changes.
+// ParallelAgent extends the primary ParentID tree with ordered merge-parent
+// edges. The resulting DAG still exposes one deterministic active projection,
+// while detached branch chains remain available for checkout and audit.
+//
+// ParentID remains the primary lineage used by ordinary linear conversations.
+// Merge nodes expand detached parents in declaration order, while a linear chat
+// is still the degenerate tree where every event has one primary parent.
 //
 // # APIs demonstrated
 //

@@ -50,8 +50,7 @@ func (st *InMemoryStore) Append(_ context.Context, s *Session, e *core.Event) er
 	if e.ID == "" {
 		e.ID = core.NewID("evt")
 	}
-	s.commit(e)
-	return nil
+	return s.append(e)
 }
 
 // Checkout implements TreeStore.

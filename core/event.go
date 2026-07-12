@@ -12,12 +12,20 @@ type Event struct {
 	Author       string `json:"author"`
 	Branch       string `json:"branch,omitempty"`
 
-	// ParentID links this event to the one it was appended after, forming the
-	// session's history as a tree rather than a flat list. An empty ParentID
-	// means "append after the current leaf" (a linear session is the degenerate
-	// tree where every event's parent is its predecessor). The active message
-	// history a model sees is the path from the active leaf back to the root.
+	// ParentID is the primary lineage edge. An empty value means "append after
+	// the current leaf". MergeParents adds ordered secondary edges without
+	// breaking consumers that understand only the primary tree.
 	ParentID string `json:"parent_id,omitempty"`
+
+	// Detached records an event without publishing it as the Session's active
+	// leaf or applying its state actions to live state. Parallel branches use
+	// detached chains and publish them atomically through a later merge event.
+	Detached bool `json:"detached,omitempty"`
+
+	// MergeParents lists detached branch tips in deterministic projection order.
+	// ParentID remains the primary/base parent for backward-compatible history;
+	// these secondary edges turn the event tree into a merge-capable DAG.
+	MergeParents []string `json:"merge_parents,omitempty"`
 
 	// SummarizesTo, when non-empty, marks this event as a summary node: its
 	// Message stands in for the conversation prefix from the root up to and
@@ -54,12 +62,21 @@ type Event struct {
 	// Err carries a failure down the same stream as normal events, so
 	// subscribers never special-case errors.
 	Err error `json:"-"`
+
+	// GraphManaged is transient runtime metadata. A composite agent sets it once
+	// ParentID/Detached semantics have been assigned, preventing an enclosing
+	// parallel workflow from re-parenting nested branch events.
+	GraphManaged bool `json:"-"`
 }
 
 // Actions are the declarative side effects an Event requests.
 type Actions struct {
 	// StateDelta is merged into session state when the event is committed.
 	StateDelta map[string]any `json:"state_delta,omitempty"`
+
+	// StateDelete removes keys when the event is published. It complements
+	// StateDelta so branch overlays can persist deletions during merge.
+	StateDelete []string `json:"state_delete,omitempty"`
 
 	// TransferToAgent, when set, hands control to the named agent.
 	TransferToAgent string `json:"transfer_to_agent,omitempty"`

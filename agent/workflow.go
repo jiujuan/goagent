@@ -1,9 +1,14 @@
 package agent
 
 import (
+	"fmt"
+	"maps"
+	"reflect"
+	"slices"
 	"sync"
 
 	"github.com/jiujuan/goagent/core"
+	"github.com/jiujuan/goagent/session"
 )
 
 // --- Sequential -------------------------------------------------------------
@@ -77,17 +82,40 @@ func (a *LoopAgent) Run(ictx InvocationContext) core.Stream {
 
 // --- Parallel ---------------------------------------------------------------
 
-// ParallelAgent runs its sub-agents concurrently, each on its own branch, and
-// merges their events. A bounded channel provides back-pressure: a sub-agent
-// blocks until the merger consumes its previous event.
+// ParallelAgent runs sub-agents on isolated event and state branches. Branch
+// events are persisted as detached chains, then one merge event publishes their
+// logical history and resolved state in declaration order. Per-event ACKs keep
+// each branch cursor aligned with Runner persistence.
 type ParallelAgent struct {
 	name string
 	subs []Agent
+	opts ParallelOptions
+}
+
+// StateConflictPolicy controls deterministic resolution when multiple branches
+// change the same state key to different values.
+type StateConflictPolicy int
+
+const (
+	RejectStateConflicts StateConflictPolicy = iota
+	PreferEarlierBranch
+	PreferLaterBranch
+)
+
+// ParallelOptions configures merge behavior without changing the simple
+// Parallel constructor. The zero value rejects conflicting state writes.
+type ParallelOptions struct {
+	StateConflict StateConflictPolicy
 }
 
 // Parallel builds a ParallelAgent.
 func Parallel(name string, subs ...Agent) *ParallelAgent {
-	return &ParallelAgent{name: name, subs: subs}
+	return ParallelWithOptions(name, ParallelOptions{}, subs...)
+}
+
+// ParallelWithOptions builds a ParallelAgent with explicit merge policy.
+func ParallelWithOptions(name string, opts ParallelOptions, subs ...Agent) *ParallelAgent {
+	return &ParallelAgent{name: name, subs: subs, opts: opts}
 }
 
 func (a *ParallelAgent) Name() string        { return a.name }
@@ -97,6 +125,12 @@ func (a *ParallelAgent) SubAgents() []Agent  { return a.subs }
 type parallelItem struct {
 	ev  *core.Event
 	err error
+	ack chan struct{}
+}
+
+type parallelBranchResult struct {
+	tip   string
+	patch session.StatePatch
 }
 
 func (a *ParallelAgent) Run(ictx InvocationContext) core.Stream {
@@ -104,26 +138,58 @@ func (a *ParallelAgent) Run(ictx InvocationContext) core.Stream {
 		// Capture one immutable baseline before any child starts. A slow child
 		// must not observe events already emitted by a faster sibling.
 		base := ictx.refreshSnapshot()
+		if len(a.subs) == 0 {
+			return
+		}
 		merged := make(chan parallelItem)
 		var wg sync.WaitGroup
 		done := make(chan struct{})
+		results := make([]parallelBranchResult, len(a.subs))
 
-		for _, sub := range a.subs {
+		for index, sub := range a.subs {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				scope := newBranchScope(base.snapshot())
 				branch := ictx.Branch
 				if branch == "" {
 					branch = a.name
 				}
 				branch += "." + sub.Name()
-				for ev, err := range sub.Run(base.withAgent(sub, branch)) {
+				child := base.withAgent(sub, branch)
+				child.branchScope = scope
+				for ev, err := range sub.Run(child) {
+					managedHere := ev != nil && !ev.GraphManaged
+					if managedHere {
+						if ev.ID == "" {
+							ev.ID = core.NewID("evt")
+						}
+						if ev.Branch == "" {
+							ev.Branch = branch
+						}
+						ev.ParentID = scope.parentID()
+						ev.Detached = true
+						ev.GraphManaged = true
+					}
+					ack := make(chan struct{})
 					select {
-					case merged <- parallelItem{ev, err}:
+					case merged <- parallelItem{ev: ev, err: err, ack: ack}:
 					case <-done:
 						return
 					}
+					select {
+					case <-ack:
+					case <-done:
+						return
+					}
+					if managedHere && err == nil {
+						scope.accept(ev)
+					}
+					if err != nil {
+						return
+					}
 				}
+				results[index] = parallelBranchResult{tip: scope.tipID(), patch: scope.patch()}
 			}()
 		}
 
@@ -134,10 +200,103 @@ func (a *ParallelAgent) Run(ictx InvocationContext) core.Stream {
 
 		defer close(done)
 		for it := range merged {
-			if !yield(it.ev, it.err) {
+			ok := yield(it.ev, it.err)
+			close(it.ack)
+			if !ok || it.err != nil {
 				return
 			}
 		}
+
+		actions, err := mergeBranchPatches(results, a.opts.StateConflict)
+		if err != nil {
+			yield(&core.Event{ID: core.NewID("evt"), InvocationID: ictx.InvocationID, Author: a.name, Err: err}, err)
+			return
+		}
+		parents := make([]string, 0, len(results))
+		for _, result := range results {
+			if result.tip != "" && result.tip != base.snapshot().Leaf() {
+				parents = append(parents, result.tip)
+			}
+		}
+		merge := &core.Event{
+			ID:           core.NewID("evt"),
+			InvocationID: ictx.InvocationID,
+			Author:       a.name,
+			Branch:       ictx.Branch,
+			ParentID:     base.snapshot().Leaf(),
+			Detached:     ictx.branchScope != nil,
+			MergeParents: parents,
+			Actions:      actions,
+			GraphManaged: true,
+		}
+		if !yield(merge, nil) {
+			return
+		}
+		if ictx.branchScope != nil {
+			ictx.branchScope.accept(merge)
+		}
+	}
+}
+
+type branchMutation struct {
+	branch int
+	delete bool
+	value  any
+}
+
+func mergeBranchPatches(results []parallelBranchResult, policy StateConflictPolicy) (core.Actions, error) {
+	mutations := map[string]branchMutation{}
+	for branch, result := range results {
+		deletes := map[string]bool{}
+		for _, key := range result.patch.Delete {
+			deletes[key] = true
+			if err := mergeMutation(mutations, key, branchMutation{branch: branch, delete: true}, policy); err != nil {
+				return core.Actions{}, err
+			}
+		}
+		keys := slices.Sorted(maps.Keys(result.patch.Delta))
+		for _, key := range keys {
+			if deletes[key] {
+				continue
+			}
+			if err := mergeMutation(mutations, key, branchMutation{branch: branch, value: result.patch.Delta[key]}, policy); err != nil {
+				return core.Actions{}, err
+			}
+		}
+	}
+	actions := core.Actions{StateDelta: map[string]any{}}
+	keys := slices.Sorted(maps.Keys(mutations))
+	for _, key := range keys {
+		mutation := mutations[key]
+		if mutation.delete {
+			actions.StateDelete = append(actions.StateDelete, key)
+		} else {
+			actions.StateDelta[key] = mutation.value
+		}
+	}
+	if len(actions.StateDelta) == 0 {
+		actions.StateDelta = nil
+	}
+	return actions, nil
+}
+
+func mergeMutation(dst map[string]branchMutation, key string, next branchMutation, policy StateConflictPolicy) error {
+	current, exists := dst[key]
+	if !exists {
+		dst[key] = next
+		return nil
+	}
+	if current.delete == next.delete && (current.delete || reflect.DeepEqual(current.value, next.value)) {
+		return nil
+	}
+	switch policy {
+	case PreferEarlierBranch:
+		return nil
+	case PreferLaterBranch:
+		dst[key] = next
+		return nil
+	default:
+		return fmt.Errorf("parallel: state key %q conflicts between branches %d and %d", key, current.branch, next.branch)
 	}
 }
 

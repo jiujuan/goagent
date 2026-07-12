@@ -11,6 +11,10 @@
 //	├─ writer                 读取前序调研（消息历史）产出初稿
 //	└─ Loop「refine」(≤3 轮)   critic 评审 / reviser 修订，达标时 Escalate 跳出
 //
+// Parallel branches persist as isolated detached chains. Their merge publishes
+// messages in declaration order and applies OutputKey state atomically before
+// the writer stage starts.
+//
 // It showcases:
 //   - Parallel 并发分支 + OutputKey 写入共享 state；
 //   - Sequential 阶段间通过已提交的消息历史传递数据；

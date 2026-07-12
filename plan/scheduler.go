@@ -44,7 +44,7 @@ func newScheduler(p *Plan, maxConc int, backend Backend, approver Approver, auth
 		backend:  backend,
 		approver: approver,
 		author:   author,
-		state:    ictx.Session.State(),
+		state:    ictx.MutableState(),
 		ictx:     ictx,
 	}
 }

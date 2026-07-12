@@ -31,6 +31,8 @@ func CloneEvent(e *Event) *Event {
 		return nil
 	}
 	out := *e
+	out.GraphManaged = false
+	out.MergeParents = append([]string(nil), e.MergeParents...)
 	if e.Message != nil {
 		msg := CloneMessage(*e.Message)
 		out.Message = &msg
@@ -38,6 +40,7 @@ func CloneEvent(e *Event) *Event {
 	if e.Actions.StateDelta != nil {
 		out.Actions.StateDelta = maps.Clone(e.Actions.StateDelta)
 	}
+	out.Actions.StateDelete = append([]string(nil), e.Actions.StateDelete...)
 	if e.Usage != nil {
 		usage := *e.Usage
 		out.Usage = &usage
