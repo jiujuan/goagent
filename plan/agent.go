@@ -113,8 +113,8 @@ func (a *PlanAgent) Run(ictx agent.InvocationContext) core.Stream {
 
 			// Replan on aborting failure, if configured and budget remains.
 			if a.canReplan(p, attempt) {
-				recordFailure(ictx.Session.State(), p)
-				ictx.Session.State().Delete(draftKey) // force the planner to re-run
+				recordFailure(ictx.MutableState(), p)
+				ictx.MutableState().Delete(draftKey) // force the planner to re-run
 				note := core.AssistantText(fmt.Sprintf("⚠️ 计划存在失败步骤，第 %d 次重规划…", attempt+1))
 				if !yield(&core.Event{ID: core.NewID("evt"), InvocationID: ictx.InvocationID, Author: a.cfg.Name, Message: &note}, nil) {
 					return
@@ -146,7 +146,7 @@ func (a *PlanAgent) canReplan(p *Plan, attempt int) bool {
 // resumed or replanned run skips completed steps. The bool is false when the
 // planner stream was stopped by the consumer (the caller should just return).
 func (a *PlanAgent) resolvePlan(ictx agent.InvocationContext, yield func(*core.Event, error) bool) (*Plan, bool, error) {
-	state := ictx.Session.State()
+	state := ictx.MutableState()
 
 	var template *Plan
 	switch {

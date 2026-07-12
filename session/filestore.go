@@ -72,6 +72,9 @@ func (st *FileStore) Append(_ context.Context, s *Session, e *core.Event) error 
 	if e.ParentID == "" {
 		e.ParentID = s.leaf
 	}
+	if err := s.validateAppendLocked(e); err != nil {
+		return err
+	}
 	line, err := json.Marshal(e)
 	if err != nil {
 		return fmt.Errorf("session: marshal event: %w", err)

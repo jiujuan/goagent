@@ -51,6 +51,35 @@ func (s Snapshot) State() StateReader {
 	return snapshotState{values: maps.Clone(s.state)}
 }
 
+// WithState returns a copy whose state view is replaced by state. Branch
+// runtimes use it to combine committed branch history with an in-memory overlay.
+func (s Snapshot) WithState(state StateReader) Snapshot {
+	if state == nil {
+		s.state = map[string]any{}
+	} else {
+		s.state = state.All()
+	}
+	return s
+}
+
+// SnapshotAt captures the logical history and path-derived state ending at an
+// arbitrary committed event, including detached branch tips and merge nodes.
+func (s *Session) SnapshotAt(eventID string) Snapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	path := s.logicalPathToLocked(eventID)
+	return Snapshot{
+		id:       s.ID,
+		appName:  s.AppName,
+		userID:   s.UserID,
+		revision: s.revision,
+		leaf:     eventID,
+		events:   cloneEvents(path),
+		messages: projectMessages(path),
+		state:    s.stateAlongLocked(eventID),
+	}
+}
+
 type snapshotState struct {
 	values map[string]any
 }

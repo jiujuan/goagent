@@ -44,6 +44,7 @@ type InvocationContext struct {
 	SessionSnapshot *session.Snapshot
 	Branch          string
 	UserContent     core.Message
+	branchScope     *branchScope
 
 	// transferDepth counts how many delegations have chained in this run, used
 	// to bound runaway agent-to-agent ping-pong.
@@ -68,9 +69,27 @@ func (ictx InvocationContext) refreshSnapshot() InvocationContext {
 		ictx.SessionSnapshot = nil
 		return ictx
 	}
-	snapshot := ictx.Session.Snapshot()
+	var snapshot session.Snapshot
+	if ictx.branchScope != nil {
+		snapshot = ictx.branchScope.snapshot(ictx.Session)
+	} else {
+		snapshot = ictx.Session.Snapshot()
+	}
 	ictx.SessionSnapshot = &snapshot
 	return ictx
+}
+
+// MutableState returns the state boundary for this execution unit. Normal
+// invocations use live Session state; parallel branches use an isolated overlay
+// that is published only by their merge event.
+func (ictx InvocationContext) MutableState() session.State {
+	if ictx.branchScope != nil {
+		return ictx.branchScope.state()
+	}
+	if ictx.Session != nil {
+		return ictx.Session.State()
+	}
+	return session.NewState()
 }
 
 func (ictx InvocationContext) snapshot() session.Snapshot {
@@ -248,7 +267,12 @@ func (a *LLMAgent) Run(ictx InvocationContext) core.Stream {
 			history = append(history, toolMsg)
 
 			toolEvt := a.event(ictx, &toolMsg, false, nil)
-			toolEvt.Actions = core.Actions{StateDelta: acts.StateDelta, Escalate: acts.Escalate, Stop: acts.Stop}
+			toolEvt.Actions = core.Actions{
+				StateDelta:  acts.StateDelta,
+				StateDelete: acts.StateDelete,
+				Escalate:    acts.Escalate,
+				Stop:        acts.Stop,
+			}
 			if !yield(toolEvt, nil) {
 				return
 			}
@@ -314,13 +338,25 @@ func (a *LLMAgent) execTools(ictx InvocationContext, byName map[string]tool.Tool
 			defer wg.Done()
 			acts := &core.Actions{}
 			actions[i] = acts
+			// Each concurrent tool receives an isolated overlay. Direct State writes
+			// are converted into Actions below and later folded in model call order,
+			// eliminating scheduler-dependent last-writer behavior.
+			toolState := session.NewOverlay(ictx.MutableState())
 			tctx := &tool.Context{
 				Context: ictx,
-				State:   ictx.Session.State(),
+				State:   toolState,
 				Actions: acts,
 				CallID:  c.ID,
 			}
 			res, err := t.Call(tctx, c.Args)
+			patch := toolState.Patch()
+			if acts.StateDelta == nil && len(patch.Delta) > 0 {
+				acts.StateDelta = map[string]any{}
+			}
+			for key, value := range patch.Delta {
+				acts.StateDelta[key] = value
+			}
+			acts.StateDelete = append(acts.StateDelete, patch.Delete...)
 			if err != nil {
 				results[i] = core.ToolResult{
 					CallID: c.ID, Name: c.Name, IsError: true,
@@ -338,20 +374,26 @@ func (a *LLMAgent) execTools(ictx InvocationContext, byName map[string]tool.Tool
 	return results, mergeActions(actions)
 }
 
-// mergeActions folds the per-tool Actions into one. StateDelta entries are
-// merged; TransferToAgent takes the last non-empty value; Escalate/Stop are
-// OR-ed.
+// mergeActions folds per-tool Actions in the model's call order. Later state
+// sets/deletes win deterministically; TransferToAgent takes the last non-empty
+// value, while Escalate and Stop are OR-ed.
 func mergeActions(list []*core.Actions) core.Actions {
 	var m core.Actions
+	deleted := map[string]bool{}
 	for _, a := range list {
 		if a == nil {
 			continue
+		}
+		for _, key := range a.StateDelete {
+			delete(m.StateDelta, key)
+			deleted[key] = true
 		}
 		for k, v := range a.StateDelta {
 			if m.StateDelta == nil {
 				m.StateDelta = map[string]any{}
 			}
 			m.StateDelta[k] = v
+			delete(deleted, k)
 		}
 		if a.TransferToAgent != "" {
 			m.TransferToAgent = a.TransferToAgent
@@ -359,6 +401,10 @@ func mergeActions(list []*core.Actions) core.Actions {
 		m.Escalate = m.Escalate || a.Escalate
 		m.Stop = m.Stop || a.Stop
 	}
+	for key := range deleted {
+		m.StateDelete = append(m.StateDelete, key)
+	}
+	slices.Sort(m.StateDelete)
 	return m
 }
 

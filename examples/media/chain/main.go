@@ -86,7 +86,7 @@ func (a *stateAgent) SubAgents() []agent.Agent {
 
 func (a *stateAgent) Run(ictx agent.InvocationContext) core.Stream {
 	// ictx is a value; mutating our copy's UserContent only affects the child.
-	if v, ok := ictx.Session.State().Get(a.key); ok {
+	if v, ok := ictx.MutableState().Get(a.key); ok {
 		if s, ok := v.(string); ok && s != "" {
 			ictx.UserContent = core.UserText(s)
 		}

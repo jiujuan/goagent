@@ -78,6 +78,12 @@ func (b *PipelineBuilder) ThenParallel(name string, subs ...Agent) *PipelineBuil
 	return b.Then(Parallel(name, subs...))
 }
 
+// ThenParallelWithOptions appends a fan-out stage with explicit state-conflict
+// behavior for the deterministic merge.
+func (b *PipelineBuilder) ThenParallelWithOptions(name string, opts ParallelOptions, subs ...Agent) *PipelineBuilder {
+	return b.Then(ParallelWithOptions(name, opts, subs...))
+}
+
 // ThenLoop appends a stage that repeats its sub-agents until one escalates or
 // maxIterations is reached (0 = until escalation; see LoopAgent).
 func (b *PipelineBuilder) ThenLoop(name string, maxIterations int, subs ...Agent) *PipelineBuilder {

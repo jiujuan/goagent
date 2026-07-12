@@ -11,7 +11,8 @@
 //	    ThenLoop("review", 3, critic, reviser).     // ④ 评审-修订循环（Escalate 跳出）
 //	    Build()
 //
-// Each leaf is an LLMAgent on the mock provider, so no API key is required.
+// The fan-out stage uses isolated state/event branches and a deterministic
+// merge before writer runs. Each leaf uses the mock provider; no key is needed.
 package main
 
 import (
