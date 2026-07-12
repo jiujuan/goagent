@@ -108,14 +108,29 @@ func main() {
 			if err != nil {
 				return nil, err
 			}
+			// This Redis handler runs the Agent directly instead of going through
+			// Runner, so it must establish the same per-session invocation boundary.
+			// Jobs for one session are serialized; jobs for other sessions still run
+			// concurrently on the worker pool.
+			release, err := sess.BeginInvocation(ctx)
+			if err != nil {
+				return nil, err
+			}
+			defer release()
+
+			// Bind history and prompt state to the revision observed after acquiring
+			// the gate. Supplying the snapshot explicitly also covers custom Agent
+			// implementations that do not have LLMAgent's snapshot fallback.
+			snapshot := sess.Snapshot()
 			// NOTE: Redis is at-least-once — a job can be redelivered after a crash,
 			// so a production handler should dedupe on the job id before appending.
 			ictx := agent.InvocationContext{
-				Context:     ctx,
-				Agent:       ag,
-				Root:        ag,
-				Session:     sess,
-				UserContent: core.UserText(p.Prompt),
+				Context:         ctx,
+				Agent:           ag,
+				Root:            ag,
+				Session:         sess,
+				SessionSnapshot: &snapshot,
+				UserContent:     core.UserText(p.Prompt),
 			}
 			var final *core.Event
 			for ev, err := range ag.Run(ictx) {
@@ -145,7 +160,7 @@ func main() {
 		queue.WithGroup("workers"),
 		queue.WithRegistry(reg),
 		queue.WithIdleThreshold(30 * time.Second), // > this short job's runtime
-		queue.WithMaxDeliveries(3),                 // poison cap -> DLQ
+		queue.WithMaxDeliveries(3),                // poison cap -> DLQ
 	}
 	q, consumer, err := queue.New(opts...)
 	if err != nil {

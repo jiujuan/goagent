@@ -234,19 +234,21 @@ func recordStep(st session.State, title, output string) {
 	st.Set("exec.results", rs)
 }
 
-func resultsOf(st session.State) []StepResult {
+func resultsOf(st session.StateReader) []StepResult {
 	if v, ok := st.Get("exec.results"); ok {
 		if rs, ok := v.([]StepResult); ok {
-			return rs
+			// Appending may reuse a slice's backing array. Copy on read so recordStep
+			// always builds a replacement value instead of modifying State-owned data.
+			return append([]StepResult(nil), rs...)
 		}
 	}
 	return nil
 }
 
-func planFromState(st session.State) []Step {
+func planFromState(st session.StateReader) []Step {
 	if v, ok := st.Get("plan"); ok {
 		if p, ok := v.([]Step); ok {
-			return p
+			return append([]Step(nil), p...)
 		}
 	}
 	return nil
