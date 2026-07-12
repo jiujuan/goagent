@@ -40,17 +40,30 @@ type TreeStore interface {
 // checkout moves the active leaf to id and rebuilds derived state along the new
 // path. It errors if id is not a known event.
 func (s *Session) checkout(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.checkoutLocked(id)
+}
+
+func (s *Session) checkoutLocked(id string) error {
 	if _, ok := s.byID[id]; !ok {
 		return fmt.Errorf("session: checkout unknown event %q", id)
 	}
 	s.leaf = id
-	s.state = s.stateAlong(id)
+	s.state = s.stateAlongLocked(id)
+	s.revision++
 	return nil
 }
 
 // tips returns the IDs of events that are no event's parent (the tree's
 // leaves), sorted for determinism.
 func (s *Session) tips() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.tipsLocked()
+}
+
+func (s *Session) tipsLocked() []string {
 	hasChild := make(map[string]bool, len(s.events))
 	for _, e := range s.events {
 		if e.ParentID != "" {
@@ -69,7 +82,13 @@ func (s *Session) tips() []string {
 
 // branchRefs builds the branch tip list, marking the active leaf.
 func (s *Session) branchRefs() []Ref {
-	tips := s.tips()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.branchRefsLocked()
+}
+
+func (s *Session) branchRefsLocked() []Ref {
+	tips := s.tipsLocked()
 	refs := make([]Ref, 0, len(tips))
 	for _, id := range tips {
 		refs = append(refs, Ref{Name: branchName(id), LeafEventID: id, Active: id == s.leaf})
@@ -91,14 +110,15 @@ func branchName(id string) string {
 // Events are immutable post-commit, so a shallow struct copy is enough to keep
 // the two sessions from sharing mutable index state.
 func (s *Session) forkEvents(fromID string) ([]*core.Event, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if _, ok := s.byID[fromID]; !ok {
 		return nil, fmt.Errorf("session: fork from unknown event %q", fromID)
 	}
-	path := s.pathTo(fromID)
+	path := s.pathToLocked(fromID)
 	out := make([]*core.Event, len(path))
 	for i, e := range path {
-		cp := *e
-		out[i] = &cp
+		out[i] = core.CloneEvent(e)
 	}
 	return out, nil
 }

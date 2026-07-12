@@ -23,10 +23,13 @@ type Peer struct {
 type Context struct {
 	context.Context
 
-	Session     *session.Session
-	UserContent core.Message
-	AgentName   string
-	AgentDesc   string
-	Tools       []tool.Tool
-	SubAgents   []Peer
+	Session *session.Session
+	// SessionSnapshot is the point-in-time view selected by the workflow. Built-in
+	// state sections prefer it over the live Session so prompt and history agree.
+	SessionSnapshot *session.Snapshot
+	UserContent     core.Message
+	AgentName       string
+	AgentDesc       string
+	Tools           []tool.Tool
+	SubAgents       []Peer
 }

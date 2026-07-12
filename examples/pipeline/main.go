@@ -219,10 +219,13 @@ func printEvent(ev *core.Event) {
 
 // --- 小工具 ---
 
-func items(st session.State, key string) []Feedback {
+func items(st session.StateReader, key string) []Feedback {
 	if v, ok := st.Get(key); ok {
 		if fb, ok := v.([]Feedback); ok {
-			return fb
+			// State owns the stored slice after Set. Return a copy so downstream
+			// stages can enrich records without mutating an earlier stage's value or
+			// racing with a concurrent snapshot reader.
+			return append([]Feedback(nil), fb...)
 		}
 	}
 	return nil

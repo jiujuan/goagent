@@ -27,7 +27,7 @@ func (a *SequentialAgent) SubAgents() []Agent  { return a.subs }
 func (a *SequentialAgent) Run(ictx InvocationContext) core.Stream {
 	return func(yield func(*core.Event, error) bool) {
 		for _, sub := range a.subs {
-			if !core.Pipe(sub.Run(ictx.withAgent(sub, "")), yield) {
+			if !core.Pipe(sub.Run(ictx.withAgent(sub, "").refreshSnapshot()), yield) {
 				return
 			}
 		}
@@ -59,7 +59,7 @@ func (a *LoopAgent) Run(ictx InvocationContext) core.Stream {
 		for iter := 0; a.maxIter == 0 || iter < a.maxIter; iter++ {
 			escalated := false
 			for _, sub := range a.subs {
-				for ev, err := range sub.Run(ictx.withAgent(sub, "")) {
+				for ev, err := range sub.Run(ictx.withAgent(sub, "").refreshSnapshot()) {
 					if !yield(ev, err) {
 						return
 					}
@@ -101,6 +101,9 @@ type parallelItem struct {
 
 func (a *ParallelAgent) Run(ictx InvocationContext) core.Stream {
 	return func(yield func(*core.Event, error) bool) {
+		// Capture one immutable baseline before any child starts. A slow child
+		// must not observe events already emitted by a faster sibling.
+		base := ictx.refreshSnapshot()
 		merged := make(chan parallelItem)
 		var wg sync.WaitGroup
 		done := make(chan struct{})
@@ -114,7 +117,7 @@ func (a *ParallelAgent) Run(ictx InvocationContext) core.Stream {
 					branch = a.name
 				}
 				branch += "." + sub.Name()
-				for ev, err := range sub.Run(ictx.withAgent(sub, branch)) {
+				for ev, err := range sub.Run(base.withAgent(sub, branch)) {
 					select {
 					case merged <- parallelItem{ev, err}:
 					case <-done:
