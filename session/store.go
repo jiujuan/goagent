@@ -47,8 +47,6 @@ func (st *InMemoryStore) GetOrCreate(_ context.Context, appName, userID, session
 
 // Append implements Store.
 func (st *InMemoryStore) Append(_ context.Context, s *Session, e *core.Event) error {
-	st.mu.Lock()
-	defer st.mu.Unlock()
 	if e.ID == "" {
 		e.ID = core.NewID("evt")
 	}
@@ -58,19 +56,17 @@ func (st *InMemoryStore) Append(_ context.Context, s *Session, e *core.Event) er
 
 // Checkout implements TreeStore.
 func (st *InMemoryStore) Checkout(_ context.Context, s *Session, eventID string) error {
-	st.mu.Lock()
-	defer st.mu.Unlock()
 	return s.checkout(eventID)
 }
 
 // Fork implements TreeStore.
 func (st *InMemoryStore) Fork(_ context.Context, s *Session, fromEventID, newSessionID string) (*Session, error) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
 	events, err := s.forkEvents(fromEventID)
 	if err != nil {
 		return nil, err
 	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	ns := seedSession(s.AppName, s.UserID, newSessionID, events)
 	st.sessions[key(s.AppName, s.UserID, newSessionID)] = ns
 	return ns, nil
@@ -78,8 +74,6 @@ func (st *InMemoryStore) Fork(_ context.Context, s *Session, fromEventID, newSes
 
 // Branches implements TreeStore.
 func (st *InMemoryStore) Branches(_ context.Context, s *Session) ([]Ref, error) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
 	return s.branchRefs(), nil
 }
 

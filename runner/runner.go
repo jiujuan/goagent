@@ -51,6 +51,12 @@ func (r *Runner) Run(ctx context.Context, userID, sessionID string, msg core.Mes
 			yield(nil, err)
 			return
 		}
+		release, err := sess.BeginInvocation(ctx)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		defer release()
 
 		invID := core.NewID("inv")
 		userEvt := &core.Event{
@@ -76,6 +82,8 @@ func (r *Runner) Run(ctx context.Context, userID, sessionID string, msg core.Mes
 			Session:      sess,
 			UserContent:  msg,
 		}
+		snapshot := sess.Snapshot()
+		ictx.SessionSnapshot = &snapshot
 
 		for ev, err := range r.root.Run(ictx) {
 			if err != nil {

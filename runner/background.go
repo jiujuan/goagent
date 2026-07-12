@@ -35,6 +35,11 @@ func EnqueueAgent(ctx context.Context, q queue.Queue, store session.Store, appNa
 			if err != nil {
 				return nil, err
 			}
+			release, err := sess.BeginInvocation(rctx)
+			if err != nil {
+				return nil, err
+			}
+			defer release()
 			ictx := agent.InvocationContext{
 				Context:      rctx,
 				InvocationID: jobID,
@@ -43,6 +48,8 @@ func EnqueueAgent(ctx context.Context, q queue.Queue, store session.Store, appNa
 				Session:      sess,
 				UserContent:  msg,
 			}
+			snapshot := sess.Snapshot()
+			ictx.SessionSnapshot = &snapshot
 			var final *core.Event
 			for ev, err := range ag.Run(ictx) {
 				if err != nil {

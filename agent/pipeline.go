@@ -33,7 +33,7 @@ func (a *PipelineAgent) SubAgents() []Agent { return a.stages }
 func (a *PipelineAgent) Run(ictx InvocationContext) core.Stream {
 	return func(yield func(*core.Event, error) bool) {
 		for _, stage := range a.stages {
-			if !core.Pipe(stage.Run(ictx.withAgent(stage, "")), yield) {
+			if !core.Pipe(stage.Run(ictx.withAgent(stage, "").refreshSnapshot()), yield) {
 				return
 			}
 		}

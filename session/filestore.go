@@ -58,8 +58,11 @@ func (st *FileStore) GetOrCreate(_ context.Context, appName, userID, sessionID s
 // Append implements Store: it writes the event as one JSONL line and commits it
 // to the in-memory session.
 func (st *FileStore) Append(_ context.Context, s *Session, e *core.Event) error {
-	st.mu.Lock()
-	defer st.mu.Unlock()
+	// Hold the Session lock across parent selection, durable append, and the
+	// in-memory commit. This serializes one session without blocking unrelated
+	// sessions on FileStore's cache mutex.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if e.ID == "" {
 		e.ID = core.NewID("evt")
@@ -90,33 +93,35 @@ func (st *FileStore) Append(_ context.Context, s *Session, e *core.Event) error 
 		return fmt.Errorf("session: close session file: %w", err)
 	}
 
-	s.commit(e)
+	s.commitLocked(e)
 	// Record the active leaf so a reload restores it. After an append the leaf
 	// is the just-written event; after a prior Checkout this is what keeps the
 	// active branch authoritative rather than "last line in the file".
-	return st.writeRefs(s)
+	return st.writeRefsLocked(s)
 }
 
 // Checkout implements TreeStore: it moves the active leaf and persists it.
 func (st *FileStore) Checkout(_ context.Context, s *Session, eventID string) error {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if err := s.checkout(eventID); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkoutLocked(eventID); err != nil {
 		return err
 	}
-	return st.writeRefs(s)
+	return st.writeRefsLocked(s)
 }
 
 // Fork implements TreeStore: it copies the root..fromEventID path into a new
 // session, writes it to its own JSONL file, and caches it.
 func (st *FileStore) Fork(_ context.Context, s *Session, fromEventID, newSessionID string) (*Session, error) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-
 	events, err := s.forkEvents(fromEventID)
 	if err != nil {
 		return nil, err
 	}
+	// Materializing a new cache key must be atomic with respect to GetOrCreate
+	// for that key. Fork is rare, so the simple cache lock is preferable to
+	// publishing a partially-written session or adding per-key lock machinery.
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	ns := seedSession(s.AppName, s.UserID, newSessionID, events)
 	if err := st.writeAll(ns, events); err != nil {
 		return nil, err
@@ -130,8 +135,6 @@ func (st *FileStore) Fork(_ context.Context, s *Session, fromEventID, newSession
 
 // Branches implements TreeStore.
 func (st *FileStore) Branches(_ context.Context, s *Session) ([]Ref, error) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
 	return s.branchRefs(), nil
 }
 
@@ -168,6 +171,12 @@ func (st *FileStore) refsPath(appName, userID, sessionID string) string {
 }
 
 func (st *FileStore) writeRefs(s *Session) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return st.writeRefsLocked(s)
+}
+
+func (st *FileStore) writeRefsLocked(s *Session) error {
 	path := st.refsPath(s.AppName, s.UserID, s.ID)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("session: create session dir: %w", err)
@@ -240,13 +249,17 @@ func (st *FileStore) load(appName, userID, sessionID string) (*Session, error) {
 		return nil, err
 	}
 	if ok && leaf != "" {
+		s.mu.Lock()
 		if _, known := s.byID[leaf]; known {
 			s.leaf = leaf
 		}
+		s.mu.Unlock()
 	}
 	// Replay rebuilt state incrementally across all lines, which mixes branches
 	// for a non-linear log; recompute it along the active path to be correct.
-	s.state = s.stateAlong(s.leaf)
+	s.mu.Lock()
+	s.state = s.stateAlongLocked(s.leaf)
+	s.mu.Unlock()
 	return s, nil
 }
 

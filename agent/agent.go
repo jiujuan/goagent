@@ -36,10 +36,14 @@ type InvocationContext struct {
 	Agent        Agent
 	// Root is the top of the agent tree for this run, set by the Runner. It
 	// lets any agent locate its parent and peers for transfer direction rules.
-	Root        Agent
-	Session     *session.Session
-	Branch      string
-	UserContent core.Message
+	Root    Agent
+	Session *session.Session
+	// SessionSnapshot is the immutable history/state view this execution unit
+	// must read. Workflow agents control when it is refreshed: parallel children
+	// share one baseline, while sequential stages refresh between stages.
+	SessionSnapshot *session.Snapshot
+	Branch          string
+	UserContent     core.Message
 
 	// transferDepth counts how many delegations have chained in this run, used
 	// to bound runaway agent-to-agent ping-pong.
@@ -56,12 +60,35 @@ func (ictx InvocationContext) withAgent(a Agent, branch string) InvocationContex
 	return ictx
 }
 
+// refreshSnapshot returns a copy bound to the Session's latest committed
+// revision. The Session remains available for live tool state and persistence;
+// model history and prompt sections read from the immutable snapshot.
+func (ictx InvocationContext) refreshSnapshot() InvocationContext {
+	if ictx.Session == nil {
+		ictx.SessionSnapshot = nil
+		return ictx
+	}
+	snapshot := ictx.Session.Snapshot()
+	ictx.SessionSnapshot = &snapshot
+	return ictx
+}
+
+func (ictx InvocationContext) snapshot() session.Snapshot {
+	if ictx.SessionSnapshot != nil {
+		return *ictx.SessionSnapshot
+	}
+	if ictx.Session != nil {
+		return ictx.Session.Snapshot()
+	}
+	return session.Snapshot{}
+}
+
 // ForSubAgent returns a copy of ictx rebound to run sub, on an optional branch
 // (empty keeps the current branch). It is the exported form of withAgent, used
 // by out-of-package orchestrators (e.g. the plan package's AgentExecutor) that
 // invoke a sub-agent's Run directly.
 func (ictx InvocationContext) ForSubAgent(sub Agent, branch string) InvocationContext {
-	return ictx.withAgent(sub, branch)
+	return ictx.withAgent(sub, branch).refreshSnapshot()
 }
 
 // transferTo returns a copy of ictx handed to a transfer target, incrementing
@@ -158,6 +185,11 @@ func (a *LLMAgent) SubAgents() []Agent  { return a.cfg.SubAgents }
 // Run implements Agent.
 func (a *LLMAgent) Run(ictx InvocationContext) core.Stream {
 	return func(yield func(*core.Event, error) bool) {
+		// Direct Agent callers may not have gone through Runner. Bind one snapshot
+		// here so model history and prompt sections still read the same revision.
+		if ictx.SessionSnapshot == nil {
+			ictx = ictx.refreshSnapshot()
+		}
 		// Decorate the model with the configured middleware chain once per run
 		// (compaction, RAG, retry, rate limit, steering, ...).
 		model := middleware.Chain(a.cfg.Model, a.cfg.Middleware...)
@@ -165,7 +197,7 @@ func (a *LLMAgent) Run(ictx InvocationContext) core.Stream {
 		// Seed working history from committed session messages. The agent keeps
 		// its own copy and appends in-turn messages locally, so correctness does
 		// not depend on when the Runner commits.
-		history := slices.Clone(ictx.Session.Messages())
+		history := slices.Clone(ictx.snapshot().Messages())
 
 		// Advertise the agent's own tools, plus a synthetic transfer tool when
 		// delegation is enabled and at least one target (sub-agent, parent, or
@@ -228,7 +260,7 @@ func (a *LLMAgent) Run(ictx InvocationContext) core.Stream {
 					if ictx.transferDepth >= maxTransferDepth {
 						return // bound runaway delegation chains
 					}
-					core.Pipe(target.Run(ictx.transferTo(target)), yield)
+					core.Pipe(target.Run(ictx.transferTo(target).refreshSnapshot()), yield)
 					return
 				}
 				// Unknown or disallowed target: fall through; the model retries.
@@ -364,12 +396,13 @@ func (a *LLMAgent) promptContext(ictx InvocationContext) prompt.Context {
 		peers[i] = prompt.Peer{Name: sub.Name(), Description: sub.Description()}
 	}
 	return prompt.Context{
-		Context:     ictx,
-		Session:     ictx.Session,
-		UserContent: ictx.UserContent,
-		AgentName:   a.cfg.Name,
-		AgentDesc:   a.cfg.Description,
-		Tools:       a.cfg.Tools,
-		SubAgents:   peers,
+		Context:         ictx,
+		Session:         ictx.Session,
+		SessionSnapshot: ictx.SessionSnapshot,
+		UserContent:     ictx.UserContent,
+		AgentName:       a.cfg.Name,
+		AgentDesc:       a.cfg.Description,
+		Tools:           a.cfg.Tools,
+		SubAgents:       peers,
 	}
 }

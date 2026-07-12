@@ -69,7 +69,7 @@ func (w *WorkingMemory) Notes() map[string]string { return w.Snapshot().Notes }
 
 // readSnapshot decodes the Snapshot from State, returning the zero Snapshot when
 // absent or malformed.
-func readSnapshot(st session.State) Snapshot {
+func readSnapshot(st session.StateReader) Snapshot {
 	v, ok := st.Get(stateKey)
 	if !ok {
 		return Snapshot{}

@@ -26,8 +26,8 @@ type scheduler struct {
 	approver Approver
 	author   string
 
-	mu    sync.Mutex // guards every step's runtime fields and snapshot reads
-	state *syncState // concurrency-safe view of session state
+	mu    sync.Mutex    // guards every step's runtime fields and snapshot reads
+	state session.State // Session owns synchronization across workers and Runner
 	ictx  agent.InvocationContext
 }
 
@@ -44,7 +44,7 @@ func newScheduler(p *Plan, maxConc int, backend Backend, approver Approver, auth
 		backend:  backend,
 		approver: approver,
 		author:   author,
-		state:    newSyncState(ictx.Session.State()),
+		state:    ictx.Session.State(),
 		ictx:     ictx,
 	}
 }
@@ -295,41 +295,3 @@ func sleep(ctx context.Context, d time.Duration) bool {
 		return false
 	}
 }
-
-// --- syncState --------------------------------------------------------------
-
-// syncState wraps a session.State with a mutex so the concurrently-running step
-// goroutines can read upstream outputs and write their own without racing on
-// the underlying map.
-type syncState struct {
-	mu sync.Mutex
-	s  session.State
-}
-
-func newSyncState(s session.State) *syncState { return &syncState{s: s} }
-
-func (s *syncState) Get(k string) (any, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.s.Get(k)
-}
-
-func (s *syncState) Set(k string, v any) {
-	s.mu.Lock()
-	s.s.Set(k, v)
-	s.mu.Unlock()
-}
-
-func (s *syncState) Delete(k string) {
-	s.mu.Lock()
-	s.s.Delete(k)
-	s.mu.Unlock()
-}
-
-func (s *syncState) All() map[string]any {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.s.All()
-}
-
-var _ session.State = (*syncState)(nil)
