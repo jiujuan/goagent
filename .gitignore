@@ -25,7 +25,7 @@ _cgo_export.h
 *~
 .claude
 
-README.md
+docs/
 
 # 忽略本地开发环境和凭证文件
 .env
