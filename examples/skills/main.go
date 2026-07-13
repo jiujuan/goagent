@@ -1,15 +1,14 @@
-// Command skills demonstrates the filesystem-based skill system end to end,
-// exercising all three progressive-disclosure levels with no API key and no
-// network (a scripted mock model plus a process sandbox):
+// Command skills is a tutorial for filesystem skill packs with progressive
+// (three-level) loading:
 //
-//	Level 1  the agent's system prompt lists the "greet" skill (name + desc)
-//	Level 2  the model calls use_skill to read the skill's SKILL.md body
-//	Level 3  the model calls use_skill to read a bundled resource (template.md),
-//	         then run_skill_script to execute a bundled script in the sandbox
+//	Level 1  metadata     —— skill.PromptSection 把可用技能列进 system prompt(总在)
+//	Level 2  SKILL.md body —— 模型按需调 use_skill(name) 读正文
+//	Level 3  resources/脚本 —— use_skill(name, resource) 读文件;run_skill_script 经 sandbox 执行
 //
-// The skill bundle (SKILL.md + template.md + scripts for sh/python/node) is
-// compiled into the binary with go:embed, so the example is self-contained. The
-// example picks whichever interpreter is present on the host.
+// 技能以目录形式存在(含一个 SKILL.md);可从磁盘(LoadDir)或编进二进制(Load + embed.FS)
+// 加载。本例用 embed.FS + mock 模型,离线、确定性。
+//
+//	go run ./examples/skills
 package main
 
 import (
@@ -18,189 +17,98 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
-	"os"
-	"os/exec"
-	"time"
 
 	"github.com/jiujuan/goagent/agent"
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/llm"
 	"github.com/jiujuan/goagent/llm/mock"
 	"github.com/jiujuan/goagent/prompt"
-	"github.com/jiujuan/goagent/runner"
-	"github.com/jiujuan/goagent/sandbox"
-	"github.com/jiujuan/goagent/sandbox/process"
-	"github.com/jiujuan/goagent/skill"
-	"github.com/jiujuan/goagent/tool"
+	"github.com/jiujuan/goagent/skills"
 )
 
 //go:embed skills
-var bundle embed.FS
-
-// candidate pairs an interpreter command with the bundled script and extension
-// it runs, in preference order. The example uses the first one found on PATH.
-type candidate struct {
-	command string // interpreter to run (must be on PATH and sandbox-allowed)
-	script  string // bundled script path within the skill
-	ext     string // its extension, to pin the interpreter for that type
-}
+var skillsFS embed.FS
 
 func main() {
-	// 1. Load the embedded skill library (rooted at the "skills" directory).
-	skillsFS, err := fs.Sub(bundle, "skills")
+	// 把技能编进二进制:fs.Sub 把根定位到 skills/,使 Load 能扫到 greet/SKILL.md。
+	sub, err := fs.Sub(skillsFS, "skills")
 	if err != nil {
 		log.Fatal(err)
 	}
-	lib, err := skill.Load(skillsFS)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// 2. Pick an interpreter that exists on this host.
-	pick, ok := pickInterpreter()
-	if !ok {
-		log.Fatal("no supported interpreter (sh/bash/python3/python/node) found on PATH")
-	}
-
-	// 3. A sandbox that may run only the chosen interpreter. run_skill_script
-	//    materializes the bundled script to a temp file and runs it here, so the
-	//    sandbox's limits (timeout, output cap, env/command allow-lists) apply.
-	workDir, err := os.MkdirTemp("", "goagent-skills-*")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer os.RemoveAll(workDir)
-
-	sb, err := process.New(sandbox.Policy{
-		WorkDir:         workDir,
-		Timeout:         5 * time.Second,
-		MaxOutputBytes:  16 << 10,
-		AllowedCommands: []string{pick.command},
-		Env:             map[string]string{"PATH": os.Getenv("PATH")},
-	})
+	lib, err := skills.Load(sub)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// 4. The agent's prompt advertises skills (Level 1); its tools are the
-	//    on-demand skill loader plus the skill script runner. Pin the chosen
-	//    interpreter for the script's extension (covers python vs python3).
-	sys := prompt.New().
-		Add(prompt.Identity("你是一个会按需调用技能的助手。")).
-		Add(skill.PromptSection(lib))
-
-	tools := []tool.Tool{
-		skill.Tool(lib),
-		skill.ScriptTool(lib, sb, skill.WithInterpreter(pick.ext, pick.command)),
-	}
-
-	// 5. A scripted mock model walking the three levels in order. It branches on
-	//    how many tool steps have already completed.
-	scriptCall := fmt.Sprintf(`{"skill":"greet","script":%q}`, pick.script)
-	model := mock.New("mock-opus", func(req *llm.Request) *llm.Response {
-		switch countToolSteps(req) {
-		case 0: // Level 2: read the skill's instructions.
-			return mock.CallTool("c1", "use_skill", `{"name":"greet"}`)
-		case 1: // Level 3a: read a bundled resource.
-			return mock.CallTool("c2", "use_skill", `{"name":"greet","resource":"template.md"}`)
-		case 2: // Level 3b: run a bundled script in the sandbox.
-			return mock.CallTool("c3", "run_skill_script", scriptCall)
-		default: // Done: summarize.
-			tr, _ := mock.LastToolResult(req)
-			return mock.Text("已按 greet 技能执行脚本，输出：\n" + partsText(tr.Content))
+	// mock:第一轮按 prompt 里列出的技能调 use_skill 读正文,第二轮据正文作答。
+	model := mock.New("mock", func(req *llm.Request) *llm.Response {
+		if tr, ok := mock.LastToolResult(req); ok {
+			_ = tr // 这里能看到 SKILL.md 正文
+			return mock.Text("(已加载 greet 技能)你好,小明!见到你很开心。")
 		}
+		return mock.CallTool("c1", "use_skill", `{"name":"greet"}`)
 	})
 
-	assistant := agent.New(agent.Config{
-		Name:        "assistant",
-		Description: "技能驱动的助手",
-		Model:       model,
-		Prompt:      sys,
-		Tools:       tools,
-	})
+	a, err := agent.New(
+		agent.WithModel(model),
+		// Level 1:skill.PromptSection 把可用技能列进 system prompt。
+		agent.WithPrompt(prompt.New().
+			Add(prompt.Identity("你是一个助手。需要某种能力时,先用 use_skill 加载对应技能再行动。")).
+			Add(skills.PromptSection(lib))),
+		// Level 2/3 的入口工具(本例不跑脚本,故只挂 use_skill;脚本用 skills.ScriptTool(lib, sandbox))。
+		agent.WithTools(skills.Tool(lib)),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	r := runner.New(runner.Config{Root: assistant})
-	ctx := context.Background()
-	fmt.Printf("=== 渐进式技能系统：三层加载演示（解释器：%s）===\n", pick.command)
-	for ev, err := range r.Run(ctx, "user-1", "session-1", core.UserText("请用 greet 技能跟 Ada 打个招呼。")) {
+	for ev, err := range a.Stream(context.Background(), "请问候一下小明").Iter() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		printEvent(ev)
-	}
-}
-
-// pickInterpreter returns the first interpreter found on PATH and the bundled
-// script it should run.
-func pickInterpreter() (candidate, bool) {
-	for _, c := range []candidate{
-		{"sh", "scripts/greet.sh", ".sh"},
-		{"bash", "scripts/greet.sh", ".sh"},
-		{"python3", "scripts/greet.py", ".py"},
-		{"python", "scripts/greet.py", ".py"},
-		{"node", "scripts/greet.js", ".js"},
-	} {
-		if _, err := exec.LookPath(c.command); err == nil {
-			return c, true
-		}
-	}
-	return candidate{}, false
-}
-
-// countToolSteps reports how many tool-result turns are already in the history,
-// which the mock uses to advance through the three levels.
-func countToolSteps(req *llm.Request) int {
-	n := 0
-	for _, m := range req.Messages {
-		if m.Role == core.RoleTool {
-			n++
-		}
-	}
-	return n
-}
-
-func printEvent(ev *core.Event) {
-	if ev == nil || ev.Message == nil {
-		return
-	}
-	switch ev.Message.Role {
-	case core.RoleUser:
-		fmt.Printf("👤 user:      %s\n", ev.Message.Text())
-	case core.RoleAssistant:
-		if calls := ev.Message.ToolCalls(); len(calls) > 0 {
-			for _, c := range calls {
-				fmt.Printf("🤖 assistant: →调用工具 %s(%s)\n", c.Name, string(c.Args))
+		switch e := ev.(type) {
+		case core.ToolDone:
+			if e.Result.Name == "use_skill" {
+				fmt.Println("📖 use_skill 返回(SKILL.md 正文节选):")
+				fmt.Println(indent(firstN(e.Result.Content[0].(core.Text).Text, 120)))
 			}
-			return
-		}
-		fmt.Printf("🤖 assistant: %s\n", ev.Message.Text())
-	case core.RoleTool:
-		for _, p := range ev.Message.Parts {
-			if tr, ok := p.(core.ToolResult); ok {
-				fmt.Printf("🔧 tool:      %s ->\n%s\n", tr.Name, indent(partsText(tr.Content)))
+		case core.MessageDone:
+			if t := e.Message.Text(); t != "" {
+				fmt.Println("🤖", t)
 			}
 		}
 	}
 }
 
-func partsText(parts []core.Part) string {
-	var s string
-	for _, p := range parts {
-		if t, ok := p.(core.Text); ok {
-			s += t.Text
-		}
+func firstN(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
 	}
-	return s
+	return string(r[:n]) + " …"
 }
 
 func indent(s string) string {
-	const pad = "             "
-	out := pad
-	for _, r := range s {
-		out += string(r)
-		if r == '\n' {
-			out += pad
-		}
+	out := ""
+	for _, line := range splitLines(s) {
+		out += "   " + line + "\n"
 	}
 	return out
+}
+
+func splitLines(s string) []string {
+	var lines []string
+	cur := ""
+	for _, r := range s {
+		if r == '\n' {
+			lines = append(lines, cur)
+			cur = ""
+			continue
+		}
+		cur += string(r)
+	}
+	if cur != "" {
+		lines = append(lines, cur)
+	}
+	return lines
 }

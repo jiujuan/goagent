@@ -6,8 +6,6 @@ import (
 	"runtime"
 	"strings"
 	"time"
-
-	"github.com/jiujuan/goagent/session"
 )
 
 // Built-in section orders, spaced 100 apart so custom sections can slot
@@ -93,16 +91,12 @@ func SessionState(keys ...string) Section {
 		SecName:  "session_state",
 		SecOrder: orderSessionState,
 		RenderFn: func(c Context) (string, error) {
-			if c.Session == nil || len(keys) == 0 {
+			if c.State == nil || c.State.KV == nil || len(keys) == 0 {
 				return "", nil
-			}
-			var state session.StateReader = c.Session.State()
-			if c.SessionSnapshot != nil {
-				state = c.SessionSnapshot.State()
 			}
 			var b strings.Builder
 			for _, k := range keys {
-				v, ok := state.Get(k)
+				v, ok := c.State.KV[k]
 				if !ok {
 					continue
 				}

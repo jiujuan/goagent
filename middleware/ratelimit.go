@@ -2,101 +2,75 @@ package middleware
 
 import (
 	"context"
-	"iter"
 	"sync"
 	"time"
 
-	"github.com/jiujuan/goagent/llm"
+	"github.com/jiujuan/goagent/agent"
+	"github.com/jiujuan/goagent/core"
 )
 
-// RateLimitOptions configures the RateLimit middleware.
+// RateLimitOptions configures RateLimit.
 type RateLimitOptions struct {
-	// RPS caps requests per second (a minimum interval between calls). 0 = no
-	// rate cap.
+	// RPS is the sustained model-calls-per-second (default 1).
 	RPS float64
-	// MaxConcurrent caps simultaneous in-flight calls. 0 = unlimited.
-	MaxConcurrent int
+	// Burst is the bucket capacity — how many calls may happen back-to-back
+	// before throttling kicks in (default 1).
+	Burst int
 }
 
-// RateLimit throttles model calls: it enforces a minimum interval between
-// calls (RPS) and/or a cap on concurrent in-flight calls. Both bounds honor
-// context cancellation while waiting. The concurrency slot is held for the
-// whole streamed response and released when the stream ends.
-func RateLimit(opts *RateLimitOptions) Middleware {
-	lim := &limiter{}
-	if opts != nil {
-		if opts.RPS > 0 {
-			lim.interval = time.Duration(float64(time.Second) / opts.RPS)
-		}
-		if opts.MaxConcurrent > 0 {
-			lim.sem = make(chan struct{}, opts.MaxConcurrent)
-		}
+// RateLimit throttles model calls with a token bucket: BeforeModel blocks until
+// a token is available (respecting context cancellation). Leak-free because it
+// holds no resource past the hook.
+func RateLimit(o RateLimitOptions) agent.Middleware {
+	if o.RPS <= 0 {
+		o.RPS = 1
 	}
-
-	return func(next llm.Model) llm.Model {
-		return Wrap(next, func(ctx context.Context, req *llm.Request) iter.Seq2[*llm.Response, error] {
-			return func(yield func(*llm.Response, error) bool) {
-				release, err := lim.acquire(ctx)
-				if err != nil {
-					yield(nil, err)
-					return
-				}
-				defer release()
-				for resp, err := range next.Generate(ctx, req) {
-					if !yield(resp, err) {
-						return
-					}
-				}
-			}
-		})
+	burst := float64(o.Burst)
+	if burst < 1 {
+		burst = 1
 	}
+	return &rateLimit{b: &bucket{rps: o.RPS, max: burst, tokens: burst, last: time.Now()}}
 }
 
-// limiter combines an optional minimum-interval rate cap with an optional
-// concurrency semaphore.
-type limiter struct {
-	mu       sync.Mutex
-	interval time.Duration
-	next     time.Time
-	sem      chan struct{}
+type rateLimit struct {
+	agent.BaseMiddleware
+	b *bucket
 }
 
-// acquire blocks until a slot and the rate window are available, returning a
-// release function. It returns ctx.Err() if cancelled while waiting.
-func (l *limiter) acquire(ctx context.Context) (func(), error) {
-	if l.sem != nil {
-		select {
-		case l.sem <- struct{}{}:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	release := func() {
-		if l.sem != nil {
-			<-l.sem
-		}
-	}
+func (r *rateLimit) BeforeModel(lc *agent.LoopContext) (core.Directive, error) {
+	return core.Directive{}, r.b.wait(lc.Context)
+}
 
-	if l.interval > 0 {
-		l.mu.Lock()
+type bucket struct {
+	mu     sync.Mutex
+	tokens float64
+	rps    float64
+	max    float64
+	last   time.Time
+}
+
+func (b *bucket) wait(ctx context.Context) error {
+	for {
+		b.mu.Lock()
 		now := time.Now()
-		if l.next.Before(now) {
-			l.next = now
+		b.tokens = min(b.max, b.tokens+now.Sub(b.last).Seconds()*b.rps)
+		b.last = now
+		if b.tokens >= 1 {
+			b.tokens -= 1
+			b.mu.Unlock()
+			return nil
 		}
-		wait := l.next.Sub(now)
-		l.next = l.next.Add(l.interval)
-		l.mu.Unlock()
+		wait := time.Duration((1 - b.tokens) / b.rps * float64(time.Second))
+		b.mu.Unlock()
 
-		if wait > 0 {
-			t := time.NewTimer(wait)
-			defer t.Stop()
-			select {
-			case <-t.C:
-			case <-ctx.Done():
-				release()
-				return nil, ctx.Err()
-			}
+		if ctx == nil {
+			time.Sleep(wait)
+			continue
+		}
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
-	return release, nil
 }

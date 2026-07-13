@@ -1,13 +1,12 @@
 package core
 
 // State is v2's explicit, checkpointable run state. v1 reconstructed state by
-// replaying Event.Actions (event sourcing); v2 instead snapshots this struct at
-// each step via a Checkpointer (see ADR 0023), which is both simpler to reason
-// about and the substrate for resume / branch / time-travel.
+// replaying Event.Actions (event sourcing); v2 snapshots this struct at each
+// step via a Checkpointer, which is simpler and the substrate for resume /
+// branch / time-travel.
 //
 // State must stay serializable: Messages, Todos and KV round-trip through JSON;
-// Files is a pluggable backend handle and is excluded from inline serialization
-// (the backend persists itself).
+// Files is a pluggable backend handle, excluded from inline serialization.
 type State struct {
 	Messages []Message      `json:"messages,omitempty"`
 	Todos    []Todo         `json:"todos,omitempty"`
@@ -16,8 +15,8 @@ type State struct {
 }
 
 // FileStore is the minimal virtual-filesystem contract State depends on. It is
-// declared in core so core stays dependency-free; concrete backends (in-state,
-// disk, store-backed) live in the state/files package and are wired in later.
+// declared in core so core stays dependency-free; concrete backends live in the
+// vfs package.
 type FileStore interface {
 	Read(path string) ([]byte, error)
 	Write(path string, data []byte) error
@@ -41,8 +40,7 @@ type StateOp struct {
 	Value any
 }
 
-// StateOpKind enumerates the supported mutations. Kept deliberately small;
-// extend as concrete needs appear.
+// StateOpKind enumerates the supported mutations.
 type StateOpKind int
 
 const (
@@ -50,6 +48,8 @@ const (
 	OpSetKV StateOpKind = iota
 	// OpAddTodo appends Value (a Todo) to State.Todos.
 	OpAddTodo
+	// OpSetTodos replaces State.Todos with Value ([]Todo).
+	OpSetTodos
 )
 
 // Apply folds the given ops into the State in order.
@@ -64,6 +64,10 @@ func (s *State) Apply(ops ...StateOp) {
 		case OpAddTodo:
 			if t, ok := op.Value.(Todo); ok {
 				s.Todos = append(s.Todos, t)
+			}
+		case OpSetTodos:
+			if ts, ok := op.Value.([]Todo); ok {
+				s.Todos = ts
 			}
 		}
 	}

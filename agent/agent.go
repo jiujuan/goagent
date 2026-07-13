@@ -1,454 +1,160 @@
-// Package agent defines the Agent contract and its built-in implementations:
-// the LLM-driven turn engine (LLMAgent) and the deterministic workflow agents
-// (Sequential, Parallel, Loop). An Agent decides; it does not persist. The
-// Runner owns persistence and commits the events an Agent streams.
+// Package agent is goagent's single execution package. It exposes a small
+// façade — New + Run/Stream/Resume — and contains the runtime (execution
+// environment) underneath: the AgentLoop phase machine, the RunContext it
+// carries, middleware hooks, tool execution, and the human-in-the-loop
+// pause/continue closure. There is no separate "runtime" package; that concept
+// lives here, in runtime.go / loop.go / hitl.go.
+//
+// The package depends only on lower layers (core, llm, tool, bus, checkpoint,
+// vfs); nothing imports agent back, so the dependency graph stays acyclic.
 package agent
 
 import (
 	"context"
-	"slices"
-	"sync"
+	"errors"
 
+	"github.com/jiujuan/goagent/bus"
+	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
-	"github.com/jiujuan/goagent/llm"
-	"github.com/jiujuan/goagent/middleware"
-	"github.com/jiujuan/goagent/prompt"
-	"github.com/jiujuan/goagent/session"
-	"github.com/jiujuan/goagent/tool"
+	"github.com/jiujuan/goagent/vfs"
 )
 
-// Agent is a streaming decision unit. Run yields a Stream of events for one
-// invocation. Composition is expressed through SubAgents, which the workflow
-// agents and the transfer mechanism walk.
-type Agent interface {
-	Name() string
-	Description() string
-	Run(ictx InvocationContext) core.Stream
-	SubAgents() []Agent
+// Agent is both the declaration of an agent (its config) and a runnable handle.
+// Build one with New, then call Run (blocking, returns the answer) or Stream
+// (non-blocking, returns a *Run for live events and control).
+type Agent struct {
+	cfg      config
+	loop     *AgentLoop // the LLM loop (nil for workflow agents)
+	parent   *Agent     // set when this agent is a sub-agent of another
+	runnable Runnable
+	bus      *bus.Bus
+	store    checkpoint.Checkpointer
 }
 
-// InvocationContext carries the per-invocation environment an Agent needs. It
-// embeds context.Context so it can be passed directly to model and tool calls.
-type InvocationContext struct {
-	context.Context
-
-	InvocationID string
-	Agent        Agent
-	// Root is the top of the agent tree for this run, set by the Runner. It
-	// lets any agent locate its parent and peers for transfer direction rules.
-	Root    Agent
-	Session *session.Session
-	// SessionSnapshot is the immutable history/state view this execution unit
-	// must read. Workflow agents control when it is refreshed: parallel children
-	// share one baseline, while sequential stages refresh between stages.
-	SessionSnapshot *session.Snapshot
-	Branch          string
-	UserContent     core.Message
-	branchScope     *branchScope
-
-	// transferDepth counts how many delegations have chained in this run, used
-	// to bound runaway agent-to-agent ping-pong.
-	transferDepth int
-}
-
-// withAgent returns a copy of ictx rebound to a different agent (used when a
-// workflow agent runs a sub-agent).
-func (ictx InvocationContext) withAgent(a Agent, branch string) InvocationContext {
-	ictx.Agent = a
-	if branch != "" {
-		ictx.Branch = branch
+// New builds an Agent from functional options. WithModel is required.
+func New(opts ...Option) (*Agent, error) {
+	c := config{maxTurns: defaultMaxTurns}
+	for _, o := range opts {
+		o(&c)
 	}
-	return ictx
+	if c.model == nil {
+		return nil, errors.New("agent: WithModel is required")
+	}
+	if c.bus == nil {
+		c.bus = bus.New()
+	}
+	if c.store == nil {
+		c.store = checkpoint.NewMemory()
+	}
+	a := &Agent{cfg: c, bus: c.bus, store: c.store}
+	a.loop = newLoop(c)
+	a.runnable = &llmRunner{agent: a, loop: a.loop}
+	// Wire the delegation tree: become the parent of each sub-agent, then
+	// advertise the transfer tool for the resolved targets.
+	for _, s := range c.subAgents {
+		s.parent = a
+	}
+	if tt := transferToolFor(a.transferTargets()); tt != nil {
+		a.loop.addTool(tt)
+	}
+	return a, nil
 }
 
-// refreshSnapshot returns a copy bound to the Session's latest committed
-// revision. The Session remains available for live tool state and persistence;
-// model history and prompt sections read from the immutable snapshot.
-func (ictx InvocationContext) refreshSnapshot() InvocationContext {
-	if ictx.Session == nil {
-		ictx.SessionSnapshot = nil
-		return ictx
-	}
-	var snapshot session.Snapshot
-	if ictx.branchScope != nil {
-		snapshot = ictx.branchScope.snapshot(ictx.Session)
-	} else {
-		snapshot = ictx.Session.Snapshot()
-	}
-	ictx.SessionSnapshot = &snapshot
-	return ictx
+// Bus exposes the agent's event bus (for extra subscribers / tracing).
+func (a *Agent) Bus() *bus.Bus { return a.bus }
+
+// Name reports the configured name.
+func (a *Agent) Name() string { return a.cfg.name }
+
+// RunConfig holds run-scoped settings, set with RunOptions.
+type RunConfig struct {
+	ThreadID string
+	Message  core.Message
+	Files    core.FileStore
 }
 
-// MutableState returns the state boundary for this execution unit. Normal
-// invocations use live Session state; parallel branches use an isolated overlay
-// that is published only by their merge event.
-func (ictx InvocationContext) MutableState() session.State {
-	if ictx.branchScope != nil {
-		return ictx.branchScope.state()
-	}
-	if ictx.Session != nil {
-		return ictx.Session.State()
-	}
-	return session.NewState()
+// RunOption configures a single Run/Stream invocation.
+type RunOption func(*RunConfig)
+
+// OnThread runs on a specific thread, so state and checkpoints accumulate
+// across calls. Defaults to a fresh ephemeral thread.
+func OnThread(id string) RunOption { return func(r *RunConfig) { r.ThreadID = id } }
+
+// WithMessage overrides the user message (e.g. multimodal content) instead of
+// the plain string passed to Run/Stream.
+func WithMessage(m core.Message) RunOption { return func(r *RunConfig) { r.Message = m } }
+
+// WithRunFiles supplies a virtual filesystem backend for this run.
+func WithRunFiles(f core.FileStore) RunOption { return func(r *RunConfig) { r.Files = f } }
+
+// Run drives the agent loop to completion and returns the final answer text. It
+// is the convenience entry: internally it calls the model and tools in a loop
+// until the model replies without tool calls.
+func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) (string, error) {
+	res, err := a.Stream(ctx, input, opts...).Wait()
+	return res.Message.Text(), err
 }
 
-func (ictx InvocationContext) snapshot() session.Snapshot {
-	if ictx.SessionSnapshot != nil {
-		return *ictx.SessionSnapshot
+// Stream starts a run and returns a non-blocking *Run handle for live events
+// (Iter/Events), settlement (Wait), and control (Steer/Cancel/Decide). The loop
+// is driven lazily on first observation, so no events are missed.
+func (a *Agent) Stream(ctx context.Context, input string, opts ...RunOption) *Run {
+	rc := RunConfig{ThreadID: core.NewID("thread"), Message: core.UserText(input)}
+	for _, o := range opts {
+		o(&rc)
 	}
-	if ictx.Session != nil {
-		return ictx.Session.Snapshot()
+	state, err := a.restore(ctx, rc.ThreadID)
+	if rc.Files != nil {
+		state.Files = rc.Files
+	} else if state.Files == nil {
+		state.Files = vfs.NewInState()
 	}
-	return session.Snapshot{}
-}
-
-// ForSubAgent returns a copy of ictx rebound to run sub, on an optional branch
-// (empty keeps the current branch). It is the exported form of withAgent, used
-// by out-of-package orchestrators (e.g. the plan package's AgentExecutor) that
-// invoke a sub-agent's Run directly.
-func (ictx InvocationContext) ForSubAgent(sub Agent, branch string) InvocationContext {
-	return ictx.withAgent(sub, branch).refreshSnapshot()
-}
-
-// transferTo returns a copy of ictx handed to a transfer target, incrementing
-// the delegation depth.
-func (ictx InvocationContext) transferTo(target Agent) InvocationContext {
-	ictx.Agent = target
-	ictx.transferDepth++
-	return ictx
-}
-
-// parentOf returns the agent in root's tree whose SubAgents contain target, or
-// nil if target is the root or not found. Agent names are unique, so name
-// equality identifies a node.
-func parentOf(root, target Agent) Agent {
-	for _, sub := range root.SubAgents() {
-		if sub.Name() == target.Name() {
-			return root
-		}
-		if p := parentOf(sub, target); p != nil {
-			return p
-		}
+	if rc.Message.Role != "" {
+		state.Messages = append(state.Messages, rc.Message)
 	}
-	return nil
+	run := a.newRunHandle(ctx, rc.ThreadID, state)
+	run.startErr = err
+	return run
 }
 
-// defaultMaxSteps bounds the tool-use loop so a misbehaving model cannot spin
-// forever.
-const defaultMaxSteps = 16
-
-// Config configures an LLMAgent.
-type Config struct {
-	Name        string
-	Description string
-	Model       llm.Model
-	Instruction string
-	Tools       []tool.Tool
-	SubAgents   []Agent
-
-	// Prompt, if set, builds the system prompt from composable sections and
-	// takes precedence over Instruction (which is then ignored). Put the base
-	// persona in a prompt.Identity section. It is rendered once per invocation.
-	Prompt *prompt.Builder
-
-	// OutputKey, if set, writes the agent's final text reply into session state
-	// under this key, for inter-agent coordination.
-	OutputKey string
-
-	// DisableTransfer turns off the auto-injected transfer_to_agent tool
-	// entirely for this agent (no delegation to sub-agents, parent, or peers).
-	DisableTransfer bool
-
-	// DisallowTransferToParent prevents this agent from delegating back up to
-	// its parent. By default an agent may return control to its parent.
-	DisallowTransferToParent bool
-
-	// DisallowTransferToPeers prevents this agent from delegating sideways to
-	// its siblings. By default an agent may transfer to peers when its parent
-	// is itself delegation-capable.
-	DisallowTransferToPeers bool
-
-	// MaxSteps caps the model<->tool loop (default 16).
-	MaxSteps int
-
-	// ModelOptions are applied to every model request.
-	ModelOptions []llm.Option
-
-	// Middleware runs before each model call, in order (e.g. context
-	// compaction). It may rewrite the request.
-	Middleware []middleware.Middleware
-}
-
-// LLMAgent is the LLM-driven turn engine. Each Run repeatedly calls the model,
-// executes any requested tools (concurrently, but preserving the model's call
-// order in the transcript), and loops until the model replies without tool
-// calls or MaxSteps is reached.
-type LLMAgent struct {
-	cfg      Config
-	maxSteps int
-}
-
-// New constructs an LLMAgent, the default LLM-driven agent.
-func New(cfg Config) *LLMAgent {
-	ms := cfg.MaxSteps
-	if ms <= 0 {
-		ms = defaultMaxSteps
+// restore loads the latest checkpoint's state for a thread, or a fresh State.
+// On store error it returns an empty state plus the error (surfaced via the run).
+func (a *Agent) restore(ctx context.Context, threadID string) (*core.State, error) {
+	cp, err := a.store.Latest(ctx, threadID)
+	if err != nil {
+		return &core.State{}, err
 	}
-	return &LLMAgent{cfg: cfg, maxSteps: ms}
+	if cp == nil {
+		return &core.State{}, nil
+	}
+	st := cloneState(cp.State)
+	return &st, nil
 }
 
-func (a *LLMAgent) Name() string        { return a.cfg.Name }
-func (a *LLMAgent) Description() string { return a.cfg.Description }
-func (a *LLMAgent) SubAgents() []Agent  { return a.cfg.SubAgents }
-
-// Run implements Agent.
-func (a *LLMAgent) Run(ictx InvocationContext) core.Stream {
-	return func(yield func(*core.Event, error) bool) {
-		// Direct Agent callers may not have gone through Runner. Bind one snapshot
-		// here so model history and prompt sections still read the same revision.
-		if ictx.SessionSnapshot == nil {
-			ictx = ictx.refreshSnapshot()
-		}
-		// Decorate the model with the configured middleware chain once per run
-		// (compaction, RAG, retry, rate limit, steering, ...).
-		model := middleware.Chain(a.cfg.Model, a.cfg.Middleware...)
-
-		// Seed working history from committed session messages. The agent keeps
-		// its own copy and appends in-turn messages locally, so correctness does
-		// not depend on when the Runner commits.
-		history := slices.Clone(ictx.snapshot().Messages())
-
-		// Advertise the agent's own tools, plus a synthetic transfer tool when
-		// delegation is enabled and at least one target (sub-agent, parent, or
-		// peer) is allowed by the direction rules.
-		schemas := tool.Schemas(a.cfg.Tools)
-		byName := tool.ByName(a.cfg.Tools)
-		transferTargets := a.transferableTargets(ictx)
-		if len(transferTargets) > 0 {
-			tt := newTransferTool(a.orderedTargets(ictx, transferTargets))
-			schemas = append(schemas, llm.ToolSchema{Name: tt.Name(), Description: tt.Description(), Parameters: tt.Schema()})
-			byName[tt.Name()] = tt
-		}
-
-		// Render the system prompt once per invocation: env/state don't change
-		// mid-turn. A configured Prompt builder wins over the static Instruction.
-		system := a.cfg.Instruction
-		if a.cfg.Prompt != nil {
-			s, err := a.cfg.Prompt.Build(a.promptContext(ictx))
-			if err != nil {
-				yield(&core.Event{Author: a.cfg.Name, InvocationID: ictx.InvocationID, Err: err}, err)
-				return
-			}
-			system = s
-		}
-
-		for range a.maxSteps {
-			req := &llm.Request{
-				System:   system,
-				Messages: history,
-				Tools:    schemas,
-			}
-			req.Options.Apply(a.cfg.ModelOptions...)
-
-			final, ok := a.streamModel(ictx, model, req, yield)
-			if !ok {
-				return // consumer stopped or model errored (event already sent)
-			}
-			history = append(history, final)
-
-			calls := final.ToolCalls()
-			if len(calls) == 0 {
-				a.maybeEmitOutput(ictx, final, yield)
-				return
-			}
-
-			results, acts := a.execTools(ictx, byName, calls)
-			toolMsg := core.Message{Role: core.RoleTool, Parts: results}
-			history = append(history, toolMsg)
-
-			toolEvt := a.event(ictx, &toolMsg, false, nil)
-			toolEvt.Actions = core.Actions{
-				StateDelta:  acts.StateDelta,
-				StateDelete: acts.StateDelete,
-				Escalate:    acts.Escalate,
-				Stop:        acts.Stop,
-			}
-			if !yield(toolEvt, nil) {
-				return
-			}
-
-			// LLM-driven delegation: hand control to the requested agent, if it
-			// is an allowed target (sub-agent, parent, or peer per the rules).
-			if acts.TransferToAgent != "" {
-				if target := transferTargets[acts.TransferToAgent]; target != nil {
-					if ictx.transferDepth >= maxTransferDepth {
-						return // bound runaway delegation chains
-					}
-					core.Pipe(target.Run(ictx.transferTo(target).refreshSnapshot()), yield)
-					return
-				}
-				// Unknown or disallowed target: fall through; the model retries.
-			}
-			if acts.Stop {
-				return
-			}
-		}
+// newRunHandle builds the per-run execution environment (RunContext) and its
+// Run handle. Shared by Stream and Resume.
+func (a *Agent) newRunHandle(ctx context.Context, threadID string, state *core.State) *Run {
+	runCtx, cancel := context.WithCancel(ctx)
+	runID := core.NewID("run")
+	topic := bus.Topic(runID)
+	rc := &RunContext{
+		Context:  runCtx,
+		RunID:    runID,
+		ThreadID: threadID,
+		Bus:      a.bus,
+		Topic:    topic,
+		Store:    a.store,
+		State:    state,
 	}
-}
-
-// streamModel runs one model call, forwarding every response as an event and
-// returning the final (non-partial) assistant message. The bool reports whether
-// to continue (false on consumer-stop or model error).
-func (a *LLMAgent) streamModel(ictx InvocationContext, model llm.Model, req *llm.Request, yield func(*core.Event, error) bool) (core.Message, bool) {
-	var final core.Message
-	for resp, err := range model.Generate(ictx, req) {
-		if err != nil {
-			yield(&core.Event{Author: a.cfg.Name, InvocationID: ictx.InvocationID, Err: err}, err)
-			return core.Message{}, false
-		}
-		msg := resp.Message
-		if !yield(a.event(ictx, &msg, resp.Partial, resp.Usage), nil) {
-			return core.Message{}, false
-		}
-		if !resp.Partial {
-			final = resp.Message
-		}
-	}
-	return final, true
-}
-
-// execTools invokes the requested tools concurrently, returning their results
-// in the model's original call order plus the merged side effects each tool
-// requested via its Context.Actions.
-func (a *LLMAgent) execTools(ictx InvocationContext, byName map[string]tool.Tool, calls []core.ToolCall) ([]core.Part, core.Actions) {
-	results := make([]core.Part, len(calls))
-	actions := make([]*core.Actions, len(calls))
-	var wg sync.WaitGroup
-	for i, c := range calls {
-		t, ok := byName[c.Name]
-		if !ok {
-			results[i] = core.ToolResult{
-				CallID: c.ID, Name: c.Name, IsError: true,
-				Content: []core.Part{core.Text{Text: "unknown tool: " + c.Name}},
-			}
-			continue
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			acts := &core.Actions{}
-			actions[i] = acts
-			// Each concurrent tool receives an isolated overlay. Direct State writes
-			// are converted into Actions below and later folded in model call order,
-			// eliminating scheduler-dependent last-writer behavior.
-			toolState := session.NewOverlay(ictx.MutableState())
-			tctx := &tool.Context{
-				Context: ictx,
-				State:   toolState,
-				Actions: acts,
-				CallID:  c.ID,
-			}
-			res, err := t.Call(tctx, c.Args)
-			patch := toolState.Patch()
-			if acts.StateDelta == nil && len(patch.Delta) > 0 {
-				acts.StateDelta = map[string]any{}
-			}
-			for key, value := range patch.Delta {
-				acts.StateDelta[key] = value
-			}
-			acts.StateDelete = append(acts.StateDelete, patch.Delete...)
-			if err != nil {
-				results[i] = core.ToolResult{
-					CallID: c.ID, Name: c.Name, IsError: true,
-					Content: []core.Part{core.Text{Text: err.Error()}},
-				}
-				return
-			}
-			results[i] = core.ToolResult{
-				CallID: c.ID, Name: c.Name,
-				Content: res.Content, IsError: res.IsError,
-			}
-		}()
-	}
-	wg.Wait()
-	return results, mergeActions(actions)
-}
-
-// mergeActions folds per-tool Actions in the model's call order. Later state
-// sets/deletes win deterministically; TransferToAgent takes the last non-empty
-// value, while Escalate and Stop are OR-ed.
-func mergeActions(list []*core.Actions) core.Actions {
-	var m core.Actions
-	deleted := map[string]bool{}
-	for _, a := range list {
-		if a == nil {
-			continue
-		}
-		for _, key := range a.StateDelete {
-			delete(m.StateDelta, key)
-			deleted[key] = true
-		}
-		for k, v := range a.StateDelta {
-			if m.StateDelta == nil {
-				m.StateDelta = map[string]any{}
-			}
-			m.StateDelta[k] = v
-			delete(deleted, k)
-		}
-		if a.TransferToAgent != "" {
-			m.TransferToAgent = a.TransferToAgent
-		}
-		m.Escalate = m.Escalate || a.Escalate
-		m.Stop = m.Stop || a.Stop
-	}
-	for key := range deleted {
-		m.StateDelete = append(m.StateDelete, key)
-	}
-	slices.Sort(m.StateDelete)
-	return m
-}
-
-func (a *LLMAgent) maybeEmitOutput(ictx InvocationContext, final core.Message, yield func(*core.Event, error) bool) {
-	if a.cfg.OutputKey == "" {
-		return
-	}
-	yield(&core.Event{
-		ID:           core.NewID("evt"),
-		InvocationID: ictx.InvocationID,
-		Author:       a.cfg.Name,
-		Actions:      core.Actions{StateDelta: map[string]any{a.cfg.OutputKey: final.Text()}},
-	}, nil)
-}
-
-func (a *LLMAgent) event(ictx InvocationContext, msg *core.Message, partial bool, usage *core.Usage) *core.Event {
-	return &core.Event{
-		ID:           core.NewID("evt"),
-		InvocationID: ictx.InvocationID,
-		Author:       a.cfg.Name,
-		Branch:       ictx.Branch,
-		Message:      msg,
-		Partial:      partial,
-		Usage:        usage,
-	}
-}
-
-var _ Agent = (*LLMAgent)(nil)
-
-// promptContext builds the prompt.Context DTO from the invocation, decoupling
-// the prompt package from agent (it never sees InvocationContext directly).
-func (a *LLMAgent) promptContext(ictx InvocationContext) prompt.Context {
-	peers := make([]prompt.Peer, len(a.cfg.SubAgents))
-	for i, sub := range a.cfg.SubAgents {
-		peers[i] = prompt.Peer{Name: sub.Name(), Description: sub.Description()}
-	}
-	return prompt.Context{
-		Context:         ictx,
-		Session:         ictx.Session,
-		SessionSnapshot: ictx.SessionSnapshot,
-		UserContent:     ictx.UserContent,
-		AgentName:       a.cfg.Name,
-		AgentDesc:       a.cfg.Description,
-		Tools:           a.cfg.Tools,
-		SubAgents:       peers,
+	return &Run{
+		ID:       runID,
+		ThreadID: threadID,
+		agent:    a,
+		bus:      a.bus,
+		topic:    topic,
+		rc:       rc,
+		runnable: a.runnable,
+		cancel:   cancel,
+		done:     make(chan struct{}),
 	}
 }

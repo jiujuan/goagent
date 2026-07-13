@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/jiujuan/goagent/prompt"
-	"github.com/jiujuan/goagent/session"
 )
 
 // Order places the working-memory section after identity/environment but before
@@ -23,14 +22,10 @@ func Section() prompt.Section {
 		SecName:  "working_memory",
 		SecOrder: Order,
 		RenderFn: func(c prompt.Context) (string, error) {
-			if c.Session == nil {
+			if c.State == nil {
 				return "", nil
 			}
-			state := session.StateReader(c.Session.State())
-			if c.SessionSnapshot != nil {
-				state = c.SessionSnapshot.State()
-			}
-			snap := readSnapshot(state)
+			snap := readSnapshot(c.State)
 			if snap.Empty() {
 				return "", nil
 			}

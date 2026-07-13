@@ -1,22 +1,18 @@
 package core
 
-// Directive is v2's explicit control-flow signal. It replaces v1's
-// Event.Actions side-effect bag: instead of writing intent into an event that
-// the Runner later merges at commit time, a loop phase (or a tool, via
-// Result.Control) returns a Directive and the AgentLoop acts on it immediately.
-// Reading the loop therefore shows the control flow directly.
-//
-// See ADR 0023. This file is additive to v1; nothing here collides with the v1
-// core.Event struct, which keeps working until the migration completes.
+// Directive is v2's explicit control-flow signal. Instead of v1's Event.Actions
+// bag (intent written into an event and merged by a Runner at commit time), a
+// loop phase — or a tool, via Result.Control — returns a Directive that the
+// AgentLoop acts on immediately. Reading the loop shows the control flow.
 type Directive struct {
 	Kind   DirectiveKind
 	Target string // delegation target, for Transfer
-	Reason string // human-readable explanation (HITL prompts, logs)
+	Reason string // explanation (HITL prompts, logs)
 }
 
-// DirectiveKind enumerates the control signals. The integer values are ordered
-// by precedence (higher value wins) so Resolve can fold a batch with a single
-// max comparison; Continue is the zero value, i.e. the safe default.
+// DirectiveKind enumerates the control signals. Values are ordered by
+// precedence (higher wins) so Resolve folds a batch with one max comparison;
+// Continue is the zero value, the safe default.
 //
 // Precedence (low → high): Continue < Transfer < Escalate < Stop < Interrupt.
 type DirectiveKind int
@@ -53,12 +49,8 @@ func (k DirectiveKind) String() string {
 }
 
 // Resolve folds several directives into one by precedence: the highest-Kind
-// directive wins, and on a tie the first one in argument order is kept (so
-// middleware order is the tie-breaker, as specified in ADR 0023). An empty
-// call yields the zero Directive (Continue) — the safe default.
-//
-// This replaces v1's mergeActions, whose last-write-wins / OR semantics for
-// TransferToAgent were ambiguous.
+// wins, and on a tie the first in argument order is kept (so middleware order
+// is the tie-breaker). An empty call yields Continue.
 func Resolve(ds ...Directive) Directive {
 	best := Directive{Kind: Continue}
 	for _, d := range ds {

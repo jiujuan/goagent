@@ -17,7 +17,6 @@ import (
 	"github.com/jiujuan/goagent/llm"
 	"github.com/jiujuan/goagent/memory"
 	"github.com/jiujuan/goagent/memory/textmem"
-	"github.com/jiujuan/goagent/session"
 )
 
 // consolidatePrompt instructs the model to distill durable facts from a
@@ -40,12 +39,13 @@ type item struct {
 	Content string `json:"content"`
 }
 
-// Consolidate reads the session transcript, asks the model to extract durable
-// facts, and writes them to the text and/or semantic stores (either may be nil
-// to skip that target). Facts are de-duplicated by content hash before writing.
-// Call it at session end (e.g. after Runner.Run returns). See ADR 0019.
-func Consolidate(ctx context.Context, model llm.Model, s *session.Session, text textmem.Store, sem memory.Store) error {
-	transcript := renderTranscript(s.Messages())
+// Consolidate reads a run's transcript, asks the model to extract durable facts,
+// and writes them to the text and/or semantic stores (either may be nil to skip
+// that target). Facts are de-duplicated by content hash before writing. Call it
+// at the end of a run (e.g. after Run/Wait returns) with the run's messages. See
+// ADR 0019.
+func Consolidate(ctx context.Context, model llm.Model, messages []core.Message, text textmem.Store, sem memory.Store) error {
+	transcript := renderTranscript(messages)
 	if strings.TrimSpace(transcript) == "" {
 		return nil
 	}

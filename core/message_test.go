@@ -38,34 +38,3 @@ func TestMessageJSONRoundTrip(t *testing.T) {
 		}
 	}
 }
-
-func TestEventJSONRoundTrip(t *testing.T) {
-	ev := &Event{
-		ID:           "evt_1",
-		InvocationID: "inv_1",
-		Author:       "assistant",
-		Message:      &Message{Role: RoleAssistant, Parts: []Part{Text{Text: "done"}}},
-		Usage:        &Usage{InputTokens: 10, OutputTokens: 5},
-		Actions:      Actions{StateDelta: map[string]any{"answer": "done"}},
-	}
-	b, err := json.Marshal(ev)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got Event
-	if err := json.Unmarshal(b, &got); err != nil {
-		t.Fatal(err)
-	}
-	if got.ID != ev.ID || got.Author != ev.Author {
-		t.Fatalf("scalar fields lost: %+v", got)
-	}
-	if got.Message == nil || got.Message.Text() != "done" {
-		t.Fatalf("message lost: %+v", got.Message)
-	}
-	if got.Usage == nil || got.Usage.OutputTokens != 5 {
-		t.Fatalf("usage lost: %+v", got.Usage)
-	}
-	if got.Actions.StateDelta["answer"] != "done" {
-		t.Fatalf("state delta lost: %+v", got.Actions.StateDelta)
-	}
-}

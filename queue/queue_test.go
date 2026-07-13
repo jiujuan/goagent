@@ -1,159 +1,129 @@
-package queue
+package queue_test
 
 import (
 	"context"
-	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/jiujuan/goagent/core"
+	"github.com/jiujuan/goagent/agent"
+	"github.com/jiujuan/goagent/llm"
+	"github.com/jiujuan/goagent/llm/mock"
+	"github.com/jiujuan/goagent/queue"
 )
 
-func drainTo(t *testing.T, ch <-chan *core.Event, want func(*core.Event) bool) *core.Event {
-	t.Helper()
-	timeout := time.After(2 * time.Second)
-	for {
-		select {
-		case ev := <-ch:
-			if want(ev) {
-				return ev
-			}
-		case <-timeout:
-			t.Fatal("timed out waiting for event")
-		}
+func TestPoolRunsAllJobsBounded(t *testing.T) {
+	q := queue.NewMemQueue(64)
+	var ran, peak, cur int64
+
+	const n = 20
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		_ = q.Enqueue(context.Background(), queue.Job{
+			Run: func(context.Context) error {
+				c := atomic.AddInt64(&cur, 1)
+				for { // track peak concurrency
+					p := atomic.LoadInt64(&peak)
+					if c <= p || atomic.CompareAndSwapInt64(&peak, p, c) {
+						break
+					}
+				}
+				time.Sleep(2 * time.Millisecond)
+				atomic.AddInt64(&cur, -1)
+				atomic.AddInt64(&ran, 1)
+				wg.Done()
+				return nil
+			},
+		})
+	}
+	q.Close()
+
+	pool := queue.NewPool(q, 4)
+	go pool.Run(context.Background())
+	wg.Wait()
+
+	if atomic.LoadInt64(&ran) != n {
+		t.Fatalf("ran %d jobs, want %d", ran, n)
+	}
+	if p := atomic.LoadInt64(&peak); p > 4 {
+		t.Fatalf("peak concurrency %d exceeded limit 4", p)
 	}
 }
 
-func TestWorkerRunsJobAndPublishes(t *testing.T) {
-	q := NewMemQueue(4)
-	bus := NewMemBus()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go NewWorker(Config{Consumer: q, Bus: bus}).Run(ctx)
-
-	ch, unsub := bus.Subscribe("k")
-	defer unsub()
-
-	err := q.Enqueue(ctx, Job{
-		ID:  "job1",
-		Key: "k",
-		Run: func(_ context.Context, emit func(*core.Event)) (*core.Event, error) {
-			emit(&core.Event{Progress: &core.Progress{Status: "running", Percent: 50}})
-			return &core.Event{
-				Message:  &core.Message{Role: core.RoleAssistant, Parts: []core.Part{core.Text{Text: "done"}}},
-				Progress: &core.Progress{Status: "succeeded", Percent: 100},
-			}, nil
-		},
-	})
+func TestEnqueueAgentBackgroundRun(t *testing.T) {
+	ctx := context.Background()
+	a, err := agent.New(agent.WithModel(mock.New("m", func(*llm.Request) *llm.Response {
+		return mock.Text("背景任务完成")
+	})))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	prog := drainTo(t, ch, func(ev *core.Event) bool { return ev.Partial })
-	if prog.Progress.JobID != "job1" {
-		t.Errorf("progress JobID not stamped: %q", prog.Progress.JobID)
-	}
-	if prog.Progress.Percent != 50 {
-		t.Errorf("progress percent = %d", prog.Progress.Percent)
-	}
-
-	final := drainTo(t, ch, func(ev *core.Event) bool { return !ev.Partial && ev.Message != nil })
-	if final.Progress.JobID != "job1" || final.Progress.Status != "succeeded" {
-		t.Errorf("final progress wrong: %+v", final.Progress)
-	}
-}
-
-func TestWorkerPublishesFailure(t *testing.T) {
-	q := NewMemQueue(4)
-	bus := NewMemBus()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go NewWorker(Config{Consumer: q, Bus: bus}).Run(ctx)
-
-	ch, unsub := bus.Subscribe("k")
-	defer unsub()
-
-	_ = q.Enqueue(ctx, Job{
-		ID:  "job2",
-		Key: "k",
-		Run: func(_ context.Context, _ func(*core.Event)) (*core.Event, error) {
-			return nil, errors.New("boom")
-		},
-	})
-
-	failed := drainTo(t, ch, func(ev *core.Event) bool {
-		return ev.Progress != nil && ev.Progress.Status == "failed"
-	})
-	if failed.Progress.Err != "boom" || failed.Progress.JobID != "job2" {
-		t.Errorf("failure event wrong: %+v", failed.Progress)
-	}
-}
-
-func TestMemBusUnsubscribe(t *testing.T) {
-	bus := NewMemBus()
-	ch, unsub := bus.Subscribe("k")
-	unsub()
-	// Publishing after unsubscribe must not panic; channel is closed/drained.
-	bus.Publish("k", &core.Event{})
-	if _, ok := <-ch; ok {
-		t.Error("expected closed channel after unsubscribe")
-	}
-}
-
-// TestWorkerResolvesRegistryHandler exercises the cross-process job shape: a Job
-// with Type+Payload (no Run) is run via the worker's Registry — the same path
-// the Redis backend uses, validated here over an in-process MemQueue.
-func TestWorkerResolvesRegistryHandler(t *testing.T) {
-	q := NewMemQueue(4)
-	bus := NewMemBus()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	reg := Registry{
-		"echo": func(_ context.Context, payload []byte, emit func(*core.Event)) (*core.Event, error) {
-			emit(&core.Event{Progress: &core.Progress{Status: "running"}})
-			return &core.Event{
-				Message:  &core.Message{Role: core.RoleAssistant, Parts: []core.Part{core.Text{Text: string(payload)}}},
-				Progress: &core.Progress{Status: "succeeded"},
-			}, nil
-		},
-	}
-	go NewWorker(Config{Consumer: q, Bus: bus, Registry: reg}).Run(ctx)
-
-	ch, unsub := bus.Subscribe("k")
-	defer unsub()
-
-	if err := q.Enqueue(ctx, Job{ID: "j1", Key: "k", Type: "echo", Payload: []byte("hi")}); err != nil {
+	q := queue.NewMemQueue(8)
+	h, err := queue.EnqueueAgent(ctx, q, a, "go", agent.OnThread("t1"))
+	if err != nil {
 		t.Fatal(err)
 	}
+	q.Close()
 
-	final := drainTo(t, ch, func(ev *core.Event) bool { return !ev.Partial && ev.Message != nil })
-	if got := final.Message.Parts[0].(core.Text).Text; got != "hi" {
-		t.Errorf("handler payload not delivered: %q", got)
+	pool := queue.NewPool(q, 2)
+	go pool.Run(ctx)
+
+	res, err := h.Wait()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if final.Progress.JobID != "j1" {
-		t.Errorf("final JobID not stamped: %q", final.Progress.JobID)
+	if res.Message.Text() != "背景任务完成" {
+		t.Fatalf("background result = %q", res.Message.Text())
 	}
 }
 
-// TestWorkerUnknownTypeFails verifies a Job.Type with no registered handler
-// surfaces a failed event rather than hanging or panicking.
-func TestWorkerUnknownTypeFails(t *testing.T) {
-	q := NewMemQueue(4)
-	bus := NewMemBus()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go NewWorker(Config{Consumer: q, Bus: bus}).Run(ctx) // nil Registry
-
-	ch, unsub := bus.Subscribe("k")
-	defer unsub()
-
-	_ = q.Enqueue(ctx, Job{ID: "j2", Key: "k", Type: "nope"})
-
-	failed := drainTo(t, ch, func(ev *core.Event) bool {
-		return ev.Progress != nil && ev.Progress.Status == "failed"
+func TestRegistryHandlerForSerializableJob(t *testing.T) {
+	// A Type+Payload job (the shape Redis uses) is run by the pool's Registry.
+	got := make(chan string, 1)
+	q := queue.NewMemQueue(4)
+	_ = q.Enqueue(context.Background(), queue.Job{
+		ID: "j1", Type: "echo", Payload: []byte("hello"),
 	})
-	if failed.Progress.JobID != "j2" {
-		t.Errorf("failed JobID = %q", failed.Progress.JobID)
+	q.Close()
+
+	pool := queue.NewPool(q, 1).WithRegistry(queue.Registry{
+		"echo": func(_ context.Context, payload []byte) error {
+			got <- string(payload)
+			return nil
+		},
+	})
+	go pool.Run(context.Background())
+
+	select {
+	case v := <-got:
+		if v != "hello" {
+			t.Fatalf("handler got %q, want hello", v)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler not invoked")
+	}
+}
+
+func TestNewInProcessBackend(t *testing.T) {
+	q, c, err := queue.New() // no WithRedis -> MemQueue
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	_ = q.Enqueue(context.Background(), queue.Job{Run: func(context.Context) error {
+		close(done)
+		return nil
+	}})
+	if mq, ok := c.(*queue.MemQueue); ok {
+		mq.Close()
+	}
+	go queue.NewPool(c, 1).Run(context.Background())
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-process job not run")
 	}
 }

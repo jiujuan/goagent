@@ -1,307 +1,230 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
-	"maps"
-	"reflect"
-	"slices"
+	"strings"
 	"sync"
 
+	"github.com/jiujuan/goagent/bus"
+	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
-	"github.com/jiujuan/goagent/session"
+	"github.com/jiujuan/goagent/tool"
 )
 
-// --- Sequential -------------------------------------------------------------
+// This file holds the deterministic workflow agents. They are *Agent values too
+// — uniform with LLM agents, so they have the same Run/Stream/Resume surface —
+// but their runnable orchestrates child agents instead of calling a model. A
+// workflow drives children by calling child.runnable.run(rc) and composes by
+// the returned runOutcome (e.g. inspecting Escalate), while children publish
+// their internal events to the shared bus/topic.
 
-// SequentialAgent runs its sub-agents in order, forwarding every event. It is
-// the deterministic counterpart to LLM-driven delegation.
-type SequentialAgent struct {
-	name string
-	subs []Agent
+// Sequential runs sub-agents in order, sharing one State so each stage's output
+// flows to the next. It stops early if a sub fails, pauses (Interrupt), or
+// returns Stop/Escalate.
+func Sequential(name string, subs ...*Agent) *Agent {
+	return wrapWorkflow(name, &sequentialRunner{subs: subs})
 }
 
-// Sequential builds a SequentialAgent.
-func Sequential(name string, subs ...Agent) *SequentialAgent {
-	return &SequentialAgent{name: name, subs: subs}
+// Parallel runs sub-agents concurrently, each on an isolated (cloned) State
+// branch, then merges their results. Events from all branches interleave on the
+// shared topic. Branch KV writes are folded back deterministically in branch
+// declaration order; conflicting writes to the same key are rejected (use
+// ParallelWithOptions to prefer a branch instead). Final texts are concatenated.
+func Parallel(name string, subs ...*Agent) *Agent {
+	return ParallelWithOptions(name, ParallelOptions{}, subs...)
 }
 
-func (a *SequentialAgent) Name() string        { return a.name }
-func (a *SequentialAgent) Description() string { return "runs sub-agents in sequence" }
-func (a *SequentialAgent) SubAgents() []Agent  { return a.subs }
-
-func (a *SequentialAgent) Run(ictx InvocationContext) core.Stream {
-	return func(yield func(*core.Event, error) bool) {
-		for _, sub := range a.subs {
-			if !core.Pipe(sub.Run(ictx.withAgent(sub, "").refreshSnapshot()), yield) {
-				return
-			}
-		}
-	}
+// ParallelWithOptions builds a Parallel workflow with an explicit merge policy.
+func ParallelWithOptions(name string, opts ParallelOptions, subs ...*Agent) *Agent {
+	return wrapWorkflow(name, &parallelRunner{subs: subs, opts: opts})
 }
 
-// --- Loop -------------------------------------------------------------------
-
-// LoopAgent runs its sub-agents in sequence repeatedly until a sub-agent emits
-// an event with Actions.Escalate set, or MaxIterations is reached (0 = until
-// escalation).
-type LoopAgent struct {
-	name    string
-	maxIter int
-	subs    []Agent
-}
-
-// Loop builds a LoopAgent.
-func Loop(name string, maxIterations int, subs ...Agent) *LoopAgent {
-	return &LoopAgent{name: name, maxIter: maxIterations, subs: subs}
-}
-
-func (a *LoopAgent) Name() string        { return a.name }
-func (a *LoopAgent) Description() string { return "runs sub-agents in a loop until escalation" }
-func (a *LoopAgent) SubAgents() []Agent  { return a.subs }
-
-func (a *LoopAgent) Run(ictx InvocationContext) core.Stream {
-	return func(yield func(*core.Event, error) bool) {
-		for iter := 0; a.maxIter == 0 || iter < a.maxIter; iter++ {
-			escalated := false
-			for _, sub := range a.subs {
-				for ev, err := range sub.Run(ictx.withAgent(sub, "").refreshSnapshot()) {
-					if !yield(ev, err) {
-						return
-					}
-					if err == nil && ev != nil && ev.Actions.Escalate {
-						escalated = true
-					}
-				}
-				if escalated {
-					return
-				}
-			}
-		}
-	}
-}
-
-// --- Parallel ---------------------------------------------------------------
-
-// ParallelAgent runs sub-agents on isolated event and state branches. Branch
-// events are persisted as detached chains, then one merge event publishes their
-// logical history and resolved state in declaration order. Per-event ACKs keep
-// each branch cursor aligned with Runner persistence.
-type ParallelAgent struct {
-	name string
-	subs []Agent
-	opts ParallelOptions
-}
-
-// StateConflictPolicy controls deterministic resolution when multiple branches
-// change the same state key to different values.
+// StateConflictPolicy controls deterministic resolution when multiple parallel
+// branches write different values to the same State.KV key.
 type StateConflictPolicy int
 
 const (
+	// RejectStateConflicts fails the merge if two branches set the same key to
+	// different values (the safe default — surfaces accidental contention).
 	RejectStateConflicts StateConflictPolicy = iota
+	// PreferEarlierBranch keeps the value from the branch listed first.
 	PreferEarlierBranch
+	// PreferLaterBranch keeps the value from the branch listed last.
 	PreferLaterBranch
 )
 
-// ParallelOptions configures merge behavior without changing the simple
+// ParallelOptions configures branch-merge behavior without changing the simple
 // Parallel constructor. The zero value rejects conflicting state writes.
 type ParallelOptions struct {
 	StateConflict StateConflictPolicy
 }
 
-// Parallel builds a ParallelAgent.
-func Parallel(name string, subs ...Agent) *ParallelAgent {
-	return ParallelWithOptions(name, ParallelOptions{}, subs...)
+// Loop runs sub-agents in sequence repeatedly until a sub escalates (a tool/
+// middleware returns Escalate — see ExitLoopTool) or maxIter is reached (0 =
+// until escalation).
+func Loop(name string, maxIter int, subs ...*Agent) *Agent {
+	return wrapWorkflow(name, &loopRunner{subs: subs, maxIter: maxIter})
 }
 
-// ParallelWithOptions builds a ParallelAgent with explicit merge policy.
-func ParallelWithOptions(name string, opts ParallelOptions, subs ...Agent) *ParallelAgent {
-	return &ParallelAgent{name: name, subs: subs, opts: opts}
+// wrapWorkflow builds an *Agent whose runnable is a workflow orchestrator. It
+// gets its own bus/store so it is independently Run-able; children are driven
+// with the workflow's RunContext, so their events land on the workflow's topic.
+func wrapWorkflow(name string, r Runnable) *Agent {
+	c := config{name: name}
+	return &Agent{cfg: c, runnable: r, bus: bus.New(), store: checkpoint.NewMemory()}
 }
 
-func (a *ParallelAgent) Name() string        { return a.name }
-func (a *ParallelAgent) Description() string { return "runs sub-agents in parallel" }
-func (a *ParallelAgent) SubAgents() []Agent  { return a.subs }
+// --- Sequential -------------------------------------------------------------
 
-type parallelItem struct {
-	ev  *core.Event
-	err error
-	ack chan struct{}
-}
+type sequentialRunner struct{ subs []*Agent }
 
-type parallelBranchResult struct {
-	tip   string
-	patch session.StatePatch
-}
-
-func (a *ParallelAgent) Run(ictx InvocationContext) core.Stream {
-	return func(yield func(*core.Event, error) bool) {
-		// Capture one immutable baseline before any child starts. A slow child
-		// must not observe events already emitted by a faster sibling.
-		base := ictx.refreshSnapshot()
-		if len(a.subs) == 0 {
-			return
+func (s *sequentialRunner) run(rc *RunContext) runOutcome {
+	var last runOutcome
+	for _, sub := range s.subs {
+		last = sub.runnable.run(rc)
+		if last.terminal() { // error or HITL pause
+			return last
 		}
-		merged := make(chan parallelItem)
-		var wg sync.WaitGroup
-		done := make(chan struct{})
-		results := make([]parallelBranchResult, len(a.subs))
-
-		for index, sub := range a.subs {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				scope := newBranchScope(base.snapshot())
-				branch := ictx.Branch
-				if branch == "" {
-					branch = a.name
-				}
-				branch += "." + sub.Name()
-				child := base.withAgent(sub, branch)
-				child.branchScope = scope
-				for ev, err := range sub.Run(child) {
-					managedHere := ev != nil && !ev.GraphManaged
-					if managedHere {
-						if ev.ID == "" {
-							ev.ID = core.NewID("evt")
-						}
-						if ev.Branch == "" {
-							ev.Branch = branch
-						}
-						ev.ParentID = scope.parentID()
-						ev.Detached = true
-						ev.GraphManaged = true
-					}
-					ack := make(chan struct{})
-					select {
-					case merged <- parallelItem{ev: ev, err: err, ack: ack}:
-					case <-done:
-						return
-					}
-					select {
-					case <-ack:
-					case <-done:
-						return
-					}
-					if managedHere && err == nil {
-						scope.accept(ev)
-					}
-					if err != nil {
-						return
-					}
-				}
-				results[index] = parallelBranchResult{tip: scope.tipID(), patch: scope.patch()}
-			}()
-		}
-
-		go func() {
-			wg.Wait()
-			close(merged)
-		}()
-
-		defer close(done)
-		for it := range merged {
-			ok := yield(it.ev, it.err)
-			close(it.ack)
-			if !ok || it.err != nil {
-				return
-			}
-		}
-
-		actions, err := mergeBranchPatches(results, a.opts.StateConflict)
-		if err != nil {
-			yield(&core.Event{ID: core.NewID("evt"), InvocationID: ictx.InvocationID, Author: a.name, Err: err}, err)
-			return
-		}
-		parents := make([]string, 0, len(results))
-		for _, result := range results {
-			if result.tip != "" && result.tip != base.snapshot().Leaf() {
-				parents = append(parents, result.tip)
-			}
-		}
-		merge := &core.Event{
-			ID:           core.NewID("evt"),
-			InvocationID: ictx.InvocationID,
-			Author:       a.name,
-			Branch:       ictx.Branch,
-			ParentID:     base.snapshot().Leaf(),
-			Detached:     ictx.branchScope != nil,
-			MergeParents: parents,
-			Actions:      actions,
-			GraphManaged: true,
-		}
-		if !yield(merge, nil) {
-			return
-		}
-		if ictx.branchScope != nil {
-			ictx.branchScope.accept(merge)
+		if k := last.Control.Kind; k == core.Stop || k == core.Escalate {
+			return last
 		}
 	}
+	return last
 }
 
-type branchMutation struct {
-	branch int
-	delete bool
-	value  any
+var _ Runnable = (*sequentialRunner)(nil)
+
+// --- Loop -------------------------------------------------------------------
+
+type loopRunner struct {
+	subs    []*Agent
+	maxIter int
 }
 
-func mergeBranchPatches(results []parallelBranchResult, policy StateConflictPolicy) (core.Actions, error) {
-	mutations := map[string]branchMutation{}
-	for branch, result := range results {
-		deletes := map[string]bool{}
-		for _, key := range result.patch.Delete {
-			deletes[key] = true
-			if err := mergeMutation(mutations, key, branchMutation{branch: branch, delete: true}, policy); err != nil {
-				return core.Actions{}, err
+func (l *loopRunner) run(rc *RunContext) runOutcome {
+	var last runOutcome
+	for iter := 0; l.maxIter == 0 || iter < l.maxIter; iter++ {
+		for _, sub := range l.subs {
+			last = sub.runnable.run(rc)
+			if last.terminal() {
+				return last
 			}
-		}
-		keys := slices.Sorted(maps.Keys(result.patch.Delta))
-		for _, key := range keys {
-			if deletes[key] {
-				continue
+			if last.Control.Kind == core.Escalate {
+				// Escalation breaks the loop cleanly (not an error).
+				return runOutcome{Result: last.Result}
 			}
-			if err := mergeMutation(mutations, key, branchMutation{branch: branch, value: result.patch.Delta[key]}, policy); err != nil {
-				return core.Actions{}, err
+			if last.Control.Kind == core.Stop {
+				return last
 			}
 		}
 	}
-	actions := core.Actions{StateDelta: map[string]any{}}
-	keys := slices.Sorted(maps.Keys(mutations))
-	for _, key := range keys {
-		mutation := mutations[key]
-		if mutation.delete {
-			actions.StateDelete = append(actions.StateDelete, key)
-		} else {
-			actions.StateDelta[key] = mutation.value
+	return last
+}
+
+var _ Runnable = (*loopRunner)(nil)
+
+// --- Parallel ---------------------------------------------------------------
+
+type parallelRunner struct {
+	subs []*Agent
+	opts ParallelOptions
+}
+
+func (p *parallelRunner) run(rc *RunContext) runOutcome {
+	// Baseline KV captured before any branch forks, so each branch's writes can
+	// be diffed against a common ancestor and folded deterministically.
+	baseline := cloneKV(rc.State.KV)
+
+	results := make([]runOutcome, len(p.subs))
+	branches := make([]*RunContext, len(p.subs))
+	var wg sync.WaitGroup
+	for i := range p.subs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			child := rc.forBranch(p.subs[i].cfg.name)
+			branches[i] = child
+			results[i] = p.subs[i].runnable.run(child)
+		}(i)
+	}
+	wg.Wait()
+	return p.merge(rc, baseline, branches, results)
+}
+
+var _ Runnable = (*parallelRunner)(nil)
+
+// merge folds parallel branch outcomes. The first error (or non-completion
+// control, e.g. Interrupt) short-circuits and propagates. Otherwise each
+// branch's KV diff against the baseline is folded by the conflict policy and
+// applied to the shared State, and the branches' final texts are concatenated.
+func (p *parallelRunner) merge(rc *RunContext, baseline map[string]any, branches []*RunContext, rs []runOutcome) runOutcome {
+	texts := make([]string, 0, len(rs))
+	patches := make([]statePatch, len(rs))
+	for i, r := range rs {
+		if r.Err != nil {
+			return runOutcome{Err: r.Err}
+		}
+		// A branch that paused (HITL) or asked to Stop/Escalate can't be merged
+		// deterministically; surface its control to the enclosing workflow.
+		if r.terminal() || r.Control.Kind == core.Stop || r.Control.Kind == core.Escalate {
+			return r
+		}
+		patches[i] = diffKV(baseline, branches[i].State.KV)
+		if t := r.Result.Message.Text(); t != "" {
+			texts = append(texts, t)
 		}
 	}
-	if len(actions.StateDelta) == 0 {
-		actions.StateDelta = nil
+	merged, err := mergeKVPatches(patches, p.opts.StateConflict)
+	if err != nil {
+		return runOutcome{Err: err}
 	}
-	return actions, nil
+	applyKVPatch(rc.State, merged)
+	return runOutcome{Result: core.Result{Message: core.AssistantText(strings.Join(texts, "\n\n"))}}
 }
 
-func mergeMutation(dst map[string]branchMutation, key string, next branchMutation, policy StateConflictPolicy) error {
-	current, exists := dst[key]
-	if !exists {
-		dst[key] = next
-		return nil
+// renderTemplate substitutes {{key}} placeholders in an instruction with values
+// from State.KV — the read side of WithOutputKey, letting a later workflow stage
+// reference an earlier stage's output.
+func renderTemplate(tmpl string, kv map[string]any) string {
+	if tmpl == "" || len(kv) == 0 || !strings.Contains(tmpl, "{{") {
+		return tmpl
 	}
-	if current.delete == next.delete && (current.delete || reflect.DeepEqual(current.value, next.value)) {
-		return nil
+	out := tmpl
+	for k, v := range kv {
+		out = strings.ReplaceAll(out, "{{"+k+"}}", fmt.Sprint(v))
 	}
-	switch policy {
-	case PreferEarlierBranch:
-		return nil
-	case PreferLaterBranch:
-		dst[key] = next
-		return nil
-	default:
-		return fmt.Errorf("parallel: state key %q conflicts between branches %d and %d", key, current.branch, next.branch)
-	}
+	return out
 }
 
-var (
-	_ Agent = (*SequentialAgent)(nil)
-	_ Agent = (*LoopAgent)(nil)
-	_ Agent = (*ParallelAgent)(nil)
-)
+// --- ExitLoopTool -----------------------------------------------------------
+
+// ExitLoopTool returns a tool an agent can call to break an enclosing Loop
+// workflow. Calling it yields a result whose Control is Escalate, which the loop
+// folds and the loopRunner reads to stop iterating.
+func ExitLoopTool() tool.Tool { return exitTool{} }
+
+type exitTool struct{}
+
+func (exitTool) Name() string { return "exit_loop" }
+func (exitTool) Description() string {
+	return "Call when the work is good enough to stop the refinement loop."
+}
+func (exitTool) Schema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"reason":{"type":"string"}}}`)
+}
+
+func (exitTool) Call(_ *tool.Context, args json.RawMessage) (*tool.Result, error) {
+	var in struct {
+		Reason string `json:"reason"`
+	}
+	_ = json.Unmarshal(args, &in)
+	msg := "exiting loop"
+	if in.Reason != "" {
+		msg += ": " + in.Reason
+	}
+	return &tool.Result{
+		Content: []core.Part{core.Text{Text: msg}},
+		Control: &core.Directive{Kind: core.Escalate, Reason: in.Reason},
+	}, nil
+}

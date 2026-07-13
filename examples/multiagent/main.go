@@ -1,68 +1,109 @@
-// Command multiagent demonstrates LLM-driven delegation: a router agent
-// auto-advertises a transfer_to_agent tool (because it has sub-agents) and
-// hands the request to the specialist best suited to answer. Uses the mock
-// provider, so no API key is required.
+// Command multiagent is a tutorial for LLM-driven delegation: a router agent
+// with sub-experts. When you give an agent sub-agents (WithSubAgents), goagent
+// auto-injects a transfer_to_agent tool; the model decides whom to hand off to,
+// and the delegate's reply becomes the run's answer (it continues the same
+// conversation State).
+//
+// Driven by a real Agnes chat model (OpenAI-compatible).
+//
+//	export AGNES_API_KEY=sk-...
+//	export AGNES_MODEL=gemini-2.5-flash
+//	go run ./examples/multiagent
+//
+// 没设 AGNES_API_KEY 时,程序只打印用法后退出。
 package main
 
 import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 
 	"github.com/jiujuan/goagent/agent"
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/llm"
-	"github.com/jiujuan/goagent/llm/mock"
-	"github.com/jiujuan/goagent/runner"
+	"github.com/jiujuan/goagent/llm/openaicompat"
 )
 
 func main() {
-	weatherExpert := agent.New(agent.Config{
-		Name:        "weather_expert",
-		Description: "回答天气相关问题",
-		Model: mock.New("weather", func(*llm.Request) *llm.Response {
-			return mock.Text("今天北京晴，25°C，适合出门。")
-		}),
-	})
+	model, ok := buildModel()
+	if !ok {
+		fmt.Println("请先设置 AGNES_API_KEY(和可选 AGNES_MODEL / AGNES_BASE_URL)再运行。")
+		return
+	}
+	ctx := context.Background()
 
-	mathExpert := agent.New(agent.Config{
-		Name:        "math_expert",
-		Description: "解决数学计算问题",
-		Model: mock.New("math", func(*llm.Request) *llm.Response {
-			return mock.Text("42。")
-		}),
-	})
+	// 两个领域专家(子 agent)。Name/Description 会被 transfer 工具用来让模型挑选。
+	weather := expert(model, "weather_expert", "回答天气相关问题",
+		"你是天气专家,只回答天气问题,简洁作答。")
+	math := expert(model, "math_expert", "做数学计算与推理",
+		"你是数学专家,只回答数学问题,给出步骤与结果。")
 
-	router := agent.New(agent.Config{
-		Name:        "router",
-		Description: "把用户问题路由到合适的专家",
-		Instruction: "根据问题类型转交给合适的专家。",
-		SubAgents:   []agent.Agent{weatherExpert, mathExpert},
-		Model: mock.New("router", func(*llm.Request) *llm.Response {
-			// 一个真实模型会读 user 问题决定目标；这里固定转交天气专家。
-			return mock.CallTool("t1", "transfer_to_agent", `{"agent_name":"weather_expert"}`)
-		}),
-	})
+	// 路由 agent:有 SubAgents,于是自动获得 transfer_to_agent 工具。系统提示让它
+	// 先判断领域、再转交,不自己回答。
+	router, err := agent.New(
+		agent.WithName("router"),
+		agent.WithModel(model),
+		agent.WithInstruction("你是一个分诊路由。判断用户问题属于天气还是数学,"+
+			"调用 transfer_to_agent 转交给对应专家;不要自己回答专业问题。"),
+		agent.WithSubAgents(weather, math),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	r := runner.New(runner.Config{Root: router})
-	for ev, err := range r.Run(context.Background(), "u1", "s1", core.UserText("北京天气怎么样？")) {
-		if err != nil {
-			log.Fatal(err)
-		}
-		if ev.Message == nil {
-			continue
-		}
-		switch ev.Message.Role {
-		case core.RoleUser:
-			fmt.Printf("👤 user: %s\n", ev.Message.Text())
-		case core.RoleAssistant:
-			if calls := ev.Message.ToolCalls(); len(calls) > 0 {
-				fmt.Printf("🧭 %s: 转交 → %s\n", ev.Author, string(calls[0].Args))
-				continue
+	for _, q := range []string{
+		"北京明天会下雨吗?",
+		"123 乘以 456 等于多少?",
+	} {
+		section("用户:" + q)
+		// 流式打印,能看到「→ 转交给 X」再看到专家的回答。
+		for ev, err := range router.Stream(ctx, q).Iter() {
+			if err != nil {
+				log.Fatal(err)
 			}
-			fmt.Printf("🤖 %s: %s\n", ev.Author, ev.Message.Text())
-		case core.RoleTool:
-			fmt.Printf("🔧 (transfer 已执行)\n")
+			switch e := ev.(type) {
+			case core.ToolDone:
+				if e.Result.Name == "transfer_to_agent" {
+					fmt.Println("   [delegation]", e.Result.Content[0].(core.Text).Text)
+				}
+			case core.MessageDone:
+				if t := e.Message.Text(); t != "" {
+					fmt.Println("🤖", t)
+				}
+			}
 		}
 	}
 }
+
+func expert(model llm.Model, name, desc, instruction string) *agent.Agent {
+	a, err := agent.New(
+		agent.WithName(name),
+		agent.WithDescription(desc),
+		agent.WithModel(model),
+		agent.WithInstruction(instruction),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return a
+}
+
+func buildModel() (llm.Model, bool) {
+	key := os.Getenv("AGNES_API_KEY")
+	if key == "" {
+		return nil, false
+	}
+	base := envOr("AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1")
+	model := envOr("AGNES_MODEL", "gemini-2.5-flash")
+	return openaicompat.Agnes(base, model, key), true
+}
+
+func envOr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+func section(title string) { fmt.Printf("\n========== %s ==========\n", title) }

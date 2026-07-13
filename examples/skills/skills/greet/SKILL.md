@@ -1,15 +1,12 @@
 ---
 name: greet
-description: Compose a friendly greeting and run the bundled greeter script
-allowed-tools: [use_skill, run_skill_script]
+description: 用得体、温暖的方式问候用户
+allowed-tools: []
 ---
-# Greeting workflow
+# 问候技能
 
-When asked to greet someone, follow these steps:
+当需要问候用户时,遵循以下风格:
 
-1. Call `use_skill` with `resource: "template.md"` to load the greeting
-   template and see how the message should be phrased.
-2. Run the bundled greeter with `run_skill_script` (skill `greet`, script
-   `scripts/greet.sh`, `scripts/greet.py`, or `scripts/greet.js`); it prints
-   the rendered greeting.
-3. Report the greeting back to the user.
+1. 直接称呼对方的名字
+2. 加一句简短温暖的话
+3. 整体不超过两句,避免寒暄堆砌

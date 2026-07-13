@@ -2,108 +2,76 @@ package middleware
 
 import (
 	"context"
-	"errors"
 	"iter"
 	"time"
 
 	"github.com/jiujuan/goagent/llm"
 )
 
-// RetryOptions configures the Retry middleware.
+// RetryOptions configures RetryModel.
 type RetryOptions struct {
-	// MaxAttempts is the total number of attempts (default 3).
+	// MaxAttempts is the total number of tries (default 3).
 	MaxAttempts int
-	// BaseDelay is the first backoff delay (default 200ms); it doubles each
-	// attempt up to MaxDelay.
+	// BaseDelay is the first backoff delay; it doubles each retry (default 200ms).
 	BaseDelay time.Duration
-	// MaxDelay caps the backoff (default 10s).
-	MaxDelay time.Duration
-	// Retryable decides whether an error is worth retrying (default: any
-	// non-context error).
-	Retryable func(error) bool
 }
 
-// Retry retries a failed model call with exponential backoff. To keep streaming
-// safe, it only retries when the error occurs BEFORE any response has been
-// yielded; once partial output has streamed, the error is propagated (a retry
-// would duplicate already-delivered content).
-func Retry(opts *RetryOptions) Middleware {
-	max := 3
-	base := 200 * time.Millisecond
-	maxDelay := 10 * time.Second
-	retryable := defaultRetryable
-	if opts != nil {
-		if opts.MaxAttempts > 0 {
-			max = opts.MaxAttempts
-		}
-		if opts.BaseDelay > 0 {
-			base = opts.BaseDelay
-		}
-		if opts.MaxDelay > 0 {
-			maxDelay = opts.MaxDelay
-		}
-		if opts.Retryable != nil {
-			retryable = opts.Retryable
-		}
+// RetryModel wraps an llm.Model so transient failures are retried with
+// exponential backoff. It is a MODEL DECORATOR, not a loop hook — retry belongs
+// around the bare model call. Use it via WithModel:
+//
+//	agent.New(agent.WithModel(middleware.RetryModel(real, middleware.RetryOptions{MaxAttempts: 3})))
+//
+// It only retries when the call fails BEFORE yielding any response in an
+// attempt; once tokens have streamed out, a later error is returned as-is
+// (re-running would duplicate output).
+func RetryModel(m llm.Model, o RetryOptions) llm.Model {
+	if o.MaxAttempts < 1 {
+		o.MaxAttempts = 3
 	}
+	if o.BaseDelay <= 0 {
+		o.BaseDelay = 200 * time.Millisecond
+	}
+	return &retryModel{inner: m, max: o.MaxAttempts, base: o.BaseDelay}
+}
 
-	return func(next llm.Model) llm.Model {
-		return Wrap(next, func(ctx context.Context, req *llm.Request) iter.Seq2[*llm.Response, error] {
-			return func(yield func(*llm.Response, error) bool) {
-				delay := base
-				var lastErr error
-				for attempt := 0; attempt < max; attempt++ {
-					if attempt > 0 {
-						if !sleep(ctx, delay) {
-							yield(nil, ctx.Err())
-							return
-						}
-						delay = min(delay*2, maxDelay)
-					}
+type retryModel struct {
+	inner llm.Model
+	max   int
+	base  time.Duration
+}
 
-					yielded := false
-					failed := false
-					for resp, err := range next.Generate(ctx, req) {
-						if err != nil {
-							if !yielded && retryable(err) {
-								lastErr = err
-								failed = true
-								break // retry from scratch
-							}
-							// Already streamed, or non-retryable: propagate.
-							yield(resp, err)
-							return
-						}
-						yielded = true
-						if !yield(resp, nil) {
-							return
-						}
-					}
-					if !failed {
-						return // success
-					}
+func (r *retryModel) Name() string { return r.inner.Name() }
+
+func (r *retryModel) Generate(ctx context.Context, req *llm.Request) iter.Seq2[*llm.Response, error] {
+	return func(yield func(*llm.Response, error) bool) {
+		for attempt := 0; ; attempt++ {
+			yielded := false
+			var failed error
+			for resp, err := range r.inner.Generate(ctx, req) {
+				if err != nil {
+					failed = err
+					break
 				}
-				yield(nil, lastErr)
+				yielded = true
+				if !yield(resp, nil) {
+					return
+				}
 			}
-		})
+			if failed == nil {
+				return // success
+			}
+			if yielded || attempt >= r.max-1 {
+				yield(nil, failed) // mid-stream failure or out of attempts
+				return
+			}
+			delay := r.base << attempt
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				yield(nil, ctx.Err())
+				return
+			}
+		}
 	}
-}
-
-// sleep waits for d or until ctx is done; returns false if ctx was cancelled.
-func sleep(ctx context.Context, d time.Duration) bool {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-t.C:
-		return true
-	case <-ctx.Done():
-		return false
-	}
-}
-
-// defaultRetryable retries any error except context cancellation/deadline.
-func defaultRetryable(err error) bool {
-	return err != nil &&
-		!errors.Is(err, context.Canceled) &&
-		!errors.Is(err, context.DeadlineExceeded)
 }

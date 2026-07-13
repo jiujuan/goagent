@@ -6,9 +6,9 @@ import (
 	"sync"
 )
 
-// Memory is an in-memory Checkpointer for prototyping and tests. Checkpoints
-// are kept append-only per thread, preserving order for Latest/History. It is
-// safe for concurrent use.
+// Memory is an in-memory Checkpointer for prototyping and tests. Checkpoints are
+// kept append-only per thread, preserving order for Latest/History. Safe for
+// concurrent use.
 type Memory struct {
 	mu       sync.RWMutex
 	byThread map[string][]*Checkpoint
@@ -19,7 +19,7 @@ func NewMemory() *Memory {
 	return &Memory{byThread: map[string][]*Checkpoint{}}
 }
 
-// Save appends a copy-by-reference checkpoint to its thread.
+// Save appends a checkpoint to its thread.
 func (m *Memory) Save(_ context.Context, cp *Checkpoint) error {
 	if cp == nil || cp.ThreadID == "" {
 		return fmt.Errorf("checkpoint: Save requires a non-nil checkpoint with ThreadID")

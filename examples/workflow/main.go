@@ -1,206 +1,155 @@
-// Command workflow demonstrates goagent's DETERMINISTIC orchestration agents —
-// Sequential, Parallel and Loop — composed into one pipeline, with no reliance
-// on the LLM to decide control flow. It models a small "marketing copy"
-// production line:
+// Command workflow is a tutorial for goagent's deterministic multi-agent
+// orchestration: Sequential, Parallel, Loop, and the Pipeline builder. Workflow
+// agents are *Agent values too, so they share the same New/Run/Stream API as a
+// plain LLM agent — you just compose smaller agents into bigger ones.
 //
-//	Sequential「pipeline」
-//	├─ Parallel「research」   三个调研 agent 并发跑，各自把结论写入 session state
-//	│   ├─ market_research      OutputKey: research.market
-//	│   ├─ competitor_research  OutputKey: research.competitor
-//	│   └─ audience_research    OutputKey: research.audience
-//	├─ writer                 读取前序调研（消息历史）产出初稿
-//	└─ Loop「refine」(≤3 轮)   critic 评审 / reviser 修订，达标时 Escalate 跳出
+// Driven by a real Agnes chat model (OpenAI-compatible).
 //
-// Parallel branches persist as isolated detached chains. Their merge publishes
-// messages in declaration order and applies OutputKey state atomically before
-// the writer stage starts.
+//	export AGNES_API_KEY=sk-...
+//	export AGNES_MODEL=gemini-2.5-flash     # 你的 Agnes 聊天模型 id(可选)
+//	go run ./examples/workflow
 //
-// It showcases:
-//   - Parallel 并发分支 + OutputKey 写入共享 state；
-//   - Sequential 阶段间通过已提交的消息历史传递数据；
-//   - Loop 反复迭代直到某个 sub-agent 触发 Escalate（而非靠固定轮数）。
-//
-// Everything runs on the mock provider — no API key required.
+// 没设 AGNES_API_KEY 时,程序只打印用法后退出。
 package main
 
 import (
 	"context"
 	"fmt"
 	"log"
-	"sort"
-	"strings"
+	"os"
 
 	"github.com/jiujuan/goagent/agent"
-	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/llm"
-	"github.com/jiujuan/goagent/llm/mock"
-	"github.com/jiujuan/goagent/runner"
-	"github.com/jiujuan/goagent/session"
-	"github.com/jiujuan/goagent/tool"
+	"github.com/jiujuan/goagent/llm/openaicompat"
 )
 
 func main() {
-	// --- 阶段 1：并发调研。每个 agent 把结论写入 state（OutputKey），其最终回复
-	//     也作为消息进入会话历史，供下游 writer 读取。 ---
-	market := researcher("market_research", "research.market",
-		"市场规模约 120 亿元，年增长 18%，下沉市场尚未饱和。")
-	competitor := researcher("competitor_research", "research.competitor",
-		"头部 3 家竞品合计占 40% 份额，普遍主打高价高配，缺少性价比款。")
-	audience := researcher("audience_research", "research.audience",
-		"核心用户为 25–35 岁一二线城市白领，看重续航与拍照。")
-	research := agent.Parallel("research", market, competitor, audience)
-
-	// --- 阶段 2：撰稿。读取历史里的三段调研，产出初稿。 ---
-	writer := agent.New(agent.Config{
-		Name: "writer", Description: "综合调研产出推广初稿",
-		DisableTransfer: true,
-		Model: mock.New("writer", func(req *llm.Request) *llm.Response {
-			facts := priorFindings(req)
-			return mock.Text("初稿：GoPhone 面向年轻白领，主打超长续航与影像；" +
-				"综合调研要点 —— " + strings.Join(facts, "；") + "。")
-		}),
-	})
-
-	// --- 阶段 3：评审/修订循环，达标时通过 approve 工具触发 Escalate 跳出 Loop。 ---
-	approve := tool.New("approve", "批准草稿可发布，结束修订循环",
-		func(ctx *tool.Context, _ struct{}) (string, error) {
-			ctx.Actions.Escalate = true // 通知外层 Loop 停止迭代
-			return "approved", nil
-		})
-
-	round := 0
-	critic := agent.New(agent.Config{
-		Name: "critic", Description: "评审草稿质量",
-		DisableTransfer: true,
-		Tools:           []tool.Tool{approve},
-		Model: mock.New("critic", func(req *llm.Request) *llm.Response {
-			if res, ok := mock.LastToolResult(req); ok && res.Name == "approve" {
-				return mock.Text("✓ 已批准，可以发布。")
-			}
-			round++
-			if round >= 2 { // 第二轮起认为已达标
-				return mock.CallTool("a", "approve", `{}`)
-			}
-			return mock.Text("✗ 开头缺少钩子，且未标注数据来源，请修订。")
-		}),
-	})
-
-	rev := 0
-	reviser := agent.New(agent.Config{
-		Name: "reviser", Description: "按评审意见修订草稿",
-		DisableTransfer: true,
-		Model: mock.New("reviser", func(*llm.Request) *llm.Response {
-			rev++
-			return mock.Text(fmt.Sprintf(
-				"修订稿 v%d：开头加入钩子「每天省一杯咖啡钱，续航多撑一天」，并补注数据来源。", rev))
-		}),
-	})
-	refine := agent.Loop("refine", 3, critic, reviser)
-
-	// --- 组装并运行流水线 ---
-	pipeline := agent.Sequential("pipeline", research, writer, refine)
-
-	store := session.InMemory()
-	r := runner.New(runner.Config{AppName: "report", Root: pipeline, Store: store})
+	model, ok := buildModel()
+	if !ok {
+		fmt.Println("请先设置 AGNES_API_KEY(和可选 AGNES_MODEL / AGNES_BASE_URL)再运行。")
+		return
+	}
 	ctx := context.Background()
 
-	banner("goagent 工作流示例：营销文案生产流水线",
-		"Sequential · Parallel · Loop · OutputKey→state · Escalate")
+	section("1. Sequential —— 顺序流水线(上一阶段输出流向下一阶段)")
+	demoSequential(ctx, model)
 
-	for ev, err := range r.Run(ctx, "u", "s1", core.UserText("为 GoPhone 写一段市场推广短文")) {
-		if err != nil {
-			log.Fatal(err)
-		}
-		printEvent(ev)
-	}
+	section("2. Parallel —— 并发 fan-out(分支隔离 + 结果合并)")
+	demoParallel(ctx, model)
 
-	// --- 收尾：展示并发调研经 OutputKey 写入的共享 state ---
-	fmt.Println("\n── 共享 state（research.* 由并发分支写入）──")
-	s, err := store.GetOrCreate(ctx, "report", "u", "s1")
+	section("3. Loop —— 循环精修(到 exit_loop 跳出)")
+	demoLoop(ctx, model)
+
+	section("4. Pipeline —— builder 声明多阶段(含并发/循环复合阶段)")
+	demoPipeline(ctx, model)
+}
+
+// --- 1. Sequential ----------------------------------------------------------
+
+// 每个阶段都是一个用 agent.New 造的小 agent;agent.Sequential 把它们串成一个更大的
+// agent。同一条 State 贯穿,所以后一阶段能看到前一阶段写进对话的内容。
+func demoSequential(ctx context.Context, model llm.Model) {
+	planner := stage(model, "你是选题策划。把用户主题拆成 3 个要点,列表输出,不要展开。")
+	writer := stage(model, "你是作者。根据上文要点,写一段 100 字以内的简介。")
+	polisher := stage(model, "你是润色编辑。把上文改得更简洁有力,直接输出最终文字。")
+
+	flow := agent.Sequential("write-pipeline", planner, writer, polisher)
+	out, err := flow.Run(ctx, "主题:向量数据库")
 	if err != nil {
 		log.Fatal(err)
 	}
-	for _, k := range sortedResearchKeys(s.State()) {
-		v, _ := s.State().Get(k)
-		fmt.Printf("   %-22s = %v\n", k, v)
-	}
+	fmt.Println("🤖", out)
 }
 
-// printEvent renders one streamed event with a stage icon keyed by author.
-func printEvent(ev *core.Event) {
-	if ev.Message == nil {
-		return // OutputKey 等纯 state 事件无消息体
+// --- 2. Parallel ------------------------------------------------------------
+
+// 并发跑多个 agent,每个在自己的 State 分支上(互不干扰),最后把各自终答合并。
+func demoParallel(ctx context.Context, model llm.Model) {
+	pros := stage(model, "只列出『使用 Go 写后端』的 3 个优点,简短。")
+	cons := stage(model, "只列出『使用 Go 写后端』的 3 个缺点,简短。")
+
+	flow := agent.Parallel("pros-cons", pros, cons)
+	out, err := flow.Run(ctx, "评估 Go 做后端")
+	if err != nil {
+		log.Fatal(err)
 	}
-	switch ev.Message.Role {
-	case core.RoleUser:
-		fmt.Printf("\n👤 %s\n", ev.Message.Text())
-	case core.RoleAssistant:
-		if calls := ev.Message.ToolCalls(); len(calls) > 0 {
-			for _, c := range calls {
-				if c.Name == "approve" {
-					fmt.Printf("   ✅ %s 批准草稿 → 触发 Escalate，退出 refine 循环\n", ev.Author)
-				}
-			}
-			return
-		}
-		fmt.Printf("   %s %-18s %s\n", icon(ev.Author), ev.Author, ev.Message.Text())
-	}
+	fmt.Println("🤖\n" + out)
 }
 
-func icon(author string) string {
-	switch {
-	case strings.HasSuffix(author, "research"):
-		return "🔎"
-	case author == "writer":
-		return "✍️"
-	case author == "critic":
-		return "🧐"
-	case author == "reviser":
-		return "🛠️"
-	default:
-		return "•"
+// --- 3. Loop ----------------------------------------------------------------
+
+// Loop 反复跑子 agent,直到某个 agent 调用 exit_loop(agent.ExitLoopTool 返回的
+// 工具,其结果带 Escalate 控制信号,loopRunner 读到就停),或到达 maxIter。
+func demoLoop(ctx context.Context, model llm.Model) {
+	critic := stage(model,
+		"你是严格的评审。若上文草稿已足够好,就调用 exit_loop 工具结束;否则用一句话给出改进建议。",
+		agent.WithTools(agent.ExitLoopTool()),
+	)
+	reviser := stage(model, "你是修改者。根据最近的评审建议改写草稿,直接输出新草稿。")
+
+	flow := agent.Loop("refine", 4, critic, reviser)
+	out, err := flow.Run(ctx, "草稿:Go 是一种语言。请精修到一句话的精彩简介。")
+	if err != nil {
+		log.Fatal(err)
 	}
+	fmt.Println("🤖", out)
 }
 
-// researcher builds a leaf agent that returns a fixed finding and also records
-// it into session state under outputKey.
-func researcher(name, outputKey, finding string) *agent.LLMAgent {
-	return agent.New(agent.Config{
-		Name: name, Description: "调研：" + name,
-		OutputKey:       outputKey,
-		DisableTransfer: true,
-		Model: mock.New(name, func(*llm.Request) *llm.Response {
-			return mock.Text(finding)
-		}),
-	})
-}
+// --- 4. Pipeline ------------------------------------------------------------
 
-// priorFindings extracts the research agents' replies already committed to the
-// conversation, so the writer can compose from them.
-func priorFindings(req *llm.Request) []string {
-	var out []string
-	for _, m := range req.Messages {
-		if m.Role == core.RoleAssistant && m.Text() != "" && len(m.ToolCalls()) == 0 {
-			out = append(out, m.Text())
-		}
+// Pipeline 是 Sequential 的 fluent 糖:每个 stage 可以是普通 agent,也可以是
+// Parallel/Loop 复合阶段。Build() 折叠成一个可运行的 Sequential agent。
+func demoPipeline(ctx context.Context, model llm.Model) {
+	planner := stage(model, "把主题拆成 2 个调研角度,列表输出。")
+	angleA := stage(model, "就第一个角度给一句要点。")
+	angleB := stage(model, "就第二个角度给一句要点。")
+	writer := stage(model, "综合上文,写 80 字以内的总结。")
+	critic := stage(model, "若总结够好就调用 exit_loop;否则给一句改进建议。", agent.WithTools(agent.ExitLoopTool()))
+	reviser := stage(model, "按评审意见改写总结,直接输出。")
+
+	pipe := agent.NewPipeline("research-report").
+		Then(planner).
+		ThenParallel("gather", angleA, angleB).
+		Then(writer).
+		ThenLoop("review", 3, critic, reviser).
+		Build()
+
+	out, err := pipe.Run(ctx, "主题:Go 的并发模型")
+	if err != nil {
+		log.Fatal(err)
 	}
-	return out
+	fmt.Println("🤖", out)
 }
 
-func sortedResearchKeys(state session.State) []string {
-	var keys []string
-	for _, k := range []string{"research.market", "research.competitor", "research.audience"} {
-		if _, ok := state.Get(k); ok {
-			keys = append(keys, k)
-		}
+// --- helpers ----------------------------------------------------------------
+
+// stage builds a small single-purpose agent for use as a workflow stage.
+func stage(model llm.Model, instruction string, opts ...agent.Option) *agent.Agent {
+	a, err := agent.New(append([]agent.Option{
+		agent.WithModel(model),
+		agent.WithInstruction(instruction),
+	}, opts...)...)
+	if err != nil {
+		log.Fatal(err)
 	}
-	sort.Strings(keys)
-	return keys
+	return a
 }
 
-func banner(title, sub string) {
-	fmt.Println("════════════════════════════════════════════════════════")
-	fmt.Println("  " + title)
-	fmt.Println("  " + sub)
-	fmt.Println("════════════════════════════════════════════════════════")
+func buildModel() (llm.Model, bool) {
+	key := os.Getenv("AGNES_API_KEY")
+	if key == "" {
+		return nil, false
+	}
+	base := envOr("AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1")
+	model := envOr("AGNES_MODEL", "gemini-2.5-flash")
+	return openaicompat.Agnes(base, model, key), true
 }
+
+func envOr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+func section(title string) { fmt.Printf("\n========== %s ==========\n", title) }

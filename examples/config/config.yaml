@@ -1,0 +1,17 @@
+# 这是 examples/config 的演示配置文件。
+# 用法:go run ./examples/config -file examples/config/config.yaml
+#
+# 优先级:内置默认值 < 本文件 < config.local.yaml < 环境变量 < WithXxx
+
+llm:
+  provider: deepseek
+  base_url: https://api.deepseek.com/v1
+  model: deepseek-chat
+  # api_key 不要写在 committed 文件里;放到 config.local.yaml 或用环境变量
+  # AGNES_API_KEY / GOAGENT_LLM_API_KEY 注入。
+
+redis:
+  url: redis://localhost:6379
+
+eval:
+  live: false

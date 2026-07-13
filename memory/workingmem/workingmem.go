@@ -1,23 +1,21 @@
 // Package workingmem provides working memory: a small, structured scratchpad
-// (current goal, todos, key facts) that lives in session State and therefore
-// survives context compaction. The compaction middleware (ADR 0007) replaces
-// old messages with a summary, but State is untouched — so durable task context
-// belongs here, not in the message log. See ADR 0017.
+// (current goal, todos, key facts) that lives in run State.KV and therefore
+// survives context compaction. Compaction (a ModifyRequest middleware) reshapes
+// the message history, but State is untouched — so durable task context belongs
+// here, not in the message log. See ADR 0017.
 //
-// The scratchpad is stored under a single reserved State key as a JSON string.
-// Encoding the whole snapshot as one string (rather than storing []Todo etc.
-// directly) keeps it stable across the FileStore JSON round-trip, where a
-// []Todo would otherwise reload as []any of map[string]any.
+// The scratchpad is stored under a single reserved State.KV key as a JSON string
+// (encoding the whole snapshot as one string keeps it stable across a file
+// checkpoint's JSON round-trip).
 package workingmem
 
 import (
 	"encoding/json"
 
-	"github.com/jiujuan/goagent/session"
+	"github.com/jiujuan/goagent/core"
 )
 
-// stateKey is the reserved session-State key holding the encoded Snapshot. It
-// is session-scoped (no app:/user:/temp: prefix) so it persists per session.
+// stateKey is the reserved State.KV key holding the encoded Snapshot.
 const stateKey = "wm:snapshot"
 
 // Todo is one tracked task item.
@@ -39,23 +37,22 @@ func (s Snapshot) Empty() bool {
 	return s.Goal == "" && len(s.Todos) == 0 && len(s.Notes) == 0
 }
 
-// WorkingMemory is a typed view over a session's working-memory scratchpad. It
-// reads from session State; writes go through the UpdateTool so they flow into
-// an event's StateDelta and persist (a direct State.Set is not persisted by the
-// FileStore — see session.commit).
+// WorkingMemory is a typed view over a run's working-memory scratchpad. It reads
+// from State.KV; writes go through UpdateTool (which returns a StateOp so the
+// loop persists it).
 type WorkingMemory struct {
-	s *session.Session
+	st *core.State
 }
 
-// For wraps a session's working memory.
-func For(s *session.Session) *WorkingMemory { return &WorkingMemory{s: s} }
+// For wraps a run's State.
+func For(st *core.State) *WorkingMemory { return &WorkingMemory{st: st} }
 
 // Snapshot returns the current working memory.
 func (w *WorkingMemory) Snapshot() Snapshot {
-	if w.s == nil {
+	if w.st == nil {
 		return Snapshot{}
 	}
-	return readSnapshot(w.s.State())
+	return readSnapshot(w.st)
 }
 
 // Goal returns the current goal (empty if unset).
@@ -67,10 +64,13 @@ func (w *WorkingMemory) Todos() []Todo { return w.Snapshot().Todos }
 // Notes returns the key/value facts.
 func (w *WorkingMemory) Notes() map[string]string { return w.Snapshot().Notes }
 
-// readSnapshot decodes the Snapshot from State, returning the zero Snapshot when
-// absent or malformed.
-func readSnapshot(st session.StateReader) Snapshot {
-	v, ok := st.Get(stateKey)
+// readSnapshot decodes the Snapshot from State.KV, returning the zero Snapshot
+// when absent or malformed.
+func readSnapshot(st *core.State) Snapshot {
+	if st == nil || st.KV == nil {
+		return Snapshot{}
+	}
+	v, ok := st.KV[stateKey]
 	if !ok {
 		return Snapshot{}
 	}
@@ -83,7 +83,7 @@ func readSnapshot(st session.StateReader) Snapshot {
 	return snap
 }
 
-// encodeSnapshot serializes a Snapshot for storage in State.
+// encodeSnapshot serializes a Snapshot for storage in State.KV.
 func encodeSnapshot(snap Snapshot) string {
 	b, _ := json.Marshal(snap)
 	return string(b)

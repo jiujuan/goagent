@@ -24,22 +24,19 @@ func TestResolvePrecedence(t *testing.T) {
 }
 
 func TestResolveTieKeepsFirst(t *testing.T) {
-	got := Resolve(
-		Directive{Kind: Transfer, Target: "a"},
-		Directive{Kind: Transfer, Target: "b"},
-	)
+	got := Resolve(Directive{Kind: Transfer, Target: "a"}, Directive{Kind: Transfer, Target: "b"})
 	if got.Target != "a" {
-		t.Fatalf("tie should keep first: got target %q, want %q", got.Target, "a")
+		t.Fatalf("tie should keep first: got %q", got.Target)
 	}
 }
 
 func TestStateApply(t *testing.T) {
 	var s State
 	s.Apply(
-		StateOp{Kind: OpSetKV, Key: "user_pref", Value: "concise"},
-		StateOp{Kind: OpAddTodo, Value: Todo{ID: "1", Title: "research", Status: "pending"}},
+		StateOp{Kind: OpSetKV, Key: "pref", Value: "concise"},
+		StateOp{Kind: OpAddTodo, Value: Todo{ID: "1", Title: "research"}},
 	)
-	if s.KV["user_pref"] != "concise" {
+	if s.KV["pref"] != "concise" {
 		t.Fatalf("OpSetKV not applied: %v", s.KV)
 	}
 	if len(s.Todos) != 1 || s.Todos[0].Title != "research" {

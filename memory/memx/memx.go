@@ -1,6 +1,7 @@
 package memx
 
 import (
+	"github.com/jiujuan/goagent/agent"
 	"github.com/jiujuan/goagent/memory"
 	"github.com/jiujuan/goagent/memory/projectmem"
 	"github.com/jiujuan/goagent/memory/rules"
@@ -10,6 +11,16 @@ import (
 	"github.com/jiujuan/goagent/prompt"
 	"github.com/jiujuan/goagent/tool"
 )
+
+// RAGConfig configures the auto-RAG middleware mounted over the semantic store.
+type RAGConfig struct {
+	// K is the number of documents to retrieve (default 4).
+	K int
+	// MinScore drops retrieved documents below this similarity (default 0).
+	MinScore float64
+	// Header is the preamble placed before injected context.
+	Header string
+}
 
 // Config selects which memory layers to mount and where they persist. Every
 // field is optional: a zero/empty field disables that layer, so callers opt into
@@ -33,7 +44,7 @@ type Config struct {
 	// When set, RAG and/or the search tool are mounted per the flags below.
 	Semantic memory.Store
 	// RAG, when non-nil and Semantic is set, mounts the auto-RAG middleware.
-	RAG *memory.RAGOptions
+	RAG *RAGConfig
 	// EnableSearchTool mounts the model-driven search_memory tool when Semantic
 	// is set.
 	EnableSearchTool bool
@@ -49,7 +60,7 @@ type Config struct {
 // constructed, so callers can also drive Consolidate with the same stores.
 type Memory struct {
 	Sections   []prompt.Section
-	Middleware []middleware.Middleware
+	Middleware []agent.Middleware
 	Tools      []tool.Tool
 
 	// TextStore is the constructed text-memory store (nil if disabled).
@@ -102,7 +113,11 @@ func New(cfg Config) (*Memory, error) {
 	// Semantic memory — RAG middleware and/or search tool.
 	if cfg.Semantic != nil {
 		if cfg.RAG != nil {
-			m.Middleware = append(m.Middleware, memory.NewRAG(cfg.Semantic, cfg.RAG))
+			m.Middleware = append(m.Middleware, middleware.RAG(middleware.RAGOptions{
+				Retriever: memory.NewRetriever(cfg.Semantic, cfg.RAG.MinScore),
+				K:         cfg.RAG.K,
+				Header:    cfg.RAG.Header,
+			}))
 		}
 		if cfg.EnableSearchTool {
 			m.Tools = append(m.Tools, memory.SearchTool(cfg.Semantic, cfg.SearchK))

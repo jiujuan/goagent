@@ -15,22 +15,18 @@ import (
 // redisStreamQueue is a Redis Streams-backed Queue and Consumer. Jobs are stored
 // on a stream (XADD) and drained by a consumer group (XREADGROUP), giving
 // at-least-once delivery that survives a worker restart: a job a worker read but
-// did not acknowledge stays in the group's Pending Entries List (PEL) and is
-// reclaimed by a janitor goroutine after it has been idle past idleThreshold.
+// did not ack stays in the group's Pending Entries List (PEL) and is reclaimed
+// by a janitor goroutine after it has been idle past idleThreshold.
 //
-// Because Job.Run is a closure that cannot cross a process boundary, this
-// backend only accepts jobs that carry Type+Payload; the draining worker rebuilds
-// the work from its Registry.
+// Because Job.Run is a closure that cannot cross a process boundary, this backend
+// only accepts jobs that carry Type+Payload; the draining worker (a Pool with a
+// Registry) rebuilds the work.
 //
-// Reliability knobs:
-//   - idleThreshold: how long a delivered-but-unacked job waits before it is
-//     reclaimed for retry. MUST exceed the longest expected job runtime, or a
-//     still-running job is reclaimed and run twice.
-//   - maxDeliveries: a job delivered more than this many times is a poison
-//     message; it is moved to deadStream (a DLQ) and acked off the main stream.
-//   - maxLen: the stream is capped with an approximate MAXLEN trim (~) so it does
-//     not grow without bound; pick it well above the in-flight backlog so unacked
-//     entries are never trimmed away.
+// Reliability knobs (see factory Options):
+//   - idleThreshold: how long a delivered-but-unacked job waits before reclaim.
+//     MUST exceed the longest expected job runtime, or a running job is run twice.
+//   - maxDeliveries: a job delivered more than this is poison; it goes to the DLQ.
+//   - maxLen: approximate MAXLEN trim so the stream does not grow unbounded.
 type redisStreamQueue struct {
 	rdb           *redis.Client
 	stream        string
@@ -45,14 +41,12 @@ type redisStreamQueue struct {
 	start   sync.Once
 }
 
-// pendingItem is a reclaimed job awaiting redelivery to the worker.
 type pendingItem struct {
 	job Job
 	ack func() error
 }
 
-// wireJob is the serialized shape of a Job on the stream. Only the serializable
-// fields travel; Run is always nil on the wire.
+// wireJob is the serialized shape of a Job on the stream (Run never travels).
 type wireJob struct {
 	ID      string          `json:"id"`
 	Key     string          `json:"key"`
@@ -89,31 +83,28 @@ func (q *redisStreamQueue) Enqueue(ctx context.Context, job Job) error {
 	return q.rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: q.stream,
 		MaxLen: q.maxLen,
-		Approx: true, // MAXLEN ~ : trims in whole macro-nodes, far cheaper
+		Approx: true,
 		Values: map[string]any{"job": data},
 	}).Err()
 }
 
-// Dequeue implements Consumer. It prefers reclaimed retries (fed by the janitor)
-// over new messages, then blocks on XREADGROUP for new work. The returned ack
-// XACKs the delivery.
+// Dequeue implements Consumer. It prefers reclaimed retries over new messages,
+// then blocks on XREADGROUP. The returned ack XACKs the delivery.
 func (q *redisStreamQueue) Dequeue(ctx context.Context) (Job, func() error, bool, error) {
 	q.ensureStarted(ctx)
 
-	const blockDur = 2 * time.Second // bounded so the loop re-checks retries/ctx
+	const blockDur = 2 * time.Second
 	for {
 		if err := ctx.Err(); err != nil {
 			return Job{}, nil, false, err
 		}
 
-		// 1. Reclaimed retries first.
 		select {
 		case it := <-q.retryCh:
 			return it.job, it.ack, true, nil
 		default:
 		}
 
-		// 2. New messages.
 		res, err := q.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    q.group,
 			Consumer: q.consumer,
@@ -123,7 +114,7 @@ func (q *redisStreamQueue) Dequeue(ctx context.Context) (Job, func() error, bool
 		}).Result()
 		if err != nil {
 			if errors.Is(err, redis.Nil) {
-				continue // block timed out with no message; loop
+				continue
 			}
 			if ctx.Err() != nil {
 				return Job{}, nil, false, ctx.Err()
@@ -144,22 +135,15 @@ func (q *redisStreamQueue) Dequeue(ctx context.Context) (Job, func() error, bool
 	}
 }
 
-// ensureStarted creates the consumer group (idempotently) and launches the
-// janitor that reclaims idle-pending jobs. Bound to ctx so it stops with Run.
 func (q *redisStreamQueue) ensureStarted(ctx context.Context) {
 	q.start.Do(func() {
 		ictx, cancel := context.WithTimeout(context.Background(), ackTimeout)
-		// MKSTREAM creates the stream if absent; "$" starts the group at the tail.
-		// A BUSYGROUP error just means the group already exists — ignore it.
 		_ = q.rdb.XGroupCreateMkStream(ictx, q.stream, q.group, "$").Err()
 		cancel()
 		go q.janitor(ctx)
 	})
 }
 
-// janitor periodically reclaims jobs that have been pending longer than
-// idleThreshold — i.e. delivered to a worker that then died or hung — and either
-// redelivers them for retry or routes poison messages to the DLQ.
 func (q *redisStreamQueue) janitor(ctx context.Context) {
 	t := time.NewTicker(q.idleThreshold)
 	defer t.Stop()
@@ -186,8 +170,6 @@ func (q *redisStreamQueue) reclaimOnce(ctx context.Context) {
 		return
 	}
 	for _, p := range pending {
-		// Claim transfers ownership to us, resets idle, and bumps the delivery
-		// count. MinIdle guards against grabbing a job another worker just took.
 		claimed, err := q.rdb.XClaim(ctx, &redis.XClaimArgs{
 			Stream:   q.stream,
 			Group:    q.group,
@@ -200,8 +182,6 @@ func (q *redisStreamQueue) reclaimOnce(ctx context.Context) {
 		}
 		msg := claimed[0]
 
-		// RetryCount is the deliveries so far (before this claim). Once it reaches
-		// the cap the job is poison: move it to the DLQ and ack it off the stream.
 		if p.RetryCount >= int64(q.maxDeliveries) {
 			q.toDead(msg, "exceeded max deliveries")
 			_ = q.ack(msg.ID)
@@ -218,13 +198,11 @@ func (q *redisStreamQueue) reclaimOnce(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
-			// Retry buffer full; leave the job claimed. It stays pending and is
-			// picked up on a later tick once idle again — no job is lost.
+			// retry buffer full; leave claimed, picked up on a later tick
 		}
 	}
 }
 
-// toDead copies a job onto the dead-letter stream for offline inspection.
 func (q *redisStreamQueue) toDead(msg redis.XMessage, reason string) {
 	raw, _ := msg.Values["job"].(string)
 	bctx, cancel := context.WithTimeout(context.Background(), ackTimeout)

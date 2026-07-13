@@ -2,156 +2,120 @@ package agent
 
 import (
 	"encoding/json"
-	"sort"
+	"fmt"
 	"strings"
 
+	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/tool"
 )
 
-// transferToolName is the reserved name of the auto-injected delegation tool.
-const transferToolName = "transfer_to_agent"
+// This file implements LLM-driven delegation. When an agent is configured with
+// sub-agents (WithSubAgents), a synthetic transfer_to_agent tool is advertised;
+// when the model calls it, the tool returns a Transfer control directive, and
+// the llmRunner wrapping the loop hands control to the named agent (sharing the
+// conversation State so the delegate continues the same thread).
 
-// maxTransferDepth bounds agent-to-agent delegation chaining within one run to
-// prevent runaway ping-pong (e.g. parent<->child loops the model might induce).
+// maxTransferDepth bounds delegation chains so agents cannot ping-pong forever.
 const maxTransferDepth = 8
 
-// transferTarget is one advertised delegation destination.
-type transferTarget struct {
-	name string
-	hint string // direction + description, shown to the model
+// transferToolName is the synthetic tool's name.
+const transferToolName = "transfer_to_agent"
+
+// llmRunner wraps an AgentLoop and performs delegation. It keeps a back-ref to
+// the Agent so it can resolve transfer targets lazily at run time (targets like
+// parent/peers are wired after New). The loop itself never delegates; it just
+// surfaces a Transfer outcome, which this runner acts on.
+type llmRunner struct {
+	agent *Agent
+	loop  *AgentLoop
 }
 
-// transferTool is the synthetic tool an agent advertises when delegation is
-// enabled and it has at least one allowed target (sub-agent, parent, or peer).
-// Calling it sets Actions.TransferToAgent; the turn engine resolves the target
-// (validating it is in the allowed set) and hands over control.
-type transferTool struct {
-	schema  json.RawMessage
-	targets []transferTarget
+func (r *llmRunner) run(rc *RunContext) runOutcome {
+	out := r.loop.run(rc)
+	if out.Control.Kind != core.Transfer {
+		return out
+	}
+	target := r.agent.resolveTransfer(out.Control.Target)
+	if target == nil || rc.transferDepth >= maxTransferDepth {
+		// Unknown/disallowed target or depth exceeded: end with what we have.
+		return runOutcome{Result: out.Result}
+	}
+	rc.publish(core.MessageDone{Message: core.AssistantText(
+		fmt.Sprintf("→ 转交给 %s", target.cfg.name))})
+	// Delegate on the same State (the delegate continues the conversation),
+	// one level deeper.
+	return target.runnable.run(rc.deeper())
 }
 
-func newTransferTool(targets []transferTarget) *transferTool {
-	names := make([]string, len(targets))
-	for i, t := range targets {
-		names[i] = t.name
-	}
-	schema := map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"agent_name": map[string]any{
-				"type":        "string",
-				"enum":        names,
-				"description": "要转交给的目标 agent 名称。",
-			},
-		},
-		"required": []string{"agent_name"},
-	}
-	b, _ := json.Marshal(schema)
-	return &transferTool{schema: b, targets: targets}
-}
+var _ Runnable = (*llmRunner)(nil)
 
-func (t *transferTool) Name() string { return transferToolName }
-
-func (t *transferTool) Description() string {
-	var b strings.Builder
-	b.WriteString("当另一个 agent 更适合处理当前请求时，把对话转交给它。可选目标：")
-	for i, tg := range t.targets {
-		if i > 0 {
-			b.WriteString("；")
-		}
-		b.WriteString(tg.name)
-		if tg.hint != "" {
-			b.WriteString(" ")
-			b.WriteString(tg.hint)
-		}
-	}
-	return b.String()
-}
-
-func (t *transferTool) Schema() json.RawMessage { return t.schema }
-
-func (t *transferTool) Call(ctx *tool.Context, args json.RawMessage) (*tool.Result, error) {
-	var in struct {
-		AgentName string `json:"agent_name"`
-	}
-	if err := json.Unmarshal(args, &in); err != nil {
-		return tool.ErrorResult("invalid transfer arguments: " + err.Error()), nil
-	}
-	if in.AgentName == "" {
-		return tool.ErrorResult("agent_name is required"), nil
-	}
-	ctx.Actions.TransferToAgent = in.AgentName
-	return tool.TextResult("转交给 " + in.AgentName), nil
-}
-
-var _ tool.Tool = (*transferTool)(nil)
-
-// transferableTargets computes, per the direction rules, the agents this agent
-// may delegate to, and returns them indexed by name. Rules:
-//   - sub-agents: always (when delegation is enabled);
-//   - parent: unless DisallowTransferToParent;
-//   - peers (siblings): unless DisallowTransferToPeers, and only if the parent
-//     is itself delegation-capable (otherwise a peer handoff would strand).
-func (a *LLMAgent) transferableTargets(ictx InvocationContext) map[string]Agent {
-	if a.cfg.DisableTransfer {
+// transferTargets returns the agents this agent may delegate to, keyed by name:
+// its sub-agents (down), its parent (up), and its peers (siblings), minus any
+// disabled by options.
+func (a *Agent) transferTargets() map[string]*Agent {
+	if a.cfg.noTransfer {
 		return nil
 	}
-	out := map[string]Agent{}
-
-	for _, sub := range a.cfg.SubAgents {
-		out[sub.Name()] = sub
+	out := map[string]*Agent{}
+	for _, s := range a.cfg.subAgents {
+		out[s.cfg.name] = s
 	}
-
-	if ictx.Root != nil {
-		if parent := parentOf(ictx.Root, a); parent != nil {
-			if !a.cfg.DisallowTransferToParent {
-				out[parent.Name()] = parent
-			}
-			if !a.cfg.DisallowTransferToPeers && transferCapable(parent) {
-				for _, sib := range parent.SubAgents() {
-					if sib.Name() != a.cfg.Name {
-						out[sib.Name()] = sib
-					}
+	if a.parent != nil && !a.cfg.noTransferParent {
+		out[a.parent.cfg.name] = a.parent
+		if !a.cfg.noTransferPeers {
+			for _, peer := range a.parent.cfg.subAgents {
+				if peer != a {
+					out[peer.cfg.name] = peer
 				}
 			}
 		}
 	}
-	delete(out, a.cfg.Name) // never transfer to self
 	return out
 }
 
-// orderedTargets renders the target map as advertised entries (sub, parent,
-// peer) with a direction hint for the model.
-func (a *LLMAgent) orderedTargets(ictx InvocationContext, targets map[string]Agent) []transferTarget {
-	parent := Agent(nil)
-	if ictx.Root != nil {
-		parent = parentOf(ictx.Root, a)
-	}
-	subNames := map[string]bool{}
-	for _, s := range a.cfg.SubAgents {
-		subNames[s.Name()] = true
-	}
-
-	entries := make([]transferTarget, 0, len(targets))
-	for name, ag := range targets {
-		var dir string
-		switch {
-		case subNames[name]:
-			dir = "(下级)"
-		case parent != nil && parent.Name() == name:
-			dir = "(上级)"
-		default:
-			dir = "(同级)"
-		}
-		entries = append(entries, transferTarget{name: name, hint: dir + ag.Description()})
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
-	return entries
+// resolveTransfer looks up a transfer target by name.
+func (a *Agent) resolveTransfer(name string) *Agent {
+	return a.transferTargets()[name]
 }
 
-// transferCapable reports whether an agent can itself delegate (used to gate
-// peer transfer).
-func transferCapable(a Agent) bool {
-	la, ok := a.(*LLMAgent)
-	return ok && !la.cfg.DisableTransfer
+// transferToolFor builds the synthetic transfer tool advertising the given
+// targets, or nil if there are none.
+func transferToolFor(targets map[string]*Agent) tool.Tool {
+	if len(targets) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(targets))
+	var b strings.Builder
+	b.WriteString("Delegate the conversation to another agent. Available agents:\n")
+	for name, ag := range targets {
+		names = append(names, name)
+		fmt.Fprintf(&b, "- %s: %s\n", name, ag.cfg.description)
+	}
+	enum, _ := json.Marshal(names)
+	schema := json.RawMessage(fmt.Sprintf(
+		`{"type":"object","properties":{"agent":{"type":"string","enum":%s,"description":"target agent name"}},"required":["agent"]}`,
+		enum))
+	return &transferTool{desc: b.String(), schema: schema}
+}
+
+type transferTool struct {
+	desc   string
+	schema json.RawMessage
+}
+
+func (transferTool) Name() string              { return transferToolName }
+func (t transferTool) Description() string     { return t.desc }
+func (t transferTool) Schema() json.RawMessage { return t.schema }
+
+func (transferTool) Call(_ *tool.Context, args json.RawMessage) (*tool.Result, error) {
+	var in struct {
+		Agent string `json:"agent"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil || in.Agent == "" {
+		return tool.ErrorResult("transfer_to_agent requires an 'agent' name"), nil
+	}
+	return &tool.Result{
+		Content: []core.Part{core.Text{Text: "transferring to " + in.Agent}},
+		Control: &core.Directive{Kind: core.Transfer, Target: in.Agent},
+	}, nil
 }

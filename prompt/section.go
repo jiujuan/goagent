@@ -30,7 +30,7 @@ type SectionFunc struct {
 	RenderFn func(Context) (string, error)
 }
 
-func (s SectionFunc) Name() string                    { return s.SecName }
+func (s SectionFunc) Name() string                     { return s.SecName }
 func (s SectionFunc) Order() int                       { return s.SecOrder }
 func (s SectionFunc) Render(c Context) (string, error) { return s.RenderFn(c) }
 

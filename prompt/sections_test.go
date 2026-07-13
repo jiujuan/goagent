@@ -1,12 +1,11 @@
 package prompt
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/jiujuan/goagent/session"
+	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/tool"
 )
 
@@ -44,12 +43,7 @@ func TestToolGuidance(t *testing.T) {
 }
 
 func TestSessionState(t *testing.T) {
-	s, err := session.InMemory().GetOrCreate(context.Background(), "app", "user", "sid")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.State().Set("plan", "ship it")
-	ctx := Context{Session: s}
+	ctx := Context{State: &core.State{KV: map[string]any{"plan": "ship it"}}}
 
 	out, err := SessionState("plan", "missing").Render(ctx)
 	if err != nil {

@@ -1,6 +1,8 @@
 package workingmem
 
 import (
+	"encoding/json"
+
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/tool"
 )
@@ -15,48 +17,58 @@ type updateArgs struct {
 	NoteVal       string `json:"note_val,omitempty" desc:"关键事实的值，需与 note_key 配对"`
 }
 
-// UpdateTool returns a tool the model calls to maintain its working memory.
-// Writes go through ctx.Actions.StateDelta so they are folded into the
-// resulting event and persisted by the session store (a direct State.Set would
-// not survive a FileStore restart). See ADR 0017.
-func UpdateTool() tool.Tool {
-	return tool.New("update_working_memory",
-		"维护跨轮的工作记忆：设置当前目标、增删待办、记录关键事实。任务有阶段性进展或确定了关键约束时调用，使其在上下文被压缩后仍然保留。",
-		func(ctx *tool.Context, in updateArgs) (string, error) {
-			snap := readSnapshot(ctx.State)
+// UpdateTool returns a tool the model calls to maintain its working memory. The
+// write is returned as a Result.State op so the loop applies it under its state
+// mutex and it is captured by checkpoints (surviving a restart). See ADR 0017.
+func UpdateTool() tool.Tool { return updateTool{} }
 
-			var addedID string
-			if in.Goal != "" {
-				snap.Goal = in.Goal
-			}
-			if in.AddTodo != "" {
-				addedID = core.NewID("todo")
-				snap.Todos = append(snap.Todos, Todo{ID: addedID, Text: in.AddTodo})
-			}
-			if in.ResolveTodoID != "" {
-				for i := range snap.Todos {
-					if snap.Todos[i].ID == in.ResolveTodoID {
-						snap.Todos[i].Done = true
-					}
-				}
-			}
-			if in.NoteKey != "" {
-				if snap.Notes == nil {
-					snap.Notes = map[string]string{}
-				}
-				snap.Notes[in.NoteKey] = in.NoteVal
-			}
+type updateTool struct{}
 
-			if ctx.Actions != nil {
-				if ctx.Actions.StateDelta == nil {
-					ctx.Actions.StateDelta = map[string]any{}
-				}
-				ctx.Actions.StateDelta[stateKey] = encodeSnapshot(snap)
-			}
+func (updateTool) Name() string { return "update_working_memory" }
 
-			if addedID != "" {
-				return "工作记忆已更新（新待办 id: " + addedID + "）", nil
+func (updateTool) Description() string {
+	return "维护跨轮的工作记忆：设置当前目标、增删待办、记录关键事实。任务有阶段性进展或确定了关键约束时调用，使其在上下文被压缩后仍然保留。"
+}
+
+func (updateTool) Schema() json.RawMessage { return tool.SchemaFor[updateArgs]() }
+
+func (updateTool) Call(ctx *tool.Context, args json.RawMessage) (*tool.Result, error) {
+	var in updateArgs
+	if len(args) > 0 {
+		if err := json.Unmarshal(args, &in); err != nil {
+			return tool.ErrorResult("invalid arguments: " + err.Error()), nil
+		}
+	}
+	snap := readSnapshot(ctx.State)
+
+	var addedID string
+	if in.Goal != "" {
+		snap.Goal = in.Goal
+	}
+	if in.AddTodo != "" {
+		addedID = core.NewID("todo")
+		snap.Todos = append(snap.Todos, Todo{ID: addedID, Text: in.AddTodo})
+	}
+	if in.ResolveTodoID != "" {
+		for i := range snap.Todos {
+			if snap.Todos[i].ID == in.ResolveTodoID {
+				snap.Todos[i].Done = true
 			}
-			return "工作记忆已更新", nil
-		})
+		}
+	}
+	if in.NoteKey != "" {
+		if snap.Notes == nil {
+			snap.Notes = map[string]string{}
+		}
+		snap.Notes[in.NoteKey] = in.NoteVal
+	}
+
+	msg := "工作记忆已更新"
+	if addedID != "" {
+		msg += "（新待办 id: " + addedID + "）"
+	}
+	return &tool.Result{
+		Content: []core.Part{core.Text{Text: msg}},
+		State:   []core.StateOp{{Kind: core.OpSetKV, Key: stateKey, Value: encodeSnapshot(snap)}},
+	}, nil
 }

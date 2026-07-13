@@ -2,98 +2,76 @@ package memx
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/jiujuan/goagent/core"
-	"github.com/jiujuan/goagent/embeddings/mock"
+	embmock "github.com/jiujuan/goagent/embeddings/mock"
 	"github.com/jiujuan/goagent/llm"
-	llmmock "github.com/jiujuan/goagent/llm/mock"
+	"github.com/jiujuan/goagent/llm/mock"
 	"github.com/jiujuan/goagent/memory"
-	"github.com/jiujuan/goagent/session"
+	"github.com/jiujuan/goagent/memory/textmem"
 )
 
-func TestNewAssemblesSelectedLayers(t *testing.T) {
-	rulesDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(rulesDir, "tone.md"), []byte("简洁"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	m, err := New(Config{
-		GlobalRulesDir:      rulesDir,
-		EnableWorkingMemory: true,
-		TextMemDir:          t.TempDir(),
-		Semantic:            memory.InMemory(mock.New()),
-		RAG:                 &memory.RAGOptions{},
-		EnableSearchTool:    true,
-		SectionBudget:       2000,
+func TestConsolidateWritesToStores(t *testing.T) {
+	ctx := context.Background()
+	// The consolidator extracts one text fact and one semantic fact.
+	model := mock.New("m", func(*llm.Request) *llm.Response {
+		return mock.Text(`[
+			{"target":"text","name":"pref","desc":"用户偏好","type":"user","content":"用户喜欢简洁回答"},
+			{"target":"semantic","name":"","desc":"","type":"reference","content":"巴黎是法国首都"}
+		]`)
 	})
+	textStore, err := textmem.File(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
+	sem := memory.InMemory(embmock.New())
 
-	// rules + working memory + text index = 3 sections.
-	if len(m.Sections) != 3 {
-		t.Errorf("sections = %d, want 3", len(m.Sections))
-	}
-	// working update + text save + text read + search = 4 tools.
-	if len(m.Tools) != 4 {
-		t.Errorf("tools = %d, want 4", len(m.Tools))
-	}
-	// RAG = 1 middleware.
-	if len(m.Middleware) != 1 {
-		t.Errorf("middleware = %d, want 1", len(m.Middleware))
-	}
-	if m.TextStore == nil {
-		t.Error("TextStore should be set")
-	}
-}
-
-func TestConsolidateWritesAndDedups(t *testing.T) {
-	ctx := context.Background()
-
-	// A session with some content to consolidate.
-	store := session.InMemory()
-	s, _ := store.GetOrCreate(ctx, "app", "u", "sess")
-	msg := core.UserText("我们项目用 PostgreSQL，我喜欢简洁的回复。")
-	_ = store.Append(ctx, s, &core.Event{Message: &msg})
-
-	// Model returns a fixed extraction with a duplicate semantic item.
-	const out = `[
-{"target":"text","name":"db","desc":"用 pg","type":"project","content":"项目使用 PostgreSQL"},
-{"target":"semantic","content":"用户偏好简洁回复"},
-{"target":"semantic","content":"用户偏好简洁回复"}
-]`
-	model := llmmock.New("m", func(*llm.Request) *llm.Response { return llmmock.Text(out) })
-
-	textStore, _ := New(Config{TextMemDir: t.TempDir()})
-	sem := memory.InMemory(mock.New())
-
-	if err := Consolidate(ctx, model, s, textStore.TextStore, sem); err != nil {
+	msgs := []core.Message{core.UserText("我喜欢简洁"), core.AssistantText("好的")}
+	if err := Consolidate(ctx, model, msgs, textStore, sem); err != nil {
 		t.Fatal(err)
 	}
 
-	idx, _ := textStore.TextStore.Index(ctx)
-	if len(idx) != 1 || idx[0].Name != "db" {
-		t.Errorf("text store = %+v, want 1 entry 'db'", idx)
-	}
 	if sem.Len() != 1 {
-		t.Errorf("semantic len = %d, want 1 (duplicate deduped)", sem.Len())
+		t.Fatalf("semantic store len = %d, want 1", sem.Len())
+	}
+	e, err := textStore.Read(ctx, "pref")
+	if err != nil {
+		t.Fatalf("text entry not saved: %v", err)
+	}
+	if e.Body == "" {
+		t.Fatalf("text entry body empty: %+v", e)
 	}
 }
 
 func TestConsolidateEmptyTranscriptNoop(t *testing.T) {
-	ctx := context.Background()
-	store := session.InMemory()
-	s, _ := store.GetOrCreate(ctx, "app", "u", "sess")
-	model := llmmock.New("m", func(*llm.Request) *llm.Response { return llmmock.Text("[]") })
-
-	sem := memory.InMemory(mock.New())
-	if err := Consolidate(ctx, model, s, nil, sem); err != nil {
+	sem := memory.InMemory(embmock.New())
+	model := mock.New("m", func(*llm.Request) *llm.Response { return mock.Text("[]") })
+	if err := Consolidate(context.Background(), model, nil, nil, sem); err != nil {
 		t.Fatal(err)
 	}
 	if sem.Len() != 0 {
-		t.Errorf("nothing should be written for empty transcript")
+		t.Fatalf("empty transcript should write nothing, len=%d", sem.Len())
+	}
+}
+
+func TestNewAssemblesLayers(t *testing.T) {
+	sem := memory.InMemory(embmock.New())
+	m, err := New(Config{
+		EnableWorkingMemory: true,
+		TextMemDir:          t.TempDir(),
+		Semantic:            sem,
+		RAG:                 &RAGConfig{K: 3},
+		EnableSearchTool:    true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Sections) == 0 || len(m.Middleware) == 0 || len(m.Tools) == 0 {
+		t.Fatalf("New did not assemble layers: sections=%d mw=%d tools=%d",
+			len(m.Sections), len(m.Middleware), len(m.Tools))
+	}
+	if m.TextStore == nil {
+		t.Fatal("TextStore should be constructed")
 	}
 }

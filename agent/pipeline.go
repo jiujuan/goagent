@@ -1,99 +1,49 @@
 package agent
 
-import (
-	"slices"
-
-	"github.com/jiujuan/goagent/core"
-)
-
-// --- Pipeline ---------------------------------------------------------------
-
-// PipelineAgent runs an ordered list of stages, forwarding every event. Its run
-// semantics match SequentialAgent; what differs is construction: a PipelineAgent
-// is assembled with the fluent Pipeline builder, which reads top-to-bottom as a
-// series of named stages — including composite parallel/loop stages added inline
-// — making a multi-step flow easier to follow than nested constructors.
-type PipelineAgent struct {
-	name   string
-	desc   string
-	stages []Agent
-}
-
-func (a *PipelineAgent) Name() string { return a.name }
-
-func (a *PipelineAgent) Description() string {
-	if a.desc != "" {
-		return a.desc
-	}
-	return "runs stages in a pipeline"
-}
-
-func (a *PipelineAgent) SubAgents() []Agent { return a.stages }
-
-func (a *PipelineAgent) Run(ictx InvocationContext) core.Stream {
-	return func(yield func(*core.Event, error) bool) {
-		for _, stage := range a.stages {
-			if !core.Pipe(stage.Run(ictx.withAgent(stage, "").refreshSnapshot()), yield) {
-				return
-			}
-		}
-	}
-}
-
-// PipelineBuilder assembles a PipelineAgent one stage at a time. Construct it
-// with Pipeline, chain Then / ThenParallel / ThenLoop, then call Build.
-type PipelineBuilder struct {
-	name   string
-	desc   string
-	stages []Agent
-}
-
-// Pipeline starts building a named PipelineAgent:
+// Pipeline is a fluent builder for a multi-stage workflow. Each stage is an
+// *Agent — a plain LLM agent, or a Parallel/Loop compound stage. Build() folds
+// the stages into a Sequential workflow, so a pipeline is just sugar over
+// Sequential with compound stages inlined.
 //
-//	p := agent.Pipeline("etl").
-//	    Then(ingest).
-//	    ThenParallel("enrich", geo, sentiment).
+//	pipe := agent.NewPipeline("research-report").
+//	    Then(planner).
+//	    ThenParallel("gather", web, papers).
 //	    Then(writer).
 //	    ThenLoop("review", 3, critic, reviser).
 //	    Build()
-func Pipeline(name string) *PipelineBuilder {
-	return &PipelineBuilder{name: name}
+//	answer, _ := pipe.Run(ctx, "topic: vector databases")
+type Pipeline struct {
+	name   string
+	stages []*Agent
 }
 
-// Describe sets an optional human-readable description for the pipeline.
-func (b *PipelineBuilder) Describe(desc string) *PipelineBuilder {
-	b.desc = desc
-	return b
+// NewPipeline starts a pipeline builder.
+func NewPipeline(name string) *Pipeline { return &Pipeline{name: name} }
+
+// Then appends a single agent stage.
+func (p *Pipeline) Then(a *Agent) *Pipeline {
+	p.stages = append(p.stages, a)
+	return p
 }
 
-// Then appends a single agent as the next stage.
-func (b *PipelineBuilder) Then(stage Agent) *PipelineBuilder {
-	b.stages = append(b.stages, stage)
-	return b
+// ThenParallel appends a concurrent fan-out stage.
+func (p *Pipeline) ThenParallel(name string, subs ...*Agent) *Pipeline {
+	p.stages = append(p.stages, Parallel(name, subs...))
+	return p
 }
 
-// ThenParallel appends a fan-out stage whose sub-agents run concurrently, each
-// on its own branch (see ParallelAgent).
-func (b *PipelineBuilder) ThenParallel(name string, subs ...Agent) *PipelineBuilder {
-	return b.Then(Parallel(name, subs...))
+// ThenParallelWithOptions appends a concurrent fan-out stage with an explicit
+// branch-merge policy (e.g. to prefer one branch on a state-key conflict).
+func (p *Pipeline) ThenParallelWithOptions(name string, opts ParallelOptions, subs ...*Agent) *Pipeline {
+	p.stages = append(p.stages, ParallelWithOptions(name, opts, subs...))
+	return p
 }
 
-// ThenParallelWithOptions appends a fan-out stage with explicit state-conflict
-// behavior for the deterministic merge.
-func (b *PipelineBuilder) ThenParallelWithOptions(name string, opts ParallelOptions, subs ...Agent) *PipelineBuilder {
-	return b.Then(ParallelWithOptions(name, opts, subs...))
+// ThenLoop appends a refinement-loop stage (runs until Escalate or maxIter).
+func (p *Pipeline) ThenLoop(name string, maxIter int, subs ...*Agent) *Pipeline {
+	p.stages = append(p.stages, Loop(name, maxIter, subs...))
+	return p
 }
 
-// ThenLoop appends a stage that repeats its sub-agents until one escalates or
-// maxIterations is reached (0 = until escalation; see LoopAgent).
-func (b *PipelineBuilder) ThenLoop(name string, maxIterations int, subs ...Agent) *PipelineBuilder {
-	return b.Then(Loop(name, maxIterations, subs...))
-}
-
-// Build finalizes the pipeline. The result is itself an Agent, so it can be
-// nested as a stage in another pipeline or workflow.
-func (b *PipelineBuilder) Build() *PipelineAgent {
-	return &PipelineAgent{name: b.name, desc: b.desc, stages: slices.Clone(b.stages)}
-}
-
-var _ Agent = (*PipelineAgent)(nil)
+// Build assembles the pipeline into a runnable Sequential agent.
+func (p *Pipeline) Build() *Agent { return Sequential(p.name, p.stages...) }

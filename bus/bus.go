@@ -1,8 +1,7 @@
 // Package bus is v2's observational event bus: a topic-based publish/subscribe
-// fan-out over Go channels. It replaces v1's iter.Seq2 as the streaming
-// primitive for OBSERVATION only (durability is the Checkpointer's job). Many
-// subscribers — UI, JSONL tracing, a progress bar — can watch one run without
-// tee-ing an iterator.
+// fan-out over Go channels. It is the streaming primitive for OBSERVATION only
+// (durability is the Checkpointer's job). Many subscribers — UI, JSONL tracing,
+// a progress bar — can watch one run without tee-ing an iterator.
 //
 // The producer (the AgentLoop) calls Publish from a single goroutine, so events
 // are totally ordered per topic. Each subscriber gets its own buffered channel
@@ -12,14 +11,13 @@
 //   - Lossless: block the publisher when full, giving back-pressure (tracing /
 //     persistence sinks that must not drop).
 //
-// See ADR 0023. A stalled Lossless subscriber back-pressures the whole bus by
-// design; refine with per-subscriber timeouts in the real implementation.
+// A stalled Lossless subscriber back-pressures the whole bus by design.
 package bus
 
 import (
 	"sync"
 
-	"github.com/jiujuan/goagent/event"
+	"github.com/jiujuan/goagent/core"
 )
 
 // Topic identifies a stream of events, e.g. one run or one (app,user,session).
@@ -38,7 +36,7 @@ const (
 const defaultBufferSize = 64
 
 type subscriber struct {
-	ch   chan event.Event
+	ch   chan core.Event
 	mode DeliveryMode
 }
 
@@ -75,12 +73,10 @@ func New(opts ...Option) *Bus {
 
 // Subscribe registers a subscriber on topic and returns its receive channel
 // plus a cancel func. cancel removes the subscriber and closes the channel; it
-// is safe to call once and idempotent thereafter.
-//
-// Publish (under RLock) and cancel (under Lock) are mutually exclusive, so a
-// send can never race a close — no send-on-closed panic.
-func (b *Bus) Subscribe(topic Topic, mode DeliveryMode) (<-chan event.Event, func()) {
-	s := &subscriber{ch: make(chan event.Event, b.bufSize), mode: mode}
+// is idempotent. Publish (under RLock) and cancel (under Lock) are mutually
+// exclusive, so a send can never race a close.
+func (b *Bus) Subscribe(topic Topic, mode DeliveryMode) (<-chan core.Event, func()) {
+	s := &subscriber{ch: make(chan core.Event, b.bufSize), mode: mode}
 
 	b.mu.Lock()
 	if b.subs[topic] == nil {
@@ -110,7 +106,7 @@ func (b *Bus) Subscribe(topic Topic, mode DeliveryMode) (<-chan event.Event, fun
 
 // Publish fans ev out to every subscriber on topic. Call it from a single
 // goroutine per topic to preserve ordering.
-func (b *Bus) Publish(topic Topic, ev event.Event) {
+func (b *Bus) Publish(topic Topic, ev core.Event) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	for s := range b.subs[topic] {
@@ -126,8 +122,7 @@ func (b *Bus) Publish(topic Topic, ev event.Event) {
 	}
 }
 
-// Subscribers reports the live subscriber count on topic (useful in tests and
-// for shedding work when nobody is watching).
+// Subscribers reports the live subscriber count on topic.
 func (b *Bus) Subscribers(topic Topic) int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
