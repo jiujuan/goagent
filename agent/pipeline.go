@@ -32,6 +32,13 @@ func (p *Pipeline) ThenParallel(name string, subs ...*Agent) *Pipeline {
 	return p
 }
 
+// ThenParallelWithOptions appends a concurrent fan-out stage with an explicit
+// branch-merge policy (e.g. to prefer one branch on a state-key conflict).
+func (p *Pipeline) ThenParallelWithOptions(name string, opts ParallelOptions, subs ...*Agent) *Pipeline {
+	p.stages = append(p.stages, ParallelWithOptions(name, opts, subs...))
+	return p
+}
+
 // ThenLoop appends a refinement-loop stage (runs until Escalate or maxIter).
 func (p *Pipeline) ThenLoop(name string, maxIter int, subs ...*Agent) *Pipeline {
 	p.stages = append(p.stages, Loop(name, maxIter, subs...))

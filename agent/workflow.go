@@ -27,10 +27,37 @@ func Sequential(name string, subs ...*Agent) *Agent {
 }
 
 // Parallel runs sub-agents concurrently, each on an isolated (cloned) State
-// branch, then merges their final texts. Events from all branches interleave on
-// the shared topic.
+// branch, then merges their results. Events from all branches interleave on the
+// shared topic. Branch KV writes are folded back deterministically in branch
+// declaration order; conflicting writes to the same key are rejected (use
+// ParallelWithOptions to prefer a branch instead). Final texts are concatenated.
 func Parallel(name string, subs ...*Agent) *Agent {
-	return wrapWorkflow(name, &parallelRunner{subs: subs})
+	return ParallelWithOptions(name, ParallelOptions{}, subs...)
+}
+
+// ParallelWithOptions builds a Parallel workflow with an explicit merge policy.
+func ParallelWithOptions(name string, opts ParallelOptions, subs ...*Agent) *Agent {
+	return wrapWorkflow(name, &parallelRunner{subs: subs, opts: opts})
+}
+
+// StateConflictPolicy controls deterministic resolution when multiple parallel
+// branches write different values to the same State.KV key.
+type StateConflictPolicy int
+
+const (
+	// RejectStateConflicts fails the merge if two branches set the same key to
+	// different values (the safe default — surfaces accidental contention).
+	RejectStateConflicts StateConflictPolicy = iota
+	// PreferEarlierBranch keeps the value from the branch listed first.
+	PreferEarlierBranch
+	// PreferLaterBranch keeps the value from the branch listed last.
+	PreferLaterBranch
+)
+
+// ParallelOptions configures branch-merge behavior without changing the simple
+// Parallel constructor. The zero value rejects conflicting state writes.
+type ParallelOptions struct {
+	StateConflict StateConflictPolicy
 }
 
 // Loop runs sub-agents in sequence repeatedly until a sub escalates (a tool/
@@ -99,37 +126,60 @@ var _ Runnable = (*loopRunner)(nil)
 
 // --- Parallel ---------------------------------------------------------------
 
-type parallelRunner struct{ subs []*Agent }
+type parallelRunner struct {
+	subs []*Agent
+	opts ParallelOptions
+}
 
 func (p *parallelRunner) run(rc *RunContext) runOutcome {
+	// Baseline KV captured before any branch forks, so each branch's writes can
+	// be diffed against a common ancestor and folded deterministically.
+	baseline := cloneKV(rc.State.KV)
+
 	results := make([]runOutcome, len(p.subs))
+	branches := make([]*RunContext, len(p.subs))
 	var wg sync.WaitGroup
 	for i := range p.subs {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			child := rc.forBranch(p.subs[i].cfg.name)
+			branches[i] = child
 			results[i] = p.subs[i].runnable.run(child)
 		}(i)
 	}
 	wg.Wait()
-	return mergeOutcomes(results)
+	return p.merge(rc, baseline, branches, results)
 }
 
 var _ Runnable = (*parallelRunner)(nil)
 
-// mergeOutcomes folds parallel branch outcomes: the first error wins; otherwise
-// the branches' final texts are concatenated into one assistant message.
-func mergeOutcomes(rs []runOutcome) runOutcome {
+// merge folds parallel branch outcomes. The first error (or non-completion
+// control, e.g. Interrupt) short-circuits and propagates. Otherwise each
+// branch's KV diff against the baseline is folded by the conflict policy and
+// applied to the shared State, and the branches' final texts are concatenated.
+func (p *parallelRunner) merge(rc *RunContext, baseline map[string]any, branches []*RunContext, rs []runOutcome) runOutcome {
 	texts := make([]string, 0, len(rs))
-	for _, r := range rs {
+	patches := make([]statePatch, len(rs))
+	for i, r := range rs {
 		if r.Err != nil {
 			return runOutcome{Err: r.Err}
 		}
+		// A branch that paused (HITL) or asked to Stop/Escalate can't be merged
+		// deterministically; surface its control to the enclosing workflow.
+		if r.terminal() || r.Control.Kind == core.Stop || r.Control.Kind == core.Escalate {
+			return r
+		}
+		patches[i] = diffKV(baseline, branches[i].State.KV)
 		if t := r.Result.Message.Text(); t != "" {
 			texts = append(texts, t)
 		}
 	}
+	merged, err := mergeKVPatches(patches, p.opts.StateConflict)
+	if err != nil {
+		return runOutcome{Err: err}
+	}
+	applyKVPatch(rc.State, merged)
 	return runOutcome{Result: core.Result{Message: core.AssistantText(strings.Join(texts, "\n\n"))}}
 }
 
