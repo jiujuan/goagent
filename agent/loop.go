@@ -152,6 +152,19 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 			return runOutcome{Result: core.Result{Message: final}}
 		}
 
+		// A max_tokens stop means the reply was cut off by the output cap, so
+		// every tool call in it may carry silently truncated arguments (they can
+		// still parse). None are safe to execute — and none reach the BeforeTool
+		// gate, so a truncated call never enters HITL approval — instead each
+		// becomes an error result asking the model to re-issue it.
+		if finalResp.StopReason == llm.StopMaxTokens {
+			history = append(history, core.Message{Role: core.RoleTool, Parts: truncatedResults(rc, calls)})
+			rc.State.Messages = history
+			l.checkpoint(rc, step, nil)
+			rc.publish(core.TurnDone{Step: step})
+			continue
+		}
+
 		// Phase 3 — ExecuteTools: BeforeTool gate (HITL/permission) first.
 		for i := range calls {
 			d, err := l.mw.BeforeTool(lc, &calls[i])
@@ -248,4 +261,23 @@ func pendingFrom(calls []core.ToolCall) []core.ApprovalRequest {
 		out[i] = core.ApprovalRequest{CallID: c.ID, Tool: c.Name, Args: c.Args}
 	}
 	return out
+}
+
+// truncatedResults fails a batch of tool calls from a max_tokens-truncated
+// reply, publishing ToolStarted/ToolDone pairs (mirroring execTools' event
+// shape) without invoking any handler.
+func truncatedResults(rc *RunContext, calls []core.ToolCall) []core.Part {
+	parts := make([]core.Part, 0, len(calls))
+	for _, c := range calls {
+		rc.publish(core.ToolStarted{Call: c})
+		tr := core.ToolResult{
+			CallID:  c.ID,
+			Name:    c.Name,
+			IsError: true,
+			Content: []core.Part{core.Text{Text: `tool call "` + c.Name + `" was not executed: the reply hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.`}},
+		}
+		rc.publish(core.ToolDone{Result: tr})
+		parts = append(parts, tr)
+	}
+	return parts
 }
