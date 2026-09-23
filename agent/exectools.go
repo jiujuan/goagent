@@ -11,8 +11,9 @@ import (
 // original call order, plus the directives gathered from each tool's
 // Result.Control and the AfterTool middleware. State mutations a tool requests
 // (Result.State) are applied to the run State immediately. Execution is
-// concurrent by default (LoopPolicy.ToolExecution); Sequential runs one at a
-// time.
+// concurrent by default (WithToolExecution); ToolSequential forces serial, and
+// so does any tool declaring the SequentialTool capability (tool.AsSequential),
+// which downgrades the whole batch it appears in.
 //
 // ToolStarted is published in call order; ToolDone as each result lands. The
 // Bus is concurrency-safe, so parallel publishes do not race. State mutations
@@ -46,7 +47,19 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 		rc.publish(core.ToolDone{Result: tr})
 	}
 
-	if l.toolExec == ToolSequential {
+	// Serial if the agent forces it globally, or if any call in this batch
+	// targets a tool declaring the SequentialTool capability — one such tool
+	// downgrades the whole batch, keeping the model's call order.
+	needSeq := l.toolExec == ToolSequential
+	if !needSeq {
+		for _, c := range calls {
+			if l.seqTool[c.Name] {
+				needSeq = true
+				break
+			}
+		}
+	}
+	if needSeq {
 		for i := range calls {
 			rc.publish(core.ToolStarted{Call: calls[i]})
 			run(i, calls[i])

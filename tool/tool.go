@@ -46,6 +46,20 @@ type Context struct {
 	CallID string
 }
 
+// SequentialTool is an optional capability: a tool that must not run alongside
+// other tools in the same batch (rate-limited API, non-reentrant resource,
+// order-sensitive side effects). If any call in a parallel batch targets such a
+// tool, the whole batch executes one at a time, in the model's call order.
+type SequentialTool interface{ SequentialExecution() bool }
+
+// AsSequential marks any tool as sequential-executing, forcing its batches to
+// run one at a time regardless of the agent's ToolExecMode.
+func AsSequential(t Tool) Tool { return sequentialTool{t} }
+
+type sequentialTool struct{ Tool }
+
+func (sequentialTool) SequentialExecution() bool { return true }
+
 // TextResult is a convenience constructor for a successful text result.
 func TextResult(s string) *Result {
 	return &Result{Content: []core.Part{core.Text{Text: s}}}

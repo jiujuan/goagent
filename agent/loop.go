@@ -34,6 +34,7 @@ type AgentLoop struct {
 	mw          *Stack
 	tools       []tool.Tool
 	byName      map[string]tool.Tool
+	seqTool     map[string]bool // tools declaring the SequentialTool capability
 	schemas     []llm.ToolSchema
 	maxTurns    int
 }
@@ -42,6 +43,12 @@ func newLoop(c config) *AgentLoop {
 	ms := c.maxTurns
 	if ms <= 0 {
 		ms = defaultMaxTurns
+	}
+	seq := make(map[string]bool, len(c.tools))
+	for _, t := range c.tools {
+		if s, ok := t.(tool.SequentialTool); ok && s.SequentialExecution() {
+			seq[t.Name()] = true
+		}
 	}
 	return &AgentLoop{
 		model:       c.model,
@@ -55,6 +62,7 @@ func newLoop(c config) *AgentLoop {
 		mw:          NewStack(c.middleware...),
 		tools:       c.tools,
 		byName:      tool.ByName(c.tools),
+		seqTool:     seq,
 		schemas:     tool.Schemas(c.tools),
 		maxTurns:    ms,
 	}
@@ -66,6 +74,9 @@ var _ Runnable = (*AgentLoop)(nil)
 // construction, advertising it to the model.
 func (l *AgentLoop) addTool(t tool.Tool) {
 	l.byName[t.Name()] = t
+	if s, ok := t.(tool.SequentialTool); ok && s.SequentialExecution() {
+		l.seqTool[t.Name()] = true
+	}
 	l.schemas = append(l.schemas, llm.ToolSchema{
 		Name:        t.Name(),
 		Description: t.Description(),

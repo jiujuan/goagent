@@ -87,6 +87,8 @@ func WithoutTransfer() Option { return func(c *config) { c.noTransfer = true } }
 func WithMaxTurns(n int) Option { return func(c *config) { c.maxTurns = n } }
 
 // WithToolExecution selects concurrent (default) or sequential tool execution.
+// Note: a tool wrapped with tool.AsSequential downgrades its whole batch to
+// serial regardless of this mode.
 func WithToolExecution(m ToolExecMode) Option { return func(c *config) { c.toolExec = m } }
 
 // WithOutputKey writes this agent's final answer text into State.KV under key,
