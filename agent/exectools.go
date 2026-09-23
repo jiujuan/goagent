@@ -81,24 +81,37 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 }
 
 // callOne dispatches a single tool call, returning its result plus any control
-// directive and state ops the tool requested. Unknown tools and handler errors
-// become error ToolResults reported back to the model.
+// directive and state ops the tool requested. Unknown tools, rejected or
+// schema-invalid arguments, and handler errors all become error ToolResults
+// reported back to the model — the handler never runs for a bad call.
 func (l *AgentLoop) callOne(rc *RunContext, c core.ToolCall) (core.ToolResult, *core.Directive, []core.StateOp) {
 	t, ok := l.byName[c.Name]
 	if !ok {
-		return core.ToolResult{
-			CallID: c.ID, Name: c.Name, IsError: true,
-			Content: []core.Part{core.Text{Text: "unknown tool: " + c.Name}},
-		}, nil, nil
+		return errResult(c, "unknown tool: "+c.Name), nil, nil
+	}
+	raw := c.Args
+	if p, ok := t.(tool.ArgumentPreparer); ok {
+		prepared, err := p.PrepareArguments(raw)
+		if err != nil {
+			return errResult(c, "invalid arguments: "+err.Error()), nil, nil
+		}
+		raw = prepared
+	}
+	if err := tool.Validate(t.Schema(), raw); err != nil {
+		return errResult(c, "invalid arguments: "+err.Error()), nil, nil
 	}
 	tctx := &tool.Context{Context: rc, State: rc.State, CallID: c.ID}
-	res, err := t.Call(tctx, c.Args)
+	res, err := t.Call(tctx, raw)
 	if err != nil {
-		return core.ToolResult{
-			CallID: c.ID, Name: c.Name, IsError: true,
-			Content: []core.Part{core.Text{Text: err.Error()}},
-		}, nil, nil
+		return errResult(c, err.Error()), nil, nil
 	}
 	tr := core.ToolResult{CallID: c.ID, Name: c.Name, Content: res.Content, IsError: res.IsError}
 	return tr, res.Control, res.State
+}
+
+func errResult(c core.ToolCall, msg string) core.ToolResult {
+	return core.ToolResult{
+		CallID: c.ID, Name: c.Name, IsError: true,
+		Content: []core.Part{core.Text{Text: msg}},
+	}
 }

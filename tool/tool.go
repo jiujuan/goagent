@@ -46,6 +46,14 @@ type Context struct {
 	CallID string
 }
 
+// ArgumentPreparer is an optional capability: a tool may repair or normalize
+// the model's raw JSON arguments (tolerate aliased or legacy field names, fill
+// obvious defaults) before they are validated against its schema and reach
+// Call. Returning an error rejects the call without invoking the handler.
+type ArgumentPreparer interface {
+	PrepareArguments(raw json.RawMessage) (json.RawMessage, error)
+}
+
 // SequentialTool is an optional capability: a tool that must not run alongside
 // other tools in the same batch (rate-limited API, non-reentrant resource,
 // order-sensitive side effects). If any call in a parallel batch targets such a
