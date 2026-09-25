@@ -14,9 +14,14 @@
 //	                           and scripts (executed via tool/exec + sandbox).
 //
 // Loading is done over io/fs, so a Library can be built from a real directory
-// (LoadDir), an embed.FS compiled into the binary (Load), or a fstest.MapFS in
-// tests. The package depends only on prompt, tool, and core — never the other
-// way round — mirroring the tool/web and tool/exec batteries-included pattern.
+// (LoadDir), several of them merged with workspace precedence (LoadDirs), an
+// embed.FS compiled into the binary (Load), or a fstest.MapFS in tests.
+//
+// Everything except Gate depends only on prompt, tool and core. Gate is the one
+// place the package reaches into agent, to return an agent.Middleware that turns
+// a loaded skill's allowed-tools into a pre-approval list; it mirrors what the
+// middleware package already does (middleware/permission.go) and forms no cycle,
+// since agent never imports skills.
 package skills
 
 import (
@@ -41,8 +46,9 @@ type Skill struct {
 	Name string
 	// Description is the one-line summary shown in the prompt (Level 1).
 	Description string
-	// AllowedTools is the advisory tool allow-list from frontmatter. It is
-	// surfaced to the model in the loaded instructions but not hard-enforced.
+	// AllowedTools is the tool list declared in frontmatter. Loading the skill
+	// records it as the set that skills.Gate pre-approves; anything outside the
+	// list pauses for human approval rather than running silently.
 	AllowedTools []string
 	// Dir is the skill's directory within fsys (e.g. "pdf").
 	Dir string
