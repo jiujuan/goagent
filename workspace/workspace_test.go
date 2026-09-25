@@ -10,12 +10,16 @@ import (
 	"github.com/jiujuan/goagent/sandbox"
 )
 
-// newAt builds a workspace rooted at dir with global rules read from an empty
-// directory, so a rules file in the test runner's home can never leak in.
+// newAt builds a workspace rooted at dir with the user-level sources pointed at
+// directories that do not exist, so a rules or skills file in the test runner's
+// home can never leak in.
 func newAt(t *testing.T, cfg Config) *Workspace {
 	t.Helper()
 	if cfg.GlobalRulesDir == "" {
 		cfg.GlobalRulesDir = filepath.Join(t.TempDir(), "no-global-rules")
+	}
+	if cfg.GlobalSkillsDir == "" {
+		cfg.GlobalSkillsDir = filepath.Join(t.TempDir(), "no-global-skills")
 	}
 	w, err := New(cfg)
 	if err != nil {
