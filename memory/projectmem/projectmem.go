@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/jiujuan/goagent/internal/reporoot"
 )
 
 // fileName is the project-memory file discovered at each directory level.
@@ -31,26 +33,14 @@ type Doc struct {
 // inclusive). Each document's "@import ./other.md" lines are expanded relative
 // to the importing file.
 func Load(startDir string) ([]Doc, error) {
-	dir, err := filepath.Abs(startDir)
+	// The boundary walk lives in reporoot so the workspace layer resolves the
+	// same repo root from the same rules (ADR 0022).
+	dirs, err := reporoot.Resolve(startDir)
 	if err != nil {
-		return nil, fmt.Errorf("projectmem: abs %q: %w", startDir, err)
+		return nil, err
 	}
 
-	// Collect candidate directories leaf-first, stopping at the repo boundary.
-	var dirs []string
-	for {
-		dirs = append(dirs, dir)
-		if hasGit(dir) {
-			break // repo root reached; include it, then stop
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break // filesystem root
-		}
-		dir = parent
-	}
-
-	// Read root-first (reverse of the leaf-first walk) so leaf docs land last.
+	// Read root-first (reverse of the leaf-first chain) so leaf docs land last.
 	var docs []Doc
 	for i := len(dirs) - 1; i >= 0; i-- {
 		path := filepath.Join(dirs[i], fileName)
@@ -68,12 +58,6 @@ func Load(startDir string) ([]Doc, error) {
 		docs = append(docs, Doc{Path: path, Content: strings.TrimRight(content, "\n")})
 	}
 	return docs, nil
-}
-
-// hasGit reports whether dir contains a .git entry (file or directory).
-func hasGit(dir string) bool {
-	_, err := os.Stat(filepath.Join(dir, ".git"))
-	return err == nil
 }
 
 // expandImports replaces lines of the form "@import <relpath>" with the
