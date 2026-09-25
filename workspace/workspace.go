@@ -54,14 +54,20 @@ type Config struct {
 	// injecting whole project memory changes the prompt substantially, so it is
 	// the caller's explicit decision.
 	ProjectMemory bool
+
+	// Git takes the read-only repository snapshot (branch, HEAD, dirty) and adds
+	// it to the workspace facts block. Off by default because the dirty probe
+	// runs a subprocess.
+	Git bool
 }
 
 // Workspace owns an open filesystem handle, so it has a lifetime: Close it.
 type Workspace struct {
-	root  string
-	fs    *os.Root
-	docs  []projectmem.Doc
-	rules *rules.Set
+	root    string
+	fs      *os.Root
+	docs    []projectmem.Doc
+	rules   *rules.Set
+	gitInfo GitInfo
 }
 
 // New resolves the root, opens it, and loads the configured parts. A root that
@@ -92,6 +98,11 @@ func New(cfg Config) (*Workspace, error) {
 			return nil, err
 		}
 		w.docs = docs
+	}
+	if cfg.Git {
+		// A failed dirty probe lands in GitInfo.StatusErr rather than failing
+		// assembly: not having git installed must not make a workspace unusable.
+		w.gitInfo = probeGit(root, gitStatus)
 	}
 	return w, nil
 }
@@ -149,6 +160,11 @@ func (w *Workspace) Close() error {
 
 // Tools returns the file tools bound to this workspace's root.
 func (w *Workspace) Tools() []tool.Tool { return file.Tools(w.fs) }
+
+// Git returns the read-only repository snapshot. It is the zero value (Valid
+// false) unless Config.Git was set, and Valid is false when the root is not
+// inside a repository — that is a fact, not an error.
+func (w *Workspace) Git() GitInfo { return w.gitInfo }
 
 // Sections returns the prompt blocks this workspace contributes, in whatever
 // order the Builder wants (they carry their own Order): rules, project memory,

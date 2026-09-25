@@ -21,7 +21,7 @@ func (w *Workspace) Section() prompt.Section {
 		RenderFn: func(prompt.Context) (string, error) {
 			var b strings.Builder
 			b.WriteString("# Workspace\n")
-			fmt.Fprintf(&b, "Root: %s\n", w.root)
+			fmt.Fprintf(&b, "Root: %s%s\n", w.root, w.gitInfo.describe(w.root))
 			b.WriteString("File tools (read_file/write_file/list_dir/glob) are confined to this root.\n")
 			b.WriteString("Commands run with this root as their working directory, but are not jailed: a command may read or write paths outside the root.")
 			return b.String(), nil
