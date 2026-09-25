@@ -14,18 +14,28 @@ type Builder struct {
 // New returns an empty Builder.
 func New() *Builder { return &Builder{} }
 
-// Add appends a Section. If a section with the same Name is already present it
+// Add appends Sections. If a section with the same Name is already present it
 // is replaced in place (keeping its position), so built-ins can be reconfigured
 // by adding a same-named section. Returns the Builder for chaining.
-func (b *Builder) Add(s Section) *Builder {
-	for i, existing := range b.sections {
-		if existing.Name() == s.Name() {
+func (b *Builder) Add(sections ...Section) *Builder {
+	for _, s := range sections {
+		if i := b.indexOf(s.Name()); i >= 0 {
 			b.sections[i] = s
-			return b
+			continue
+		}
+		b.sections = append(b.sections, s)
+	}
+	return b
+}
+
+// indexOf returns the position of the section called name, or -1.
+func (b *Builder) indexOf(name string) int {
+	for i, existing := range b.sections {
+		if existing.Name() == name {
+			return i
 		}
 	}
-	b.sections = append(b.sections, s)
-	return b
+	return -1
 }
 
 // Remove drops the section with the given name, if present. Returns the Builder

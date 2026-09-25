@@ -31,7 +31,8 @@ func Identity(instruction string) Section {
 type EnvOption func(*envConfig)
 
 type envConfig struct {
-	now func() time.Time
+	now     func() time.Time
+	workDir string
 }
 
 // WithNow injects a clock so the Environment section is deterministic in tests.
@@ -39,8 +40,17 @@ func WithNow(now func() time.Time) EnvOption {
 	return func(c *envConfig) { c.now = now }
 }
 
+// WithWorkingDir overrides the directory reported as "Working directory". Use it
+// whenever commands actually run somewhere other than the process's cwd — a
+// sandboxed or multi-workspace agent — so the model is never told a cwd its
+// tools do not use. The default remains os.Getwd.
+func WithWorkingDir(dir string) EnvOption {
+	return func(c *envConfig) { c.workDir = dir }
+}
+
 // Environment renders the runtime environment: current date, OS, and working
-// directory. The clock defaults to time.Now and can be overridden with WithNow.
+// directory. The clock defaults to time.Now and can be overridden with WithNow;
+// the directory can be overridden with WithWorkingDir.
 func Environment(opts ...EnvOption) Section {
 	cfg := envConfig{now: time.Now}
 	for _, opt := range opts {
@@ -54,11 +64,15 @@ func Environment(opts ...EnvOption) Section {
 			b.WriteString("# Environment\n")
 			fmt.Fprintf(&b, "Date: %s\n", cfg.now().Format("2006-01-02"))
 			fmt.Fprintf(&b, "OS: %s\n", runtime.GOOS)
-			if cwd, err := os.Getwd(); err == nil {
-				fmt.Fprintf(&b, "Working directory: %s", cwd)
-			} else {
-				b.WriteString("Working directory: (unknown)")
+			dir := cfg.workDir
+			if dir == "" {
+				cwd, err := os.Getwd()
+				if err != nil {
+					cwd = "(unknown)"
+				}
+				dir = cwd
 			}
+			fmt.Fprintf(&b, "Working directory: %s", dir)
 			return b.String(), nil
 		},
 	}

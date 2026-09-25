@@ -1,6 +1,7 @@
 package prompt
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,30 @@ func TestEnvironmentDeterministicClock(t *testing.T) {
 	}
 	if !strings.Contains(out, "Date: 2026-06-25") {
 		t.Fatalf("expected injected date, got: %q", out)
+	}
+}
+
+func TestEnvironmentWorkingDirOverride(t *testing.T) {
+	fixed := time.Date(2026, 6, 25, 12, 0, 0, 0, time.UTC)
+	out, err := Environment(WithNow(func() time.Time { return fixed }), WithWorkingDir("/srv/work/tree")).Render(Context{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Working directory: /srv/work/tree") {
+		t.Fatalf("expected the injected working directory, got: %q", out)
+	}
+
+	// Without the option the section keeps reporting the process cwd, so the
+	// override cannot silently change existing callers.
+	def, err := Environment(WithNow(func() time.Time { return fixed })).Render(Context{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(def, "/srv/work/tree") {
+		t.Fatalf("override leaked into the default section: %q", def)
+	}
+	if cwd, err := os.Getwd(); err == nil && !strings.Contains(def, "Working directory: "+cwd) {
+		t.Fatalf("default must still report the process cwd %q, got: %q", cwd, def)
 	}
 }
 

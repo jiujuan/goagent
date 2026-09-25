@@ -58,6 +58,21 @@ func TestAddOverridesByName(t *testing.T) {
 	}
 }
 
+func TestAddVariadicKeepsOverrideSemantics(t *testing.T) {
+	out, err := New().
+		Add(fixed("late", 400, "fourth")).
+		Add(fixed("first", 100, "one"), fixed("second", 200, "two"), fixed("first", 100, "uno")).
+		Build(Context{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The third section replaces the first by name, in place, so "uno" keeps
+	// position 100 and "two" stays after it.
+	if want := "uno\n\ntwo\n\nfourth"; out != want {
+		t.Fatalf("Build() = %q, want %q", out, want)
+	}
+}
+
 func TestRemove(t *testing.T) {
 	out, err := New().
 		Add(fixed("a", 100, "first")).
