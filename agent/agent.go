@@ -88,8 +88,6 @@ type RunConfig struct {
 type RunOption func(*RunConfig)
 
 // OnThread runs on a specific thread, so state and checkpoints accumulate
-// across calls. Defaults to a fresh ephemeral thread.
-// OnThread runs on a specific thread, so state and checkpoints accumulate
 // across calls. Defaults to a fresh ephemeral thread. The id is used verbatim as
 // one file name in the File checkpointer and one directory name in a workspace's
 // artifact store, so it must be [A-Za-z0-9_-], 1..core.MaxThreadIDLen bytes
