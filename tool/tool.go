@@ -46,6 +46,31 @@ type Context struct {
 	CallID string
 }
 
+// Updater is an optional capability of the context a tool is invoked with: it
+// receives the partial results a long-running tool reports through
+// Context.Update. The agent's run context implements it, so a tool called by a
+// run streams to that run's observers. Anywhere else — a direct Call, a test, a
+// script — there is no receiver and Update simply drops the part.
+type Updater interface {
+	UpdateTool(callID string, p core.Part)
+}
+
+// Update reports a partial result while the tool is still running, for live
+// rendering by observers of the run (they receive it as core.ToolUpdate,
+// correlated by CallID to the surrounding ToolStarted/ToolDone pair). It is
+// transient: never persisted, never checkpointed, and never reaches the model —
+// the model's view of the call is the Result Call returns. Update from the
+// calling goroutine or one you join before returning, so nothing lands after
+// ToolDone.
+func (c *Context) Update(p core.Part) {
+	if c == nil || c.CallID == "" {
+		return
+	}
+	if u, ok := c.Context.(Updater); ok {
+		u.UpdateTool(c.CallID, p)
+	}
+}
+
 // ArgumentPreparer is an optional capability: a tool may repair or normalize
 // the model's raw JSON arguments (tolerate aliased or legacy field names, fill
 // obvious defaults) before they are validated against its schema and reach

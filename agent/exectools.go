@@ -115,3 +115,16 @@ func errResult(c core.ToolCall, msg string) core.ToolResult {
 		Content: []core.Part{core.Text{Text: msg}},
 	}
 }
+
+// UpdateTool implements tool.Updater for the run: a running tool's
+// Context.Update call arrives here and goes out on the run's event stream as a
+// ToolUpdate tagged with the CallID that started it. Every tool a run invokes is
+// handed rc as its context (callOne), so this is the only path a partial result
+// takes. Like any other publish it is safe from a tool's own goroutines; a
+// ToolUpdate arriving after the batch's ToolDone is a late report from a tool
+// that did not join its workers, not a runtime event.
+func (rc *RunContext) UpdateTool(callID string, p core.Part) {
+	rc.publish(core.ToolUpdate{CallID: callID, Partial: p})
+}
+
+var _ tool.Updater = (*RunContext)(nil)
