@@ -93,6 +93,15 @@ type StuckDetected struct {
 	Step   int
 }
 
+// BudgetExceeded is emitted by the RunBudget middleware the moment a per-run
+// resource cap is hit. Resource is "input_tokens" | "output_tokens" |
+// "total_tokens" | "cost" | "duration" | "turns"; from the next model call on,
+// the run enters wrap-up mode.
+type BudgetExceeded struct {
+	Resource string
+	Step     int
+}
+
 // --- Marker -----------------------------------------------------------------
 
 func (RunStarted) isEvent()      {}
@@ -110,6 +119,7 @@ func (Progress) isEvent()        {}
 func (PlanNodeStarted) isEvent() {}
 func (PlanNodeDone) isEvent()    {}
 func (StuckDetected) isEvent()   {}
+func (BudgetExceeded) isEvent()  {}
 
 // --- Payload types ----------------------------------------------------------
 

@@ -17,3 +17,19 @@ func TestStuckDetectedEventRoundTrip(t *testing.T) {
 		t.Fatalf("round trip = %#v, want %#v", out, in)
 	}
 }
+
+func TestBudgetExceededEventRoundTrip(t *testing.T) {
+	in := BudgetExceeded{Resource: "total_tokens", Step: 3}
+	data, err := MarshalEvent(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := out.(BudgetExceeded)
+	if !ok || got != in {
+		t.Fatalf("round trip = %#v, want %#v", out, in)
+	}
+}

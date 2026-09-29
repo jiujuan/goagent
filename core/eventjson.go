@@ -79,6 +79,8 @@ func MarshalEvent(ev Event) ([]byte, error) {
 		}
 	case StuckDetected:
 		w.Type, w.Rule, w.Reason, w.Step = "stuck_detected", e.Rule, e.Reason, e.Step
+	case BudgetExceeded:
+		w.Type, w.Reason, w.Step = "budget_exceeded", e.Resource, e.Step
 	default:
 		return nil, fmt.Errorf("core: cannot marshal event of type %T", ev)
 	}
@@ -126,6 +128,8 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		return PlanNodeDone{NodeID: w.NodeID, Status: w.Status, Err: toErr(w.Err)}, nil
 	case "stuck_detected":
 		return StuckDetected{Rule: w.Rule, Reason: w.Reason, Step: w.Step}, nil
+	case "budget_exceeded":
+		return BudgetExceeded{Resource: w.Reason, Step: w.Step}, nil
 	default:
 		return nil, fmt.Errorf("core: unknown event type %q", w.Type)
 	}
