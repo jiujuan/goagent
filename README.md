@@ -26,7 +26,7 @@
 | 确定性工作流 | `Sequential`、`Parallel`、`Loop` 和 `Pipeline` 把控制流从模型决策中剥离；并行分支在隔离的 `State` 克隆上运行，结束后按声明顺序确定性地合并 KV（可选冲突策略）。 |
 | ReAct 与计划执行 | 普通 Agent 即可完成“思考 → 调用工具 → 观察”的 ReAct 循环；`agent.NewPlan` / `agent.NewLLMPlan` 提供带依赖的执行计划（DAG）与并发调度。 |
 | 状态与检查点 | 运行状态为显式的 `core.State`（消息、Todos、KV、文件）；`checkpoint` 提供内存与 JSONL 文件后端，支持按 `ThreadID` 跨进程恢复。 |
-| 记忆与 RAG | `memory` 提供向量检索（`NewRetriever`）；`middleware.RAG` 自动把检索结果注入系统提示；`memx` 可组合规则、项目、工作、文本记忆。 |
+| 记忆与 RAG | `memory` 提供向量检索（`NewRetriever`）、可持久化向量库（`File`，支持删除与压缩）与按内容去重的 `Upsert`；`middleware.RAG` 自动把检索结果注入系统提示；`memx` 可组合规则、项目、工作、文本记忆，并在运行结束时自动把对话固化为长期记忆。 |
 | 技能系统 | `skills` 基于文件系统的技能包支持按需渐进加载 `SKILL.md`、资源和脚本，可将资源通过 `go:embed` 打进二进制。 |
 | 可组合中间件 | 内置重试、限流、上下文压缩、运行中 steering 和 Human-in-the-Loop；中间件以装饰器方式包裹模型。 |
 | 安全执行与外部工具 | 提供受策略约束的命令沙箱（`sandbox`）、MCP 客户端（`tool/mcp`）以及网页搜索/抓取工具（`tool/web`）。 |
@@ -61,7 +61,7 @@ flowchart TB
 - `llm`：供应商无关的模型接口与韧性层；适配器只需实现统一的请求/响应流（`anthropic`、`openaicompat`、`agnes`、`mock`）。
 - `tool`：工具契约与泛型函数工具，另提供 `mcp`、`web`、`exec` 等现成工具。
 - `checkpoint`：显式状态快照的持久化——内存与 JSONL 文件后端，支撑跨进程 resume。
-- `memory`：向量检索与自动 RAG；`memx` 装配规则/项目/工作/文本多层记忆。
+- `memory`：向量检索与自动 RAG；`memx` 装配规则/项目/工作/文本多层记忆，并挂载运行结束时的记忆固化。
 - `middleware`：以装饰器方式包裹模型，加入重试、限流、压缩、steering、HITL、RAG 等通用策略。
 - `prompt`：可组合的系统提示 Section（身份、环境、工具指导、状态）。
 - `bus`、`queue`、`sandbox`、`vfs`：事件总线、异步后台执行、受控外部进程、虚拟文件系统后端。

@@ -1,6 +1,8 @@
 package memx
 
 import (
+	"errors"
+
 	"github.com/jiujuan/goagent/agent"
 	"github.com/jiujuan/goagent/memory"
 	"github.com/jiujuan/goagent/memory/projectmem"
@@ -50,6 +52,12 @@ type Config struct {
 	EnableSearchTool bool
 	// SearchK is the top-k for the search tool (default 4).
 	SearchK int
+
+	// Consolidation mounts the run-end middleware that turns a finished run's
+	// messages into long-term memory (ADR 0019). Its Text and Semantic
+	// destinations default to TextMemDir and Semantic above, so a caller that
+	// already built those layers only needs to supply Model.
+	Consolidation *ConsolidationConfig
 
 	// SectionBudget caps the rune length of the truncatable sections (working
 	// memory, text-memory index). 0 means unbounded.
@@ -122,6 +130,24 @@ func New(cfg Config) (*Memory, error) {
 		if cfg.EnableSearchTool {
 			m.Tools = append(m.Tools, memory.SearchTool(cfg.Semantic, cfg.SearchK))
 		}
+	}
+
+	// Consolidation — the run-end bridge into the two long-term layers.
+	if cfg.Consolidation != nil {
+		cons := *cfg.Consolidation
+		if cons.Model == nil {
+			return nil, errors.New("memx: Consolidation.Model is required")
+		}
+		if cons.Text == nil {
+			cons.Text = m.TextStore
+		}
+		if cons.Semantic == nil {
+			cons.Semantic = cfg.Semantic
+		}
+		if cons.Text == nil && cons.Semantic == nil {
+			return nil, errors.New("memx: Consolidation needs a destination (TextMemDir, Semantic, or one on the config)")
+		}
+		m.Middleware = append(m.Middleware, Consolidator(cons))
 	}
 
 	return m, nil

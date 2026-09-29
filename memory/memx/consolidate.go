@@ -37,16 +37,28 @@ type item struct {
 	Content string `json:"content"`
 }
 
+// DefaultMaxTranscriptRunes bounds the transcript handed to the consolidator: a
+// long run's messages are truncated from the front, keeping the tail. One rune
+// approximates one token, matching the budgeting rule in Budgeted (ADR 0016).
+const DefaultMaxTranscriptRunes = 24000
+
 // Consolidate reads a run's transcript, asks the model to extract durable facts,
 // and writes them to the text and/or semantic stores (either may be nil to skip
 // that target). It is idempotent per fact: a fact whose content hash already
 // exists in the target store is not written again, while a known name carrying
 // new content replaces its entry (the update path for a changed preference).
 // Semantic writes go through memory.Upsertable when the store offers it, and
-// fall back to plain Add otherwise. Call it at the end of a run (e.g. after
-// Run/Wait returns) with the run's messages. See ADR 0019.
+// fall back to plain Add otherwise. The transcript is capped at
+// DefaultMaxTranscriptRunes; call it at the end of a run (e.g. after Run/Wait
+// returns) with the run's messages. See ADR 0019.
 func Consolidate(ctx context.Context, model llm.Model, messages []core.Message, text textmem.Store, sem memory.Store) error {
-	transcript := renderTranscript(messages)
+	return consolidate(ctx, model, messages, text, sem, DefaultMaxTranscriptRunes)
+}
+
+// consolidate is Consolidate with an explicit transcript budget (0 = uncapped),
+// shared by the manual entry point and the run-end middleware.
+func consolidate(ctx context.Context, model llm.Model, messages []core.Message, text textmem.Store, sem memory.Store, maxTranscript int) error {
+	transcript := renderTranscript(messages, maxTranscript)
 	if strings.TrimSpace(transcript) == "" {
 		return nil
 	}
@@ -147,8 +159,10 @@ func loadTextIndex(ctx context.Context, st textmem.Store) (textIndex, error) {
 	return idx, nil
 }
 
-// renderTranscript flattens messages into a "role: text" transcript.
-func renderTranscript(msgs []core.Message) string {
+// renderTranscript flattens messages into a "role: text" transcript, capped at
+// maxTranscript runes by dropping the oldest complete lines (a long run must not
+// blow the consolidator's own context).
+func renderTranscript(msgs []core.Message, maxTranscript int) string {
 	var b strings.Builder
 	for _, m := range msgs {
 		t := strings.TrimSpace(m.Text())
@@ -157,7 +171,18 @@ func renderTranscript(msgs []core.Message) string {
 		}
 		fmt.Fprintf(&b, "%s: %s\n", m.Role, t)
 	}
-	return b.String()
+	out := b.String()
+	if maxTranscript <= 0 {
+		return out
+	}
+	if r := []rune(out); len(r) > maxTranscript {
+		tail := string(r[len(r)-maxTranscript:])
+		if i := strings.IndexByte(tail, '\n'); i >= 0 {
+			tail = tail[i+1:] // never start mid-line
+		}
+		out = "…（更早的记录已按预算省略）\n" + tail
+	}
+	return out
 }
 
 // generate runs one model call and returns the final (non-partial) assistant
