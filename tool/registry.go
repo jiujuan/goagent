@@ -6,6 +6,15 @@ import (
 	"github.com/jiujuan/goagent/llm"
 )
 
+// SchemaOf converts one tool into its advertisement for a model request.
+func SchemaOf(t Tool) llm.ToolSchema {
+	return llm.ToolSchema{
+		Name:        t.Name(),
+		Description: t.Description(),
+		Parameters:  t.Schema(),
+	}
+}
+
 // Schemas maps tools to the llm.ToolSchema list a Request advertises.
 func Schemas(tools []Tool) []llm.ToolSchema {
 	if len(tools) == 0 {
@@ -13,11 +22,7 @@ func Schemas(tools []Tool) []llm.ToolSchema {
 	}
 	out := make([]llm.ToolSchema, len(tools))
 	for i, t := range tools {
-		out[i] = llm.ToolSchema{
-			Name:        t.Name(),
-			Description: t.Description(),
-			Parameters:  t.Schema(),
-		}
+		out[i] = SchemaOf(t)
 	}
 	return out
 }

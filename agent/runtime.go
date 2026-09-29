@@ -2,11 +2,14 @@ package agent
 
 import (
 	"context"
+	"slices"
 	"sync"
 
 	"github.com/jiujuan/goagent/bus"
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
+	"github.com/jiujuan/goagent/llm"
+	"github.com/jiujuan/goagent/tool"
 )
 
 // RunContext is the runtime — the execution environment carried through one
@@ -34,6 +37,11 @@ type RunContext struct {
 	resumed *resumeBatch
 
 	steering steeringQueue
+
+	// dynamic holds tools injected into this run by middleware
+	// (LoopContext.AddTool). It is consulted before the agent's static table, so an
+	// injection can replace an agent-level tool of the same name for this run only.
+	dynamic dynamicTools
 }
 
 // deeper returns a child execution environment one delegation level down,
@@ -119,6 +127,52 @@ func (q *steeringQueue) drain() []core.Message {
 	}
 	out := q.msgs
 	q.msgs = nil
+	return out
+}
+
+// dynamicTools is a goroutine-safe name-to-tool table of run-scoped tools. The loop
+// writes it while preparing a step and reads it from the tool goroutines, so both
+// sides lock. Its zero value is an empty table.
+type dynamicTools struct {
+	mu     sync.Mutex
+	byName map[string]tool.Tool
+}
+
+func (d *dynamicTools) set(t tool.Tool) {
+	d.mu.Lock()
+	if d.byName == nil {
+		d.byName = make(map[string]tool.Tool, 4)
+	}
+	d.byName[t.Name()] = t
+	d.mu.Unlock()
+}
+
+// lookup resolves one injected tool. ok is false when the table holds nothing for
+// the name, which the caller reads as "not injected, use the agent's own tool".
+func (d *dynamicTools) lookup(name string) (tool.Tool, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	t, ok := d.byName[name]
+	return t, ok
+}
+
+// advertised lists every injected tool for the model, in name order so the
+// advertisement is stable across steps and runs.
+func (d *dynamicTools) advertised() []llm.ToolSchema {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.byName) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(d.byName))
+	for name := range d.byName {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	out := make([]llm.ToolSchema, 0, len(names))
+	for _, name := range names {
+		out = append(out, tool.SchemaOf(d.byName[name]))
+	}
 	return out
 }
 

@@ -49,11 +49,12 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 
 	// Serial if the agent forces it globally, or if any call in this batch
 	// targets a tool declaring the SequentialTool capability — one such tool
-	// downgrades the whole batch, keeping the model's call order.
+	// downgrades the whole batch, keeping the model's call order. Tools injected
+	// for this run count the same way (isSequential).
 	needSeq := l.toolExec == ToolSequential
 	if !needSeq {
 		for _, c := range calls {
-			if l.seqTool[c.Name] {
+			if l.isSequential(rc, c.Name) {
 				needSeq = true
 				break
 			}
@@ -81,11 +82,17 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 }
 
 // callOne dispatches a single tool call, returning its result plus any control
-// directive and state ops the tool requested. Unknown tools, rejected or
-// schema-invalid arguments, and handler errors all become error ToolResults
+// directive and state ops the tool requested. The name resolves against the
+// run's injected tools first, then the agent's own table. Unknown tools, rejected
+// or schema-invalid arguments, and handler errors all become error ToolResults
 // reported back to the model — the handler never runs for a bad call.
 func (l *AgentLoop) callOne(rc *RunContext, c core.ToolCall) (core.ToolResult, *core.Directive, []core.StateOp) {
-	t, ok := l.byName[c.Name]
+	// Run-scoped injections resolve first, so a middleware can replace an
+	// agent-level tool by name or supply one the agent was built without.
+	t, ok := rc.dynamic.lookup(c.Name)
+	if !ok {
+		t, ok = l.byName[c.Name]
+	}
 	if !ok {
 		return errResult(c, "unknown tool: "+c.Name), nil, nil
 	}
@@ -128,3 +135,18 @@ func (rc *RunContext) UpdateTool(callID string, p core.Part) {
 }
 
 var _ tool.Updater = (*RunContext)(nil)
+
+// isSequential reports whether the tool behind name must not share a batch with others.
+// Both tables count: the agent's own capability flags recorded at construction,
+// and the run's injected tools resolved by name.
+func (l *AgentLoop) isSequential(rc *RunContext, name string) bool {
+	if l.seqTool[name] {
+		return true
+	}
+	t, ok := rc.dynamic.lookup(name)
+	if !ok {
+		return false
+	}
+	s, ok := t.(tool.SequentialTool)
+	return ok && s.SequentialExecution()
+}

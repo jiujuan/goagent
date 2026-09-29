@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"slices"
 
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
@@ -77,11 +78,30 @@ func (l *AgentLoop) addTool(t tool.Tool) {
 	if s, ok := t.(tool.SequentialTool); ok && s.SequentialExecution() {
 		l.seqTool[t.Name()] = true
 	}
-	l.schemas = append(l.schemas, llm.ToolSchema{
-		Name:        t.Name(),
-		Description: t.Description(),
-		Parameters:  t.Schema(),
-	})
+	l.schemas = mergeSchema(l.schemas, tool.SchemaOf(t))
+}
+
+// advertised lists the tools offered to the model for one step: the agent's own,
+// then any tool the run's middleware injected. An injected name is never listed
+// twice; if the agent already had a tool of that name the static slot stays and
+// callOne resolves the call against the injected tool instead (see exectools.go).
+func (l *AgentLoop) advertised(rc *RunContext) []llm.ToolSchema {
+	out := slices.Clone(l.schemas)
+	for _, s := range rc.dynamic.advertised() {
+		out = mergeSchema(out, s)
+	}
+	return out
+}
+
+// mergeSchema appends s unless a schema of that name is already listed, so a tool
+// injected mid-run keeps exactly one advertisement slot across steps.
+func mergeSchema(list []llm.ToolSchema, s llm.ToolSchema) []llm.ToolSchema {
+	for _, have := range list {
+		if have.Name == s.Name {
+			return list
+		}
+	}
+	return append(list, s)
 }
 
 func (l *AgentLoop) run(rc *RunContext) runOutcome {
@@ -142,7 +162,7 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		if !usePrompt {
 			sys = renderTemplate(l.instruction, rc.State.KV)
 		}
-		req := &llm.Request{System: sys, Messages: history, Tools: l.schemas}
+		req := &llm.Request{System: sys, Messages: history, Tools: l.advertised(rc)}
 		req.Options.Apply(l.modelOpts...)
 		lc.Request = req
 		if err := l.mw.ModifyRequest(lc, req); err != nil {
