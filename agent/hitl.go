@@ -62,6 +62,9 @@ func (r *Run) Resume(ctx context.Context) (*Run, error) {
 // folded into the run's control flow. Running it here instead would give one
 // conversation a second, weaker executor.
 func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approval) (*Run, error) {
+	if err := core.CheckThreadID(threadID); err != nil {
+		return nil, err
+	}
 	cp, err := a.store.Latest(ctx, threadID)
 	if err != nil {
 		return nil, err

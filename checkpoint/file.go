@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"github.com/jiujuan/goagent/core"
@@ -52,8 +51,14 @@ func NewFile(dir string) (*File, error) {
 	return &File{dir: dir, known: map[string]map[string]bool{}}, nil
 }
 
-func (f *File) path(threadID string) string {
-	return filepath.Join(f.dir, safeName(threadID)+".jsonl")
+// path resolves a thread id to its file inside the store directory. The id names
+// the file verbatim (ADR-0028), so it has to be file-name-safe: without the
+// check, an id carrying path syntax would place a thread's records outside dir.
+func (f *File) path(threadID string) (string, error) {
+	if err := core.CheckThreadID(threadID); err != nil {
+		return "", err
+	}
+	return filepath.Join(f.dir, threadID+".jsonl"), nil
 }
 
 // checkpointRecord is the on-disk shape of a checkpoint line: the Checkpoint
@@ -74,6 +79,9 @@ type blobRecord struct {
 func (f *File) Save(_ context.Context, cp *Checkpoint) error {
 	if cp == nil || cp.ThreadID == "" {
 		return fmt.Errorf("checkpoint: Save requires a non-nil checkpoint with ThreadID")
+	}
+	if err := core.CheckThreadID(cp.ThreadID); err != nil {
+		return err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -108,7 +116,11 @@ func (f *File) Save(_ context.Context, cp *Checkpoint) error {
 		return fmt.Errorf("checkpoint: marshal: %w", err)
 	}
 
-	fh, err := os.OpenFile(f.path(cp.ThreadID), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	fp, err := f.path(cp.ThreadID)
+	if err != nil {
+		return err
+	}
+	fh, err := os.OpenFile(fp, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}
@@ -143,7 +155,11 @@ func (f *File) knownHashes(threadID string) (map[string]bool, error) {
 // scan reads the thread file once: checkpoints in order (without snapshots
 // attached yet) and the blob dictionary. Missing file yields empty results.
 func (f *File) scan(threadID string) ([]*checkpointRecord, map[string][]byte, error) {
-	fh, err := os.Open(f.path(threadID))
+	fp, err := f.path(threadID)
+	if err != nil {
+		return nil, nil, err
+	}
+	fh, err := os.Open(fp)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, map[string][]byte{}, nil
@@ -274,23 +290,6 @@ func (f *File) History(_ context.Context, threadID string) ([]*Checkpoint, error
 func hashOf(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
-}
-
-// safeName maps a thread id to a filesystem-safe base name.
-func safeName(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case r == '-' || r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
-			b.WriteRune(r)
-		default:
-			b.WriteByte('_')
-		}
-	}
-	if b.Len() == 0 {
-		return "thread"
-	}
-	return b.String()
 }
 
 var _ Checkpointer = (*File)(nil)

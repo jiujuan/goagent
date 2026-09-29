@@ -89,6 +89,12 @@ type RunOption func(*RunConfig)
 
 // OnThread runs on a specific thread, so state and checkpoints accumulate
 // across calls. Defaults to a fresh ephemeral thread.
+// OnThread runs on a specific thread, so state and checkpoints accumulate
+// across calls. Defaults to a fresh ephemeral thread. The id is used verbatim as
+// one file name in the File checkpointer and one directory name in a workspace's
+// artifact store, so it must be [A-Za-z0-9_-], 1..core.MaxThreadIDLen bytes
+// (ADR-0028): an id outside that set fails the run with core.CheckThreadID's
+// error instead of being rewritten into a name.
 func OnThread(id string) RunOption { return func(r *RunConfig) { r.ThreadID = id } }
 
 // WithMessage overrides the user message (e.g. multimodal content) instead of
@@ -123,7 +129,15 @@ func (a *Agent) Stream(ctx context.Context, input string, opts ...RunOption) *Ru
 	for _, o := range opts {
 		o(&rc)
 	}
-	state, err := a.restore(ctx, rc.ThreadID)
+	// An id that cannot name a file fails the run here, so the caller sees the
+	// contract instead of a store error from an arbitrary backend.
+	var state *core.State
+	var err error
+	if err = core.CheckThreadID(rc.ThreadID); err == nil {
+		state, err = a.restore(ctx, rc.ThreadID)
+	} else {
+		state = &core.State{}
+	}
 	if rc.Files != nil {
 		state.Files = rc.Files
 	} else if state.Files == nil {

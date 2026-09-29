@@ -63,54 +63,50 @@ func TestFileMixedThreadFileServesOnlyItsOwnThread(t *testing.T) {
 	}
 }
 
-// The same guarantee for a store produced by Save itself: two distinct ids whose
-// sanitized file names collide (the pre-ADR-0028 folding) still resume
-// independently instead of continuing each other's conversation.
-func TestFileFoldedIdsKeepSeparateHistories(t *testing.T) {
+// An id that cannot name a file is refused on write and on read (ADR-0028): it
+// is no longer rewritten into a shareable name, and it cannot point outside the
+// store directory either.
+func TestFileRejectsUnsafeThreadIDs(t *testing.T) {
 	dir := t.TempDir()
-	w, err := checkpoint.NewFile(dir)
+	f, err := checkpoint.NewFile(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
 
-	slashed := &checkpoint.Checkpoint{ID: "c1", ThreadID: "tenant/a", Step: 1, State: note("conversation A")}
-	under := &checkpoint.Checkpoint{ID: "c2", ThreadID: "tenant_a", Step: 1, State: note("conversation B")}
-	for _, cp := range []*checkpoint.Checkpoint{slashed, under} {
-		if err := w.Save(ctx, cp); err != nil {
-			t.Fatal(err)
+	for _, bad := range []string{"tenant/a", `x\y`, "weird id:1", "..", "", "sess/1"} {
+		cp := &checkpoint.Checkpoint{ID: "c1", ThreadID: bad, Step: 1, State: note("x")}
+		if err := f.Save(ctx, cp); err == nil {
+			t.Errorf("Save(%q) succeeded, want rejection", bad)
+		}
+		if _, err := f.Latest(ctx, bad); err == nil {
+			t.Errorf("Latest(%q) succeeded, want rejection", bad)
+		}
+		if _, err := f.History(ctx, bad); err == nil {
+			t.Errorf("History(%q) succeeded, want rejection", bad)
 		}
 	}
-	// Both ids share one file today: the sanitizer maps them to the same name.
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var files []string
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".jsonl") {
-			files = append(files, e.Name())
-		}
-	}
-	if len(files) != 1 || files[0] != "tenant_a.jsonl" {
-		t.Fatalf("thread files = %v, want the folded tenant_a.jsonl", files)
+	if len(entries) != 0 {
+		t.Errorf("rejected writes left files behind: %v", entries)
 	}
 
-	r, err := checkpoint.NewFile(dir)
+	// A legal id is unaffected, and its file is named after the id verbatim.
+	if err := f.Save(ctx, &checkpoint.Checkpoint{ID: "c2", ThreadID: "tenant_a", Step: 1, State: note("ok")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "tenant_a.jsonl")); err != nil {
+		t.Fatalf("thread file not named after the id: %v", err)
+	}
+	cp, err := f.Latest(ctx, "tenant_a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for id, want := range map[string]string{"tenant/a": "c1", "tenant_a": "c2"} {
-		cp, err := r.Latest(ctx, id)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if cp == nil || cp.ID != want {
-			t.Fatalf("Latest(%q) = %+v, want checkpoint %s", id, cp, want)
-		}
-		if got := cp.State.Messages[0].Text(); !strings.Contains(got, "conversation") {
-			t.Fatalf("Latest(%q) lost its own message: %q", id, got)
-		}
+	if cp.ID != "c2" {
+		t.Fatalf("Latest = %+v, want c2", cp)
 	}
 }
 
