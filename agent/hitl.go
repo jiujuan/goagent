@@ -51,6 +51,10 @@ func (r *Run) Resume(ctx context.Context) (*Run, error) {
 // approved calls execute, rejected (or undecided) calls become error
 // ToolResults reported to the model.
 //
+// It is also how a failed run is recovered: the loop checkpoints the last
+// replayable seam when a model call or a gate errors, so resuming continues the
+// conversation where it stopped instead of rewinding to the last completed step.
+//
 // The approved batch does not execute here: it is handed to the resumed run's
 // loop (RunContext.resumed, runResumed below), so an approved call goes through
 // exactly the path a call executed inside a step goes through — ToolStarted /

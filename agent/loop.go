@@ -137,7 +137,7 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 			Tools:     l.tools,
 		})
 		if err != nil {
-			return runOutcome{Err: err}
+			return l.fail(rc, -1, history, err)
 		}
 		system = s
 	}
@@ -152,7 +152,7 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 			lc.History = history
 		}
 		if d, err := l.mw.BeforeModel(lc); err != nil {
-			return runOutcome{Err: err}
+			return l.fail(rc, step, history, err)
 		} else if out, stop := terminalFromDirective(d, core.Message{}); stop {
 			return out
 		}
@@ -166,7 +166,7 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		req.Options.Apply(l.modelOpts...)
 		lc.Request = req
 		if err := l.mw.ModifyRequest(lc, req); err != nil {
-			return runOutcome{Err: err}
+			return l.fail(rc, step, history, err)
 		}
 
 		// Derive the context for this model call. An observability middleware
@@ -177,12 +177,12 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 
 		finalResp, ok, err := l.streamModel(genCtx, rc, lc, req)
 		if !ok {
-			return runOutcome{Err: err}
+			return l.fail(rc, step, history, err)
 		}
 		final := finalResp.Message
 
 		if d, err := l.mw.AfterModel(lc, finalResp); err != nil {
-			return runOutcome{Err: err}
+			return l.fail(rc, step, history, err)
 		} else if out, stop := terminalFromDirective(d, final); stop {
 			return out
 		}
@@ -217,7 +217,7 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		for i := range calls {
 			d, err := l.mw.BeforeTool(lc, &calls[i])
 			if err != nil {
-				return runOutcome{Err: err}
+				return l.fail(rc, step, history, err)
 			}
 			switch d.Kind {
 			case core.Interrupt:
@@ -250,7 +250,9 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		}
 	}
 
-	return runOutcome{Err: ErrMaxTurnsExceeded}
+	// The budget ran out mid-conversation: the seam is still worth keeping, so
+	// Resume can continue the thread with a larger budget instead of rewinding.
+	return l.fail(rc, l.maxTurns-1, history, ErrMaxTurnsExceeded)
 }
 
 // terminalFromDirective turns a Before/AfterModel directive into a terminal
@@ -301,6 +303,41 @@ func (l *AgentLoop) checkpoint(rc *RunContext, step int, pending *checkpoint.Pen
 		State:    *rc.State,
 		Pending:  pending,
 	})
+}
+
+// fail ends the run on an error, first persisting the conversation up to the last
+// point a provider would accept. Without that, the thread's newest snapshot is
+// whichever step last succeeded, so a provider failure silently rewinds the run —
+// losing this step's steering and any approved HITL batch — and Resume replays from
+// there. step < 0 means nothing changed during this run, so nothing is written.
+//
+// The RunFailed event deliberately stays unchanged: the snapshot belongs to the
+// checkpointer, recovery is a call to Agent.Resume(thread), and the error on the
+// wire remains a single value.
+func (l *AgentLoop) fail(rc *RunContext, step int, history []core.Message, err error) runOutcome {
+	if err == nil {
+		return runOutcome{}
+	}
+	if step >= 0 {
+		rc.State.Messages = seam(history)
+		l.checkpoint(rc, step, nil)
+	}
+	return runOutcome{Err: err}
+}
+
+// seam trims a conversation to its last replayable point: a trailing assistant
+// message whose tool calls were never answered is dropped, because handing the
+// provider a tool call with no matching result is invalid input. A partial reply
+// lost this way is recovered by re-asking, not patched.
+func seam(history []core.Message) []core.Message {
+	if len(history) == 0 {
+		return history
+	}
+	last := history[len(history)-1]
+	if last.Role == core.RoleAssistant && len(last.ToolCalls()) > 0 {
+		return history[:len(history)-1]
+	}
+	return history
 }
 
 func pendingFrom(calls []core.ToolCall) []core.ApprovalRequest {
