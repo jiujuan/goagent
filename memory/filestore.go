@@ -41,6 +41,7 @@ type FileStore struct {
 // tombstone (ID + Op) for a deletion.
 type record struct {
 	ID        string         `json:"id"`
+	Key       string         `json:"key,omitempty"`
 	Op        string         `json:"op,omitempty"`
 	Content   string         `json:"content,omitempty"`
 	Metadata  map[string]any `json:"metadata,omitempty"`
@@ -95,16 +96,16 @@ func (s *FileStore) load() error {
 }
 
 // replay folds one record into the in-memory index. Records are appended, never
-// merged, so Add keeps its plain append semantics.
+// merged, so Add keeps its plain append semantics. A record written before
+// content keys existed gets its key derived here, so later Upserts still see it
+// as the fact it is.
 func (s *FileStore) replay(r record) {
 	if r.Op == opDelete {
 		s.drop(r.ID)
 		return
 	}
-	s.docs = append(s.docs, storedDoc{
-		doc: Document{ID: r.ID, Content: r.Content, Metadata: r.Metadata},
-		vec: r.Embedding,
-	})
+	d := ensureKey(Document{ID: r.ID, Key: r.Key, Content: r.Content, Metadata: r.Metadata})
+	s.docs = append(s.docs, storedDoc{doc: d, vec: r.Embedding, key: d.Key})
 }
 
 // drop removes every document with the given ID (no-op if absent).
@@ -142,9 +143,9 @@ func (s *FileStore) Add(ctx context.Context, docs ...Document) error {
 	var buf bytes.Buffer
 	assigned := make([]Document, len(docs))
 	for i, d := range docs {
-		d = ensureID(d)
+		d = ensureKey(ensureID(d))
 		assigned[i] = d
-		line, err := json.Marshal(record{ID: d.ID, Content: d.Content, Metadata: d.Metadata, Embedding: vecs[i]})
+		line, err := json.Marshal(record{ID: d.ID, Key: d.Key, Content: d.Content, Metadata: d.Metadata, Embedding: vecs[i]})
 		if err != nil {
 			return fmt.Errorf("memory: marshal record: %w", err)
 		}
@@ -159,10 +160,26 @@ func (s *FileStore) Add(ctx context.Context, docs ...Document) error {
 		return err
 	}
 	for i, d := range assigned {
-		s.docs = append(s.docs, storedDoc{doc: d, vec: vecs[i]})
+		s.docs = append(s.docs, storedDoc{doc: d, vec: vecs[i], key: d.Key})
 	}
 	s.rows += len(assigned)
 	return nil
+}
+
+// Upsert implements Upsertable: documents whose key is already stored are
+// skipped, so replaying a run's facts does not duplicate them. Skipped
+// documents are not embedded, which keeps the cost proportional to what is new.
+func (s *FileStore) Upsert(ctx context.Context, docs ...Document) (int, error) {
+	s.mu.RLock()
+	fresh := unseen(s.docs, docs)
+	s.mu.RUnlock()
+	if len(fresh) == 0 {
+		return 0, nil
+	}
+	if err := s.Add(ctx, fresh...); err != nil {
+		return 0, err
+	}
+	return len(fresh), nil
 }
 
 // Delete implements Mutable: appends a tombstone for each stored id and drops
@@ -313,6 +330,7 @@ func (s *FileStore) Len() int {
 }
 
 var (
-	_ Store   = (*FileStore)(nil)
-	_ Mutable = (*FileStore)(nil)
+	_ Store      = (*FileStore)(nil)
+	_ Mutable    = (*FileStore)(nil)
+	_ Upsertable = (*FileStore)(nil)
 )

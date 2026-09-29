@@ -16,6 +16,10 @@ type Entry struct {
 	Desc string
 	Type string
 	Body string
+	// Hash identifies Body's content (memory.ContentKey, so a fact stored as
+	// text and the same fact stored semantically share one key). Read and Index
+	// fill it; Save ignores it.
+	Hash string
 }
 
 // Store persists text-memory entries. Implementations may be file-backed or

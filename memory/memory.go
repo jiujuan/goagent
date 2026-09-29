@@ -8,13 +8,20 @@ package memory
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"strings"
 
 	"github.com/jiujuan/goagent/core"
 )
 
 // Document is a unit of retrievable knowledge.
 type Document struct {
-	ID       string         `json:"id"`
+	ID string `json:"id"`
+	// Key is the fact's identity, used by Upsertable to decide whether an equal
+	// document is already stored. Empty means "derive it from Content" (see
+	// ContentKey). Unlike the random ID, it is stable across runs.
+	Key      string         `json:"key,omitempty"`
 	Content  string         `json:"content"`
 	Metadata map[string]any `json:"metadata,omitempty"`
 	// Score is the similarity to the query, set on retrieval (higher = closer).
@@ -49,6 +56,31 @@ type Mutable interface {
 	NeedsCompaction() bool
 }
 
+// Upsertable is an optional capability of a Store that writes a fact only when
+// that fact is not already stored. Where Add appends unconditionally, Upsert is
+// idempotent: replaying the same documents changes nothing. Probed with a type
+// assertion, so the Store contract stays minimal:
+//
+//	if u, ok := store.(memory.Upsertable); ok {
+//	    n, err := u.Upsert(ctx, docs...)
+//	}
+type Upsertable interface {
+	// Upsert writes the documents whose Key (or content-derived key) is not yet
+	// stored and returns how many were written. The check and the write are not
+	// atomic (embedding happens outside the store lock), so two concurrent
+	// Upserts of the same unseen fact may both write.
+	Upsert(ctx context.Context, docs ...Document) (int, error)
+}
+
+// ContentKey returns the stable identity of a fact: its content lower-cased and
+// whitespace-normalized, then hashed. Two runs that extract the same sentence
+// get the same key, which is what lets Upsert deduplicate across runs.
+func ContentKey(content string) string {
+	norm := strings.ToLower(strings.Join(strings.Fields(content), " "))
+	sum := sha256.Sum256([]byte(norm))
+	return hex.EncodeToString(sum[:8])
+}
+
 // Doc is a convenience constructor for a Document with just content.
 func Doc(content string) Document { return Document{Content: content} }
 
@@ -61,6 +93,15 @@ func DocWithMeta(content string, meta map[string]any) Document {
 func ensureID(d Document) Document {
 	if d.ID == "" {
 		d.ID = core.NewID("doc")
+	}
+	return d
+}
+
+// ensureKey derives the content key when the document lacks one, so records
+// written by Add are still recognized by a later Upsert.
+func ensureKey(d Document) Document {
+	if d.Key == "" {
+		d.Key = ContentKey(d.Content)
 	}
 	return d
 }

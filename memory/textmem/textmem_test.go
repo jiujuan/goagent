@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/jiujuan/goagent/core"
+	"github.com/jiujuan/goagent/memory"
 	"github.com/jiujuan/goagent/prompt"
 	"github.com/jiujuan/goagent/tool"
 )
@@ -45,6 +46,36 @@ func TestSaveReadIndexRoundTrip(t *testing.T) {
 	}
 	if idx[0].Body != "" {
 		t.Errorf("index entries must omit body, got %q", idx[0].Body)
+	}
+}
+
+// Index and Read stamp the body's content key, so callers can tell whether a
+// fact is already curated without reading every file again.
+func TestEntryHash(t *testing.T) {
+	ctx := context.Background()
+	store, _ := File(t.TempDir())
+	_ = store.Save(ctx, Entry{Name: "tone", Desc: "简洁中文", Body: "回复用简洁中文。"})
+
+	got, err := store.Read(ctx, "tone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Hash != memory.ContentKey("回复用简洁中文。") {
+		t.Errorf("read hash = %q, want the body's content key", got.Hash)
+	}
+
+	idx, _ := store.Index(ctx)
+	if len(idx) != 1 || idx[0].Hash != got.Hash {
+		t.Fatalf("index hash mismatch: %+v", idx)
+	}
+	if idx[0].Body != "" {
+		t.Errorf("index must still omit body, got %q", idx[0].Body)
+	}
+
+	_ = store.Save(ctx, Entry{Name: "tone", Desc: "简洁中文", Body: "回复用英文。"})
+	changed, _ := store.Read(ctx, "tone")
+	if changed.Hash == got.Hash {
+		t.Error("hash did not change with the body")
 	}
 }
 

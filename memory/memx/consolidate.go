@@ -7,8 +7,6 @@ package memx
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -41,9 +39,12 @@ type item struct {
 
 // Consolidate reads a run's transcript, asks the model to extract durable facts,
 // and writes them to the text and/or semantic stores (either may be nil to skip
-// that target). Facts are de-duplicated by content hash before writing. Call it
-// at the end of a run (e.g. after Run/Wait returns) with the run's messages. See
-// ADR 0019.
+// that target). It is idempotent per fact: a fact whose content hash already
+// exists in the target store is not written again, while a known name carrying
+// new content replaces its entry (the update path for a changed preference).
+// Semantic writes go through memory.Upsertable when the store offers it, and
+// fall back to plain Add otherwise. Call it at the end of a run (e.g. after
+// Run/Wait returns) with the run's messages. See ADR 0019.
 func Consolidate(ctx context.Context, model llm.Model, messages []core.Message, text textmem.Store, sem memory.Store) error {
 	transcript := renderTranscript(messages)
 	if strings.TrimSpace(transcript) == "" {
@@ -64,36 +65,86 @@ func Consolidate(ctx context.Context, model llm.Model, messages []core.Message, 
 		return fmt.Errorf("memx: parse consolidation output: %w", err)
 	}
 
+	// What is already curated, so a fact extracted again is not written again.
+	txt, err := loadTextIndex(ctx, text)
+	if err != nil {
+		return err
+	}
+
+	var semDocs []memory.Document
 	seen := map[string]bool{}
 	for _, it := range items {
 		content := strings.TrimSpace(it.Content)
 		if content == "" {
 			continue
 		}
-		h := contentHash(content)
-		if seen[h] {
-			continue // intra-batch dedup
+		key := memory.ContentKey(content)
+		if seen[key] {
+			continue // the same fact proposed twice in one batch
 		}
-		seen[h] = true
+		seen[key] = true
 
 		switch it.Target {
 		case "text":
 			if text == nil || it.Name == "" {
 				continue
 			}
+			if txt.byHash[key] {
+				continue // already stored, possibly under another name
+			}
+			if h, ok := txt.byName[it.Name]; ok && h == key {
+				continue // same name, same content
+			}
+			// New name, or the same name with different content: Save replaces
+			// the file, which is how a changed preference retires the old one.
 			if err := text.Save(ctx, textmem.Entry{Name: it.Name, Desc: it.Desc, Type: it.Type, Body: content}); err != nil {
 				return fmt.Errorf("memx: save text memory: %w", err)
 			}
+			txt.byName[it.Name] = key
+			txt.byHash[key] = true
 		case "semantic":
 			if sem == nil {
 				continue
 			}
-			if err := sem.Add(ctx, memory.Doc(content)); err != nil {
+			semDocs = append(semDocs, memory.Doc(content))
+		}
+	}
+
+	if len(semDocs) > 0 {
+		if u, ok := sem.(memory.Upsertable); ok {
+			if _, err := u.Upsert(ctx, semDocs...); err != nil {
 				return fmt.Errorf("memx: add semantic memory: %w", err)
 			}
+			return nil
+		}
+		if err := sem.Add(ctx, semDocs...); err != nil {
+			return fmt.Errorf("memx: add semantic memory: %w", err)
 		}
 	}
 	return nil
+}
+
+// textIndex is the already-curated side of text memory, keyed both by name and
+// by content hash.
+type textIndex struct {
+	byName map[string]string
+	byHash map[string]bool
+}
+
+func loadTextIndex(ctx context.Context, st textmem.Store) (textIndex, error) {
+	idx := textIndex{byName: map[string]string{}, byHash: map[string]bool{}}
+	if st == nil {
+		return idx, nil
+	}
+	entries, err := st.Index(ctx)
+	if err != nil {
+		return idx, fmt.Errorf("memx: read text memory index: %w", err)
+	}
+	for _, e := range entries {
+		idx.byName[e.Name] = e.Hash
+		idx.byHash[e.Hash] = true
+	}
+	return idx, nil
 }
 
 // renderTranscript flattens messages into a "role: text" transcript.
@@ -142,10 +193,4 @@ func parseItems(out string) ([]item, error) {
 		return nil, err
 	}
 	return items, nil
-}
-
-// contentHash returns a stable hash of normalized content for dedup.
-func contentHash(s string) string {
-	sum := sha256.Sum256([]byte(strings.ToLower(strings.Join(strings.Fields(s), " "))))
-	return hex.EncodeToString(sum[:8])
 }

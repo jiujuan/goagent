@@ -23,6 +23,7 @@ type InMemoryStore struct {
 type storedDoc struct {
 	doc Document
 	vec []float32
+	key string
 }
 
 // InMemory builds an in-memory vector store backed by the given embedder.
@@ -50,9 +51,49 @@ func (s *InMemoryStore) Add(ctx context.Context, docs ...Document) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i, d := range docs {
-		s.docs = append(s.docs, storedDoc{doc: ensureID(d), vec: vecs[i]})
+		d = ensureKey(ensureID(d))
+		s.docs = append(s.docs, storedDoc{doc: d, vec: vecs[i], key: d.Key})
 	}
 	return nil
+}
+
+// Upsert implements Upsertable: documents whose key is already stored are
+// skipped, so only the unseen ones are embedded and added.
+func (s *InMemoryStore) Upsert(ctx context.Context, docs ...Document) (int, error) {
+	s.mu.RLock()
+	fresh := unseen(s.docs, docs)
+	s.mu.RUnlock()
+	if len(fresh) == 0 {
+		return 0, nil
+	}
+	if err := s.Add(ctx, fresh...); err != nil {
+		return 0, err
+	}
+	return len(fresh), nil
+}
+
+// unseen filters out documents whose content key is already stored in idx or
+// already taken by an earlier document of this batch, preserving order. Shared
+// by the two stores, which both index their corpus as []storedDoc; callers hold
+// whatever lock guards idx.
+func unseen(idx []storedDoc, docs []Document) []Document {
+	have := make(map[string]bool, len(idx)+len(docs))
+	for _, sd := range idx {
+		have[sd.key] = true
+	}
+	var fresh []Document
+	for _, d := range docs {
+		key := d.Key
+		if key == "" {
+			key = ContentKey(d.Content)
+		}
+		if have[key] {
+			continue
+		}
+		have[key] = true
+		fresh = append(fresh, d)
+	}
+	return fresh
 }
 
 // Search implements Store.
@@ -145,6 +186,7 @@ func cosine(a, b []float32) float64 {
 }
 
 var (
-	_ Store   = (*InMemoryStore)(nil)
-	_ Mutable = (*InMemoryStore)(nil)
+	_ Store      = (*InMemoryStore)(nil)
+	_ Mutable    = (*InMemoryStore)(nil)
+	_ Upsertable = (*InMemoryStore)(nil)
 )

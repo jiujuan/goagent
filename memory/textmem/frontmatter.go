@@ -1,14 +1,25 @@
 package textmem
 
-import "strings"
+import (
+	"strings"
 
-// decode parses a memory file into an Entry. The frontmatter is a leading
+	"github.com/jiujuan/goagent/memory"
+)
+
+// decode parses a memory file into an Entry and stamps Body's content hash.
+func decode(fallbackName string, src []byte) Entry {
+	e := parse(fallbackName, src)
+	e.Hash = memory.ContentKey(e.Body)
+	return e
+}
+
+// parse reads the frontmatter itself. The frontmatter is a leading
 // "---" block of "key: value" scalar lines (only name/description/type are
 // read); everything after the closing fence is the Body. A file without
 // frontmatter is treated as a bare body with the given fallback name. This is a
 // minimal parser (cf. skill.splitFrontmatter, which is unexported and supports
 // lists we do not need here).
-func decode(fallbackName string, src []byte) Entry {
+func parse(fallbackName string, src []byte) Entry {
 	text := strings.ReplaceAll(string(src), "\r\n", "\n")
 
 	e := Entry{Name: fallbackName}
