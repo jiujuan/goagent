@@ -84,6 +84,15 @@ type PlanNodeDone struct {
 	Err    error
 }
 
+// StuckDetected is emitted by the loop-guard middleware when it spots a
+// repetition pattern. Rule is "repeat_call" | "error_streak"; Reason explains
+// the concrete hit, Step is the loop step that triggered it.
+type StuckDetected struct {
+	Rule   string
+	Reason string
+	Step   int
+}
+
 // --- Marker -----------------------------------------------------------------
 
 func (RunStarted) isEvent()      {}
@@ -100,6 +109,7 @@ func (Interrupted) isEvent()     {}
 func (Progress) isEvent()        {}
 func (PlanNodeStarted) isEvent() {}
 func (PlanNodeDone) isEvent()    {}
+func (StuckDetected) isEvent()   {}
 
 // --- Payload types ----------------------------------------------------------
 
