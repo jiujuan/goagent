@@ -23,6 +23,25 @@ type FileStore interface {
 	List(prefix string) ([]string, error)
 }
 
+// Snapshottable is an optional FileStore capability (ADR-0026): the backend can
+// export its full contents as a portable path→bytes map, so a durable
+// checkpointer can persist the file state alongside the rest of State. Files is
+// excluded from State's own JSON (it is a pluggable handle); the File
+// checkpointer instead stores snapshots as content-addressed blob records. A
+// backend that cannot export itself (a real directory, a remote store) omits
+// this interface and is treated as externally managed: the caller re-supplies
+// it via agent.WithRunFiles on resume.
+type Snapshottable interface {
+	Snapshot() map[string][]byte
+}
+
+// Restorable is the counterpart of Snapshottable: the backend can replace its
+// contents from a map produced by Snapshot. The agent layer uses it to rebuild
+// a restored run's file state.
+type Restorable interface {
+	Restore(files map[string][]byte) error
+}
+
 // Todo is one planning item backing the write_todos tool (deepagents-style
 // planning that keeps a long-horizon agent focused).
 type Todo struct {
