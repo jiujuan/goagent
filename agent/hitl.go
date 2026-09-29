@@ -70,6 +70,7 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		return nil, fmt.Errorf("agent: no checkpoint to resume for thread %q", threadID)
 	}
 	state := cloneState(cp.State)
+	applyFileSnapshot(&state, cp.FileSnapshot)
 	if state.Files == nil {
 		state.Files = vfs.NewInState()
 	}

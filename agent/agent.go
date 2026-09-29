@@ -95,7 +95,13 @@ func OnThread(id string) RunOption { return func(r *RunConfig) { r.ThreadID = id
 // the plain string passed to Run/Stream.
 func WithMessage(m core.Message) RunOption { return func(r *RunConfig) { r.Message = m } }
 
-// WithRunFiles supplies a virtual filesystem backend for this run.
+// WithRunFiles supplies a virtual filesystem backend for this run. It takes
+// precedence over anything restored from the thread's checkpoint. Durability:
+// a backend implementing core.Snapshottable (like vfs.InState) is persisted by
+// the File checkpointer and rehydrated on resume automatically; a backend that
+// does not (a real directory, a remote store) is externally managed — the
+// process resuming the thread must pass an equivalent backend again here
+// (ADR-0026).
 func WithRunFiles(f core.FileStore) RunOption { return func(r *RunConfig) { r.Files = f } }
 
 // Run drives the agent loop to completion and returns the final answer text. It
@@ -139,7 +145,26 @@ func (a *Agent) restore(ctx context.Context, threadID string) (*core.State, erro
 		return &core.State{}, nil
 	}
 	st := cloneState(cp.State)
+	applyFileSnapshot(&st, cp.FileSnapshot)
 	return &st, nil
+}
+
+// applyFileSnapshot rehydrates a restored State's virtual filesystem from a
+// checkpoint's persisted file snapshot (ADR-0026): the File checkpointer stored
+// the contents of any core.Snapshottable backend as content-addressed blobs and
+// served them back on Checkpoint.FileSnapshot. A nil snapshot (nothing ever
+// written, an externally managed backend, or an in-memory checkpointer whose
+// live handle already travelled with the state) leaves Files untouched for the
+// caller's fallback rules.
+func applyFileSnapshot(st *core.State, snap map[string][]byte) {
+	if st == nil || st.Files != nil || snap == nil {
+		return
+	}
+	fs := vfs.NewInState()
+	if err := fs.Restore(snap); err != nil {
+		return
+	}
+	st.Files = fs
 }
 
 // newRunHandle builds the per-run execution environment (RunContext) and its
