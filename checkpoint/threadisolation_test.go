@@ -144,3 +144,26 @@ func TestFileUnfoldedThreadUnaffected(t *testing.T) {
 		t.Fatalf("Latest = %s/%d, want c3/2", latest.ID, latest.Step)
 	}
 }
+
+// Foreign records are dropped before their file snapshots are rehydrated, so a
+// record belonging to another thread cannot fail this thread's read by pointing
+// at a blob that is not in the file.
+func TestFileForeignBrokenRecordDoesNotBreakOwnRead(t *testing.T) {
+	dir := t.TempDir()
+	own := line(t, &checkpoint.Checkpoint{ID: "c-own", ThreadID: "sess_1", Step: 1, State: note("conversation B")})
+	broken := `{"id":"c-broken","thread_id":"sess/1","step":1,"state":{},"files":{"gone.md":"deadbeefdeadbeef"}}`
+	if err := os.WriteFile(filepath.Join(dir, "sess_1.jsonl"), []byte(broken+"\n"+own+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := checkpoint.NewFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp, err := f.Latest(context.Background(), "sess_1")
+	if err != nil {
+		t.Fatalf("another thread's damaged record broke this read: %v", err)
+	}
+	if cp.ID != "c-own" {
+		t.Fatalf("Latest = %s, want c-own", cp.ID)
+	}
+}
