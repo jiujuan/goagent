@@ -102,24 +102,36 @@ type BudgetExceeded struct {
 	Step     int
 }
 
+// HistoryCompacted is emitted when the Compaction middleware rewrites the
+// conversation history itself (persist mode): Dropped leading messages are
+// replaced by one summary note, Kept trailing messages survive verbatim, and
+// EstTokens is the calibrated estimate of the history size that triggered it.
+type HistoryCompacted struct {
+	Dropped   int
+	Kept      int
+	EstTokens int
+	Step      int
+}
+
 // --- Marker -----------------------------------------------------------------
 
-func (RunStarted) isEvent()      {}
-func (RunDone) isEvent()         {}
-func (RunFailed) isEvent()       {}
-func (TurnStarted) isEvent()     {}
-func (TurnDone) isEvent()        {}
-func (MessageDelta) isEvent()    {}
-func (MessageDone) isEvent()     {}
-func (ToolStarted) isEvent()     {}
-func (ToolUpdate) isEvent()      {}
-func (ToolDone) isEvent()        {}
-func (Interrupted) isEvent()     {}
-func (Progress) isEvent()        {}
-func (PlanNodeStarted) isEvent() {}
-func (PlanNodeDone) isEvent()    {}
-func (StuckDetected) isEvent()   {}
-func (BudgetExceeded) isEvent()  {}
+func (RunStarted) isEvent()       {}
+func (RunDone) isEvent()          {}
+func (RunFailed) isEvent()        {}
+func (TurnStarted) isEvent()      {}
+func (TurnDone) isEvent()         {}
+func (MessageDelta) isEvent()     {}
+func (MessageDone) isEvent()      {}
+func (ToolStarted) isEvent()      {}
+func (ToolUpdate) isEvent()       {}
+func (ToolDone) isEvent()         {}
+func (Interrupted) isEvent()      {}
+func (Progress) isEvent()         {}
+func (PlanNodeStarted) isEvent()  {}
+func (PlanNodeDone) isEvent()     {}
+func (StuckDetected) isEvent()    {}
+func (BudgetExceeded) isEvent()   {}
+func (HistoryCompacted) isEvent() {}
 
 // --- Payload types ----------------------------------------------------------
 

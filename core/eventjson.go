@@ -30,6 +30,9 @@ type eventWire struct {
 	CallID   string            `json:"call_id,omitempty"`
 	Rule     string            `json:"rule,omitempty"`
 	Reason   string            `json:"reason,omitempty"`
+	Dropped  int               `json:"dropped,omitempty"`
+	Kept     int               `json:"kept,omitempty"`
+	EstTok   int               `json:"est_tokens,omitempty"`
 }
 
 // MarshalEvent encodes an Event to tagged JSON.
@@ -81,6 +84,8 @@ func MarshalEvent(ev Event) ([]byte, error) {
 		w.Type, w.Rule, w.Reason, w.Step = "stuck_detected", e.Rule, e.Reason, e.Step
 	case BudgetExceeded:
 		w.Type, w.Reason, w.Step = "budget_exceeded", e.Resource, e.Step
+	case HistoryCompacted:
+		w.Type, w.Dropped, w.Kept, w.EstTok, w.Step = "history_compacted", e.Dropped, e.Kept, e.EstTokens, e.Step
 	default:
 		return nil, fmt.Errorf("core: cannot marshal event of type %T", ev)
 	}
@@ -130,6 +135,8 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		return StuckDetected{Rule: w.Rule, Reason: w.Reason, Step: w.Step}, nil
 	case "budget_exceeded":
 		return BudgetExceeded{Resource: w.Reason, Step: w.Step}, nil
+	case "history_compacted":
+		return HistoryCompacted{Dropped: w.Dropped, Kept: w.Kept, EstTokens: w.EstTok, Step: w.Step}, nil
 	default:
 		return nil, fmt.Errorf("core: unknown event type %q", w.Type)
 	}

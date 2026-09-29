@@ -33,3 +33,19 @@ func TestBudgetExceededEventRoundTrip(t *testing.T) {
 		t.Fatalf("round trip = %#v, want %#v", out, in)
 	}
 }
+
+func TestHistoryCompactedEventRoundTrip(t *testing.T) {
+	in := HistoryCompacted{Dropped: 8, Kept: 6, EstTokens: 8100, Step: 4}
+	data, err := MarshalEvent(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := out.(HistoryCompacted)
+	if !ok || got != in {
+		t.Fatalf("round trip = %#v, want %#v", out, in)
+	}
+}
