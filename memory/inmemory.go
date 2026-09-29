@@ -81,6 +81,31 @@ func (s *InMemoryStore) Len() int {
 	return len(s.docs)
 }
 
+// Delete implements Mutable: drops every document with the given IDs, ignoring
+// unknown ones.
+func (s *InMemoryStore) Delete(_ context.Context, ids ...string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range ids {
+		kept := s.docs[:0]
+		for _, sd := range s.docs {
+			if sd.doc.ID == id {
+				continue
+			}
+			kept = append(kept, sd)
+		}
+		s.docs = kept
+	}
+	return nil
+}
+
+// Compact implements Mutable: nothing to reclaim, since the index is the only
+// storage.
+func (s *InMemoryStore) Compact(context.Context) error { return nil }
+
+// NeedsCompaction implements Mutable: always false.
+func (s *InMemoryStore) NeedsCompaction() bool { return false }
+
 // rank scores every stored doc against the query vector by cosine similarity,
 // sorts descending, and returns the top k (k<=0 defaults to 4). Shared by
 // InMemoryStore and FileStore, which both hold []storedDoc.
@@ -119,4 +144,7 @@ func cosine(a, b []float32) float64 {
 	return dot / (math.Sqrt(na) * math.Sqrt(nb))
 }
 
-var _ Store = (*InMemoryStore)(nil)
+var (
+	_ Store   = (*InMemoryStore)(nil)
+	_ Mutable = (*InMemoryStore)(nil)
+)

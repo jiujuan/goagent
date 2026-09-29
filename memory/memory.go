@@ -30,6 +30,25 @@ type Store interface {
 	Search(ctx context.Context, query string, k int) ([]Document, error)
 }
 
+// Mutable is an optional capability of a Store that can forget documents and
+// reclaim its storage. Callers probe it with a type assertion, so the core Store
+// contract stays minimal:
+//
+//	if m, ok := store.(memory.Mutable); ok {
+//	    _ = m.Delete(ctx, ids...)
+//	}
+type Mutable interface {
+	// Delete removes the documents with the given IDs (IDs unknown to the
+	// store are ignored). It is not a hard removal in every backend: a
+	// file-backed store records a tombstone and needs Compact to reclaim space.
+	Delete(ctx context.Context, ids ...string) error
+	// Compact reclaims storage for deleted or superseded records.
+	Compact(ctx context.Context) error
+	// NeedsCompaction reports whether deleted/superseded records have piled up
+	// enough that a Compact is worth doing. Backends never compact implicitly.
+	NeedsCompaction() bool
+}
+
 // Doc is a convenience constructor for a Document with just content.
 func Doc(content string) Document { return Document{Content: content} }
 
