@@ -208,7 +208,9 @@ func rebuild(cps []*checkpointRecord, blobs map[string][]byte) error {
 }
 
 // readAll returns the thread's checkpoints, oldest first, with file snapshots
-// rehydrated.
+// rehydrated. Records whose own ThreadID differs from the requested one are
+// left out: before ADR-0028 two distinct ids could be sanitized onto one file
+// name, so a pre-existing file may hold more threads' records than its own.
 func (f *File) readAll(threadID string) ([]*Checkpoint, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -216,7 +218,14 @@ func (f *File) readAll(threadID string) ([]*Checkpoint, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := rebuild(recs, blobs); err != nil {
+	own := make([]*checkpointRecord, 0, len(recs))
+	for _, r := range recs {
+		if r.ThreadID != threadID {
+			continue
+		}
+		own = append(own, r)
+	}
+	if err := rebuild(own, blobs); err != nil {
 		return nil, err
 	}
 	// A full read is a cheap chance to prime the dedup cache too.
@@ -227,8 +236,8 @@ func (f *File) readAll(threadID string) ([]*Checkpoint, error) {
 		}
 		f.known[threadID] = k
 	}
-	out := make([]*Checkpoint, 0, len(recs))
-	for _, r := range recs {
+	out := make([]*Checkpoint, 0, len(own))
+	for _, r := range own {
 		out = append(out, r.Checkpoint)
 	}
 	return out, nil
