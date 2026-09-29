@@ -219,6 +219,16 @@ go run ./examples/quickstart
 | `skills` | `go run ./examples/skills` | 技能三层渐进披露：发现技能、读取 `SKILL.md`/资源、在沙箱执行脚本。 |
 | `prompt` | `go run ./examples/prompt` | 用身份、环境、工具指导、状态等可组合 Section 构建系统提示。 |
 
+### 工作区（Workspace）
+
+| 示例 | 运行方式 | 展示内容 |
+| --- | --- | --- |
+| `workspace/anatomy` | `go run ./examples/workspace/anatomy` | 工作区装配全貌：根解析与约定目录、四段提示词、文件工具的包含性、只读 git 快照、沙箱工作目录与提示词同源。 |
+| `workspace/skills-gate` | `go run ./examples/workspace/skills-gate` | 技能侧接线：全局/工作区技能合并、Level-1 清单、`allowed-tools` 免审名单外的调用停在人工批准并批准后续跑。 |
+| `workspace/policies` | `go run ./examples/workspace/policies` | 三层权限边界：`os.Root` 路径包含性、沙箱命令白名单、`skills.Gate` 与 `middleware.Permission` 的折叠结果。 |
+
+三个示例都离线、无需密钥（`anatomy`/`policies` 不用模型，`skills-gate` 用 `llm/mock` 的确定性剧本）。真实模型的完整装配形态见 `examples/task-runner`。
+
 ### 中间件、HITL 与外部工具
 
 | 示例 | 运行方式 | 展示内容 |
