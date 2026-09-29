@@ -99,9 +99,12 @@ func WithMessage(m core.Message) RunOption { return func(r *RunConfig) { r.Messa
 // precedence over anything restored from the thread's checkpoint. Durability:
 // a backend implementing core.Snapshottable (like vfs.InState) is persisted by
 // the File checkpointer and rehydrated on resume automatically; a backend that
-// does not (a real directory, a remote store) is externally managed — the
-// process resuming the thread must pass an equivalent backend again here
-// (ADR-0026).
+// does not (a real directory like vfs.DirStore, a remote store) is externally
+// managed — the checkpoint carries none of its bytes, so resuming from the
+// checkpoint alone recovers nothing. Every process that continues such a thread
+// must pass an equivalent backend here again, and the files it points at are not
+// rolled back by time travel (ADR-0026, ADR-0027; pinned by the
+// TestDurableDirStore* cases in this package's tests).
 func WithRunFiles(f core.FileStore) RunOption { return func(r *RunConfig) { r.Files = f } }
 
 // Run drives the agent loop to completion and returns the final answer text. It

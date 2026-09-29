@@ -2,6 +2,8 @@ package agent_test
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -212,5 +214,119 @@ func TestDurableRunFilesOverridePrecedence(t *testing.T) {
 	}
 	if !strings.Contains(out, "read:MISSING") {
 		t.Fatalf("explicit WithRunFiles must override the snapshot: %q", out)
+	}
+}
+
+// stashModel calls stash once, then answers.
+func stashModel() llm.Model {
+	return mock.New("p1", func(req *llm.Request) *llm.Response {
+		if _, ok := mock.LastToolResult(req); ok {
+			return mock.Text("stored it")
+		}
+		return mock.CallTool("s1", "stash", `{"path":"note.txt","text":"secret"}`)
+	})
+}
+
+// processOneStashes runs the first process of a two-process scenario: it stashes
+// note.txt through the given file backend and checkpoints the thread into
+// ckptDir. The backend is the caller's to close.
+func processOneStashes(t *testing.T, ckptDir string, files core.FileStore) {
+	t.Helper()
+	store, err := checkpoint.NewFile(ckptDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := agent.New(agent.WithModel(stashModel()),
+		agent.WithTools(stashFile(), peekFile()), agent.WithCheckpointer(store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Run(context.Background(), "stash the note",
+		agent.OnThread("artifacts"), agent.WithRunFiles(files)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// processTwoPeeks runs the second process: a fresh Agent over the same
+// checkpoint directory, asked what was stashed. Pass files nil to resume without
+// re-attaching a backend.
+func processTwoPeeks(t *testing.T, ckptDir string, files core.FileStore) string {
+	t.Helper()
+	store, err := checkpoint.NewFile(ckptDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := agent.New(agent.WithModel(peekModel()),
+		agent.WithTools(stashFile(), peekFile()), agent.WithCheckpointer(store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var opts []agent.RunOption
+	if files != nil {
+		opts = append(opts, agent.WithRunFiles(files))
+	}
+	out, err := a.Run(context.Background(), "what was stashed?",
+		append([]agent.RunOption{agent.OnThread("artifacts")}, opts...)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestDurableDirStoreResumeAcrossInstances is ADR-0027's end-to-end contract:
+// the artifacts live on disk, not in the checkpoint, so a second process that
+// re-attaches a DirStore over the same directory reads what the first one wrote.
+func TestDurableDirStoreResumeAcrossInstances(t *testing.T) {
+	ckptDir := t.TempDir()
+	artifacts := filepath.Join(t.TempDir(), "thread-artifacts")
+
+	first, err := vfs.NewDirStore(artifacts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	processOneStashes(t, ckptDir, first)
+
+	// Nothing had to be unpacked from the checkpoint to get the file back: it is
+	// an ordinary file, openable by anything outside the framework.
+	if got, err := os.ReadFile(filepath.Join(artifacts, "note.txt")); err != nil {
+		t.Fatalf("artifact never reached the disk: %v", err)
+	} else if string(got) != "secret" {
+		t.Fatalf("artifact on disk = %q", got)
+	}
+
+	second, err := vfs.NewDirStore(artifacts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if out := processTwoPeeks(t, ckptDir, second); !strings.Contains(out, "read:secret") {
+		t.Fatalf("re-attached DirStore lost the artifacts: %q", out)
+	}
+}
+
+// TestDurableDirStoreForgetsHandleYieldsEmpty records the cost of external
+// management (ADR-0027): resuming the thread from the checkpoint alone gives an
+// empty file surface, because the checkpoint never carried the DirStore's bytes.
+// The framework cannot tell "this thread has no artifacts" from "the caller
+// forgot to re-attach the handle" — both look like an empty store, so the
+// requirement to re-attach is documented on agent.WithRunFiles instead.
+func TestDurableDirStoreForgetsHandleYieldsEmpty(t *testing.T) {
+	ckptDir := t.TempDir()
+	artifacts := filepath.Join(t.TempDir(), "thread-artifacts")
+
+	first, err := vfs.NewDirStore(artifacts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	processOneStashes(t, ckptDir, first)
+
+	// The file is still there, untouched by the resume that cannot see it.
+	if _, err := os.Stat(filepath.Join(artifacts, "note.txt")); err != nil {
+		t.Fatalf("artifact disappeared: %v", err)
+	}
+	if out := processTwoPeeks(t, ckptDir, nil); !strings.Contains(out, "read:MISSING") {
+		t.Fatalf("resuming without the handle should see an empty file surface: %q", out)
 	}
 }
