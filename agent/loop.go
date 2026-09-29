@@ -143,7 +143,7 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 	}
 
 	for step := 0; step < l.maxTurns; step++ {
-		lc := &LoopContext{RunContext: rc, Step: step, History: history}
+		lc := &LoopContext{RunContext: rc, Step: step, MaxTurns: l.maxTurns, History: history}
 		rc.publish(core.TurnStarted{Step: step})
 
 		// Phase 1 — PrepareTurn: drain steering, then BeforeModel.

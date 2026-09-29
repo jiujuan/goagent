@@ -13,9 +13,10 @@ import (
 type LoopContext struct {
 	*RunContext
 
-	Step    int
-	Request *llm.Request
-	History []core.Message
+	Step     int
+	MaxTurns int // the loop's step cap, for budget/wrap-up middleware to observe
+	Request  *llm.Request
+	History  []core.Message
 }
 
 // AddTool makes a tool callable for the rest of this run and advertises it on the

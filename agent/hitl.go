@@ -136,7 +136,7 @@ type resumeBatch struct {
 // events, its AfterTool hooks and its immediate state application; denied or
 // undecided calls never reach a handler.
 func (l *AgentLoop) runResumed(rc *RunContext, rb *resumeBatch) ([]core.Part, core.Directive) {
-	lc := &LoopContext{RunContext: rc, Step: rb.step, History: rc.State.Messages}
+	lc := &LoopContext{RunContext: rc, Step: rb.step, MaxTurns: l.maxTurns, History: rc.State.Messages}
 
 	approved := make([]core.ToolCall, 0, len(rb.calls))
 	for _, c := range rb.calls {
