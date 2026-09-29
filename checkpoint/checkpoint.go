@@ -25,6 +25,15 @@ type Checkpoint struct {
 	// Pending, when set, marks this as a human-in-the-loop pause point: the
 	// tool calls awaiting approval before the run can continue from here.
 	Pending *PendingHITL `json:"pending,omitempty"`
+
+	// FileSnapshot carries the run's file state, reconstructed at read time
+	// from the content-addressed blob records the File checkpointer persists
+	// (ADR-0026). It is deliberately not serialized inline here — State.Files
+	// stays json:"-" so each checkpoint line carries only a small path→hash
+	// index — and is the in-memory handoff the agent layer feeds into a
+	// core.Restorable backend. nil means the backend was not snapshottable
+	// (externally managed) or there was nothing to persist.
+	FileSnapshot map[string][]byte `json:"-"`
 }
 
 // PendingHITL captures the tool calls a run is blocked on at an interrupt.
