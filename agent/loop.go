@@ -87,6 +87,23 @@ func (l *AgentLoop) addTool(t tool.Tool) {
 func (l *AgentLoop) run(rc *RunContext) runOutcome {
 	history := append([]core.Message(nil), rc.State.Messages...)
 
+	// A resumed run carries the tool batch its HITL pause left behind. Execute it
+	// before consulting the model, so approved calls behave exactly like a batch
+	// run inside a step (events, AfterTool, state, directives). A directive from
+	// one of them ends the run there, as it would mid-step.
+	if rb := rc.resumed; rb != nil {
+		rc.resumed = nil
+		parts, d := l.runResumed(rc, rb)
+		if len(parts) > 0 {
+			history = append(history, core.Message{Role: core.RoleTool, Parts: parts})
+			rc.State.Messages = history
+			l.checkpoint(rc, rb.step, nil)
+		}
+		if d.Kind != core.Continue {
+			return runOutcome{Result: core.Result{Message: rb.final}, Control: d}
+		}
+	}
+
 	// Render the system prompt once per run: a prompt.Builder (if set) wins over
 	// the static instruction. The builder sees the tools, state and identity.
 	usePrompt := l.prompt != nil

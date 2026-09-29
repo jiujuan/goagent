@@ -10,8 +10,9 @@ import (
 
 // This file holds the human-in-the-loop pause/continue closure — the part of
 // the runtime that turns a BeforeTool Interrupt into a durable pause and back
-// into a continued run. Pausing itself lives in the loop (it writes a
-// PendingHITL checkpoint and emits Interrupted); resuming lives here.
+// into a continued run. Pausing lives in the loop (it writes a PendingHITL
+// checkpoint and emits Interrupted); resuming lives here, where the decisions
+// are recorded, and the calls they unlock run in the loop via runResumed.
 
 // Approval is a human decision about one pending tool call.
 type Approval struct {
@@ -48,7 +49,14 @@ func (r *Run) Resume(ctx context.Context) (*Run, error) {
 // Resume continues a thread from its latest checkpoint. If that checkpoint is a
 // HITL pause (has Pending tool calls), the given approvals are applied:
 // approved calls execute, rejected (or undecided) calls become error
-// ToolResults reported to the model. The continued loop then runs from there.
+// ToolResults reported to the model.
+//
+// The approved batch does not execute here: it is handed to the resumed run's
+// loop (RunContext.resumed, runResumed below), so an approved call goes through
+// exactly the path a call executed inside a step goes through — ToolStarted /
+// ToolDone events, AfterTool hooks, state mutations, and its Result Control
+// folded into the run's control flow. Running it here instead would give one
+// conversation a second, weaker executor.
 func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approval) (*Run, error) {
 	cp, err := a.store.Latest(ctx, threadID)
 	if err != nil {
@@ -62,9 +70,9 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		state.Files = vfs.NewInState()
 	}
 	// Stash decisions in a generic State slot so non-LLM runnables (the DAG plan
-	// executor) can consume them too; the LLM path below still uses applyApprovals.
-	// Merge into any existing decisions so per-node approvals accumulate across
-	// multiple pause/resume waves.
+	// executor) can consume them too; the LLM path below reads the approvals
+	// directly. Merge into any existing decisions so per-node approvals accumulate
+	// across multiple pause/resume waves.
 	if len(approvals) > 0 {
 		if state.KV == nil {
 			state.KV = map[string]any{}
@@ -86,44 +94,107 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 	}
 	run := a.newRunHandle(ctx, threadID, &state)
 
-	if cp.Pending != nil && len(cp.Pending.Pending) > 0 {
-		parts := a.applyApprovals(run.rc, cp.Pending.Pending, approvals)
-		state.Messages = append(state.Messages, core.Message{Role: core.RoleTool, Parts: parts})
+	if cp.Pending == nil || len(cp.Pending.Pending) == 0 {
+		return run, nil
+	}
+	if a.loop == nil {
+		// A workflow agent has no tool table of its own, so it cannot run the calls
+		// an LLM agent paused on. Report each pending call as unexecuted; the KV
+		// slot above is what its DAG executor reads instead.
+		parts := make([]core.Part, 0, len(cp.Pending.Pending))
+		for _, c := range cp.Pending.Pending {
+			parts = append(parts, errResult(c, "not executed: the thread was resumed by a workflow agent, which has no tool table of its own"))
+		}
+		run.rc.State.Messages = append(run.rc.State.Messages, core.Message{Role: core.RoleTool, Parts: parts})
+		return run, nil
+	}
+	run.rc.resumed = &resumeBatch{
+		step:   cp.Pending.Step,
+		calls:  cp.Pending.Pending,
+		decide: decisionsBy(approvals),
+		final:  lastAssistant(state.Messages),
 	}
 	return run, nil
 }
 
-// applyApprovals turns pending tool calls into tool results given human
-// decisions: approved → execute the tool; rejected/undecided → an error result
-// carrying the reason. Executed synchronously before the continued loop drives.
-func (a *Agent) applyApprovals(rc *RunContext, pending []core.ToolCall, approvals []Approval) []core.Part {
-	byID := make(map[string]Approval, len(approvals))
-	for _, ap := range approvals {
-		byID[ap.CallID] = ap
-	}
-	parts := make([]core.Part, 0, len(pending))
-	// Approved calls execute via the underlying LLM loop (workflow agents have
-	// no single loop, so approval-execution applies to LLM agents).
-	loop := a.loop
-	for _, c := range pending {
-		ap, ok := byID[c.ID]
-		switch {
-		case ok && ap.Approve && loop != nil:
-			tr, _, ops := loop.callOne(rc, c)
-			rc.State.Apply(ops...)
-			parts = append(parts, tr)
-		default:
-			reason := "rejected by human"
-			if ok && ap.Reason != "" {
-				reason = "rejected: " + ap.Reason
-			} else if !ok {
-				reason = "rejected: no decision provided"
-			}
-			parts = append(parts, core.ToolResult{
-				CallID: c.ID, Name: c.Name, IsError: true,
-				Content: []core.Part{core.Text{Text: reason}},
-			})
+// resumeBatch is the pending tool-call batch a HITL pause left behind, carried
+// into the resumed run so the loop runs it before its next model call.
+type resumeBatch struct {
+	step   int             // loop step the run paused at
+	calls  []core.ToolCall // pending calls, in the model's original order
+	decide map[string]Approval
+	final  core.Message // assistant message that issued the calls, if a call ends the run
+}
+
+// runResumed executes a resumeBatch and returns its tool results in the model's
+// original call order, plus the batch's folded directive. Approved calls go
+// through execTools as one batch — so they inherit its concurrency decision, its
+// events, its AfterTool hooks and its immediate state application; denied or
+// undecided calls never reach a handler.
+func (l *AgentLoop) runResumed(rc *RunContext, rb *resumeBatch) ([]core.Part, core.Directive) {
+	lc := &LoopContext{RunContext: rc, Step: rb.step, History: rc.State.Messages}
+
+	approved := make([]core.ToolCall, 0, len(rb.calls))
+	for _, c := range rb.calls {
+		if ap, ok := rb.decide[c.ID]; ok && ap.Approve {
+			approved = append(approved, c)
 		}
 	}
-	return parts
+	results, dirs := l.execTools(rc, lc, approved)
+
+	parts := make([]core.Part, 0, len(rb.calls))
+	next := 0
+	for _, c := range rb.calls {
+		ap, recorded := rb.decide[c.ID]
+		if recorded && ap.Approve {
+			parts = append(parts, results[next])
+			next++
+			continue
+		}
+		parts = append(parts, deniedResult(rc, c, rejectionReason(ap, recorded)))
+	}
+	return parts, core.Resolve(dirs...)
+}
+
+// rejectionReason words a denial for the model, which may re-route on it: an
+// explicit rejection carries its reason, an absent decision says so.
+func rejectionReason(ap Approval, recorded bool) string {
+	switch {
+	case recorded && ap.Reason != "":
+		return "rejected: " + ap.Reason
+	case recorded:
+		return "rejected by human"
+	default:
+		return "rejected: no decision provided"
+	}
+}
+
+func decisionsBy(approvals []Approval) map[string]Approval {
+	out := make(map[string]Approval, len(approvals))
+	for _, ap := range approvals {
+		out[ap.CallID] = ap
+	}
+	return out
+}
+
+// lastAssistant returns the most recent assistant message, which in a paused
+// history is the one that issued the pending calls.
+func lastAssistant(msgs []core.Message) core.Message {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == core.RoleAssistant {
+			return msgs[i]
+		}
+	}
+	return core.Message{}
+}
+
+// deniedResult turns a tool call a human gate refused (or left undecided) into
+// an error result reported to the model. It publishes the ToolStarted/ToolDone
+// pair so the decision is visible on the event stream, but the handler never
+// runs — so no AfterTool hook sees it, the same contract truncatedResults uses.
+func deniedResult(rc *RunContext, c core.ToolCall, reason string) core.ToolResult {
+	rc.publish(core.ToolStarted{Call: c})
+	tr := errResult(c, reason)
+	rc.publish(core.ToolDone{Result: tr})
+	return tr
 }

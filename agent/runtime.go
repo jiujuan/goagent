@@ -29,6 +29,10 @@ type RunContext struct {
 
 	transferDepth int // delegation chain depth, bounded in transfer.go
 
+	// resumed carries the tool batch a HITL pause left behind, set by Agent.Resume
+	// and consumed once by the loop before its first model call (see hitl.go).
+	resumed *resumeBatch
+
 	steering steeringQueue
 }
 
