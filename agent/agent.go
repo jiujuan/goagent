@@ -63,6 +63,17 @@ func New(opts ...Option) (*Agent, error) {
 // Bus exposes the agent's event bus (for extra subscribers / tracing).
 func (a *Agent) Bus() *bus.Bus { return a.bus }
 
+// finishRun notifies the run-end capability of each configured middleware, in
+// registration order. Workflow agents have no loop, so the hook walks the
+// configured middleware list rather than the loop's stack.
+func (a *Agent) finishRun(rc *RunContext, res core.Result, err error) {
+	for _, m := range a.cfg.middleware {
+		if f, ok := m.(RunFinisher); ok {
+			f.FinishRun(rc, res, err)
+		}
+	}
+}
+
 // Name reports the configured name.
 func (a *Agent) Name() string { return a.cfg.name }
 

@@ -110,12 +110,16 @@ func (r *Run) drive() {
 			out := r.runnable.run(r.rc)
 			switch {
 			case out.Err != nil:
+				r.agent.finishRun(r.rc, core.Result{}, out.Err)
 				r.bus.Publish(r.topic, core.RunFailed{Err: out.Err})
 				r.finish(core.Result{}, out.Err)
 			case out.Control.Kind == core.Interrupt:
+				// Paused, not finished: run-end hooks wait for the eventual
+				// completion (or failure) after a resume.
 				r.bus.Publish(r.topic, core.Interrupted{Pending: out.Pending})
 				r.finish(core.Result{}, nil)
 			default:
+				r.agent.finishRun(r.rc, out.Result, nil)
 				r.bus.Publish(r.topic, core.RunDone{Result: out.Result})
 				r.finish(out.Result, nil)
 			}

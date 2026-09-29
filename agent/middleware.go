@@ -28,6 +28,21 @@ type Middleware interface {
 	OnError(*LoopContext, error) (core.Directive, error)
 }
 
+// RunFinisher is an optional middleware capability for work that belongs at the
+// very end of a run rather than inside a step: memory consolidation, a final
+// summary, releasing a resource. Run.drive calls FinishRun once, before it
+// publishes the terminal event, for a run that completed or failed. A run that
+// pauses for human-in-the-loop is not finished (it may resume later), so the
+// hook does not fire; neither does a run rejected before it started.
+//
+// FinishRun sees the run's final State. It must not mutate that State expecting
+// it to be checkpointed — the last snapshot is already written. A slow finisher
+// delays the terminal event and therefore Wait/Iter, so anything expensive should
+// detach its own context and run asynchronously.
+type RunFinisher interface {
+	FinishRun(rc *RunContext, res core.Result, runErr error)
+}
+
 // ModelContexter is an optional middleware capability. If a middleware
 // implements it, the loop calls ModelContext to derive the context.Context
 // passed to model.Generate for the current step. It exists so an observability
