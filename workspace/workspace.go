@@ -21,8 +21,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
+	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/internal/reporoot"
 	"github.com/jiujuan/goagent/memory/projectmem"
 	"github.com/jiujuan/goagent/memory/rules"
@@ -207,40 +207,26 @@ func (w *Workspace) Tools() []tool.Tool { return file.Tools(w.fs) }
 // so the artifacts stay inside the root the model's file tools are confined to
 // and remain readable by them; it is also where a human can look for them.
 //
+// The thread id names the directory verbatim (ADR-0028), so an id that cannot be
+// a directory name is refused here rather than rewritten: two distinct ids must
+// never land in one artifact directory, and one carrying path syntax must not
+// point outside the files directory. The check is core.CheckThreadID, the same
+// rule the File checkpointer applies to its file names.
+//
 // The store is externally managed (ADR-0027): checkpoints do not copy its bytes,
 // so every process resuming the thread re-attaches an equivalent handle through
 // agent.WithRunFiles, and time travel does not roll these files back. It holds
 // its own os.Root confined to that one directory, so it stays usable after the
 // Workspace is closed — and closing it is the caller's job.
 func (w *Workspace) RunFiles(threadID string) (*vfs.DirStore, error) {
-	dir := filepath.Join(w.root, userDirName, "files", safeThread(threadID))
-	store, err := vfs.NewDirStore(dir)
+	if err := core.CheckThreadID(threadID); err != nil {
+		return nil, err
+	}
+	store, err := vfs.NewDirStore(filepath.Join(w.root, userDirName, "files", threadID))
 	if err != nil {
 		return nil, fmt.Errorf("workspace: run files for thread %s: %w", threadID, err)
 	}
 	return store, nil
-}
-
-// safeThread maps a thread id to one filesystem-safe directory name: characters
-// outside [A-Za-z0-9_-] become "_", an empty id becomes "thread". Two ids that
-// differ only in mapped characters therefore share a directory, which is the
-// property checkpoint.safeName already has for its file names. The two helpers
-// are kept apart rather than widening an exported surface for twenty private
-// lines (ADR-0027, alternative C).
-func safeThread(threadID string) string {
-	var b strings.Builder
-	for _, r := range threadID {
-		switch {
-		case r == '-' || r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
-			b.WriteRune(r)
-		default:
-			b.WriteByte('_')
-		}
-	}
-	if b.Len() == 0 {
-		return "thread"
-	}
-	return b.String()
 }
 
 // Skills returns the library merged global-then-workspace, or nil when no

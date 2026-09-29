@@ -72,37 +72,42 @@ func TestRunFilesLocation(t *testing.T) {
 	}
 }
 
-// A thread id is a directory name, so anything that could add a level or escape
-// the files directory is mapped out.
-func TestRunFilesSanitizesThread(t *testing.T) {
+// A thread id names the artifact directory verbatim (ADR-0028), so an id that
+// could add a level, escape the files directory, or collide with another id's
+// sanitized name is refused — and a refusal creates nothing at all.
+func TestRunFilesRejectsThread(t *testing.T) {
 	dir := t.TempDir()
 	w := newAt(t, Config{Dir: dir})
 
-	base := filepath.Join(dir, userDirName, "files")
-	for _, id := range []string{"a/b/../c", `x\y`, "weird id:1", "", "   "} {
+	for _, id := range []string{"a/b/../c", `x\y`, "weird id:1", "", "   ", "..", ".", "会话一"} {
 		files, err := w.RunFiles(id)
-		if err != nil {
-			t.Fatalf("RunFiles(%q): %v", id, err)
+		if err == nil {
+			files.Close()
+			t.Errorf("RunFiles(%q) succeeded, want rejection", id)
+			continue
 		}
-		name := safeThread(id)
-		if strings.ContainsAny(name, `/\:`) || name == "." || name == ".." {
-			t.Fatalf("safeThread(%q) = %q, want one flat directory name", id, name)
-		}
-		if err := files.Write("a.md", []byte(id)); err != nil {
-			t.Fatal(err)
-		}
-		files.Close()
-
-		got, err := os.ReadFile(filepath.Join(base, name, "a.md"))
-		if err != nil {
-			t.Fatalf("RunFiles(%q) wrote outside %s/%s: %v", id, base, name, err)
-		}
-		if string(got) != id {
-			t.Fatalf("artifact = %q, want %q", got, id)
+		if !strings.Contains(err.Error(), "thread id") {
+			t.Errorf("RunFiles(%q) = %v, want the thread id error", id, err)
 		}
 	}
-	if name := safeThread(""); name != "thread" {
-		t.Errorf(`safeThread("") = %q, want "thread"`, name)
+	// Rejection happens before the directory is created, so the workspace stays
+	// as it was: no .goagent directory appeared.
+	if _, err := os.Stat(filepath.Join(dir, userDirName)); !os.IsNotExist(err) {
+		t.Errorf("%s exists after rejected ids (stat err: %v)", filepath.Join(dir, userDirName), err)
+	}
+
+	// The sanitized pair from ADR-0028 no longer shares a directory: one is a
+	// name, the other is not an id at all. The handle must be closed, or its open
+	// directory handle blocks the temporary directory's cleanup on Windows.
+	legal, err := w.RunFiles("a_b")
+	if err != nil {
+		t.Fatalf("RunFiles(a_b): %v", err)
+	}
+	if err := legal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.RunFiles("a/b"); err == nil {
+		t.Fatal("RunFiles(a/b) succeeded, want rejection")
 	}
 }
 
