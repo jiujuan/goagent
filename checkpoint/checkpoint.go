@@ -6,6 +6,10 @@
 // A Checkpoint snapshots core.State after a step. ParentID links snapshots into
 // a tree: a linear thread is the degenerate path; a fork is a child snapshot on
 // a new thread.
+//
+// A thread id is a key that durable backends turn into a name, so it has to be
+// file-name-safe: core.CheckThreadID is that rule (ADR-0028), and a backend
+// rejects an id that fails it instead of sanitizing it.
 package checkpoint
 
 import (

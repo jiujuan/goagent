@@ -6,10 +6,15 @@
 //
 // It is an assembly layer, not a new capability: every part comes from an
 // existing package (tool/file, memory/rules, memory/projectmem, skills,
-// internal/reporoot, sandbox/process) and stays usable on its own. The value
+// internal/reporoot, sandbox/process, vfs) and stays usable on its own. The value
 // added is that the three facts a model must agree on — where it is, what it
 // may touch, what runs there — are derived from a single root instead of being
 // wired by hand and drifting apart.
+//
+// RunFiles is the one part this layer creates rather than loads: one directory
+// per thread under <root>/.goagent/files, named after the thread id verbatim —
+// the id doubles as a directory name, so it must be file-name-safe (ADR-0027 for
+// the store, ADR-0028 for the id rule).
 //
 // Containment is exact: os.Root confines path *resolution*, so the framework's
 // own file tools cannot leave the root, but a command started through the

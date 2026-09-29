@@ -111,6 +111,11 @@ func WithMessage(m core.Message) RunOption { return func(r *RunConfig) { r.Messa
 // must pass an equivalent backend here again, and the files it points at are not
 // rolled back by time travel (ADR-0026, ADR-0027; pinned by the
 // TestDurableDirStore* cases in this package's tests).
+//
+// The backend has to match the thread it is attached to: workspace.RunFiles
+// names its directory after the thread id, so handing a store built for one id to
+// a run on another reads and writes someone else's artifacts. Both halves key off
+// the same id, which is why that id is validated as a file name (ADR-0028).
 func WithRunFiles(f core.FileStore) RunOption { return func(r *RunConfig) { r.Files = f } }
 
 // Run drives the agent loop to completion and returns the final answer text. It

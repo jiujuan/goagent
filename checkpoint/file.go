@@ -34,6 +34,14 @@ import (
 // not persisted, and the caller re-supplies it via agent.WithRunFiles on resume.
 // Messages, todos, KV and plan state always persist; a thread with no file
 // records reads back exactly as before this mechanism existed.
+//
+// One thread is one file, and the file is named after the thread id verbatim
+// (ADR-0028): <dir>/<thread id>.jsonl. So an id that cannot be a file name —
+// anything outside [A-Za-z0-9_-], or longer than core.MaxThreadIDLen — is refused
+// by Save, Load, Latest and History alike. It is never rewritten into a name:
+// rewriting was how two distinct ids ended up sharing one file and resuming each
+// other's conversation, and an id carrying path separators would also resolve
+// outside dir.
 type File struct {
 	dir string
 	mu  sync.Mutex
