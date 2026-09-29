@@ -149,8 +149,13 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		// Phase 1 — PrepareTurn: drain steering, then BeforeModel.
 		if steers := rc.steering.drain(); len(steers) > 0 {
 			history = append(history, steers...)
-			lc.History = history
 		}
+		// Let history-compacters (durable compaction) rewrite the working history
+		// before the model is consulted. The replacement flows into this step's
+		// request and, at step end, its checkpoint. A no-op when no middleware
+		// implements HistoryCompacter.
+		history = l.mw.CompactHistory(lc, history)
+		lc.History = history
 		if d, err := l.mw.BeforeModel(lc); err != nil {
 			return l.fail(rc, step, history, err)
 		} else if out, stop := terminalFromDirective(d, core.Message{}); stop {

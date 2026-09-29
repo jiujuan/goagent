@@ -54,6 +54,19 @@ type ModelContexter interface {
 	ModelContext(lc *LoopContext, ctx context.Context) context.Context
 }
 
+// HistoryCompacter is an optional middleware capability for rewriting the
+// conversation history itself at the start of each step. Unlike a ModifyRequest
+// hook (which reshapes only the outgoing request), a value returned from
+// CompactHistory replaces the loop's working history, so it flows into the
+// request for this step AND is checkpointed at step end — the rewrite is durable
+// and shrinks the stored state. It exists so context-window management (e.g.
+// Compaction's persist mode) can summarize old turns once instead of on every
+// step. Middleware that does not implement it is skipped in the fold
+// (Stack.CompactHistory), so behaviour is unchanged.
+type HistoryCompacter interface {
+	CompactHistory(lc *LoopContext, history []core.Message) []core.Message
+}
+
 // BaseMiddleware provides no-op defaults (every hook returns Continue, nil).
 // Embed it so a concrete middleware overrides only the hooks it cares about.
 type BaseMiddleware struct{}
@@ -114,6 +127,19 @@ func (s *Stack) ModelContext(lc *LoopContext, ctx context.Context) context.Conte
 		}
 	}
 	return ctx
+}
+
+// CompactHistory folds the optional HistoryCompacter capability across the
+// stack in registration order: each implementer rewrites the history it is
+// given, threading the result to the next. Middleware that does not implement
+// it is skipped, so the history is returned unchanged when none do.
+func (s *Stack) CompactHistory(lc *LoopContext, history []core.Message) []core.Message {
+	for _, m := range s.mws {
+		if hc, ok := m.(HistoryCompacter); ok {
+			history = hc.CompactHistory(lc, history)
+		}
+	}
+	return history
 }
 
 func (s *Stack) AfterModel(lc *LoopContext, resp *llm.Response) (core.Directive, error) {
