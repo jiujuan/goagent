@@ -1,7 +1,8 @@
 // Package workspace assembles an agent's working context from one config: the
 // directory it works in, the filesystem handle confined to that directory, the
-// rules and project memory that describe it, and the prompt sections and tools
-// that expose all of it to the model.
+// rules and project memory that describe it, the per-thread artifact store it
+// hands out, and the prompt sections and tools that expose all of it to the
+// model.
 //
 // It is an assembly layer, not a new capability: every part comes from an
 // existing package (tool/file, memory/rules, memory/projectmem, skills,
@@ -20,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/jiujuan/goagent/internal/reporoot"
 	"github.com/jiujuan/goagent/memory/projectmem"
@@ -29,6 +31,7 @@ import (
 	"github.com/jiujuan/goagent/skills"
 	"github.com/jiujuan/goagent/tool"
 	"github.com/jiujuan/goagent/tool/file"
+	"github.com/jiujuan/goagent/vfs"
 )
 
 // userDirName is the conventional per-user and per-repo config directory,
@@ -198,6 +201,47 @@ func (w *Workspace) Close() error {
 
 // Tools returns the file tools bound to this workspace's root.
 func (w *Workspace) Tools() []tool.Tool { return file.Tools(w.fs) }
+
+// RunFiles attaches a disk-backed artifact store for one thread, rooted at
+// <root>/.goagent/files/<thread>. That is the workspace's own config directory,
+// so the artifacts stay inside the root the model's file tools are confined to
+// and remain readable by them; it is also where a human can look for them.
+//
+// The store is externally managed (ADR-0027): checkpoints do not copy its bytes,
+// so every process resuming the thread re-attaches an equivalent handle through
+// agent.WithRunFiles, and time travel does not roll these files back. It holds
+// its own os.Root confined to that one directory, so it stays usable after the
+// Workspace is closed — and closing it is the caller's job.
+func (w *Workspace) RunFiles(threadID string) (*vfs.DirStore, error) {
+	dir := filepath.Join(w.root, userDirName, "files", safeThread(threadID))
+	store, err := vfs.NewDirStore(dir)
+	if err != nil {
+		return nil, fmt.Errorf("workspace: run files for thread %s: %w", threadID, err)
+	}
+	return store, nil
+}
+
+// safeThread maps a thread id to one filesystem-safe directory name: characters
+// outside [A-Za-z0-9_-] become "_", an empty id becomes "thread". Two ids that
+// differ only in mapped characters therefore share a directory, which is the
+// property checkpoint.safeName already has for its file names. The two helpers
+// are kept apart rather than widening an exported surface for twenty private
+// lines (ADR-0027, alternative C).
+func safeThread(threadID string) string {
+	var b strings.Builder
+	for _, r := range threadID {
+		switch {
+		case r == '-' || r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "thread"
+	}
+	return b.String()
+}
 
 // Skills returns the library merged global-then-workspace, or nil when no
 // skills directory had a skill in it.
