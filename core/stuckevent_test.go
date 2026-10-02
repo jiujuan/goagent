@@ -49,3 +49,19 @@ func TestHistoryCompactedEventRoundTrip(t *testing.T) {
 		t.Fatalf("round trip = %#v, want %#v", out, in)
 	}
 }
+
+func TestArgRejectedEventRoundTrip(t *testing.T) {
+	in := ArgRejected{Tool: "search", Class: "schema_invalid", Count: 3, Step: 5}
+	data, err := MarshalEvent(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := out.(ArgRejected)
+	if !ok || got != in {
+		t.Fatalf("round trip = %#v, want %#v", out, in)
+	}
+}

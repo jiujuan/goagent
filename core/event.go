@@ -113,6 +113,20 @@ type HistoryCompacted struct {
 	Step      int
 }
 
+// ArgRejected is emitted by the argument-guard middleware each time a tool call is
+// refused before completing. Tool names the refused tool, Class is the loop's
+// classification ("unknown_tool" | "prepare_failed" | "schema_invalid" |
+// "handler_error" | "timed_out"), Count is that tool's running total for this run
+// including this rejection, and Step is the loop step. Unlike StuckDetected — which
+// fires when a pattern is recognised — this fires per refused call, so a model that
+// cannot satisfy one tool's arguments produces a readable sequence of them.
+type ArgRejected struct {
+	Tool  string
+	Class string
+	Count int
+	Step  int
+}
+
 // --- Marker -----------------------------------------------------------------
 
 func (RunStarted) isEvent()       {}
@@ -132,6 +146,7 @@ func (PlanNodeDone) isEvent()     {}
 func (StuckDetected) isEvent()    {}
 func (BudgetExceeded) isEvent()   {}
 func (HistoryCompacted) isEvent() {}
+func (ArgRejected) isEvent()      {}
 
 // --- Payload types ----------------------------------------------------------
 

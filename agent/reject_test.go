@@ -296,6 +296,106 @@ func TestResumedBatchDispatchesRejections(t *testing.T) {
 	}
 }
 
+// TestArgRejectedEventPublished: the new event variant reaches a Stream subscriber
+// once per refused call, carrying the running total the publisher counted.
+// TASK-AG-03 replaces this stand-in publisher with middleware.ArgGuard; what is
+// pinned here is that core.ArgRejected belongs to the sealed union and travels the
+// run's bus with its fields intact.
+func TestArgRejectedEventPublished(t *testing.T) {
+	pub := &eventPublisher{}
+	calls := 0
+	// Scripted on the model-call count: history keeps a tool result from the first
+	// step on, so reading the last result here would end the run after one refusal.
+	model := mock.New("m", func(req *llm.Request) *llm.Response {
+		calls++
+		if calls > 3 {
+			return mock.Text("done")
+		}
+		return mock.CallTool("c1", "absent", `{}`)
+	})
+	a, err := agent.New(
+		agent.WithModel(model),
+		agent.WithTools(okTool{"keep"}),
+		agent.WithMiddleware(pub),
+		agent.WithMaxTurns(8),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got []core.ArgRejected
+	run := a.Stream(context.Background(), "go")
+	for ev, err := range run.Iter() {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e, ok := ev.(core.ArgRejected); ok {
+			got = append(got, e)
+		}
+	}
+	if _, err := run.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got) != 3 {
+		t.Fatalf("ArgRejected events = %d (%v), want 3", len(got), got)
+	}
+	for i, e := range got {
+		want := core.ArgRejected{Tool: "absent", Class: "unknown_tool", Count: i + 1, Step: i}
+		if e != want {
+			t.Fatalf("event %d = %+v, want %+v", i, e, want)
+		}
+	}
+	// The count a subscriber sees is the count the publisher kept in State.KV.
+	if pub.kvAtEnd["absent"] != 3 {
+		t.Fatalf("State.KV[argcount.absent] = %d, want 3", pub.kvAtEnd["absent"])
+	}
+}
+
+// eventPublisher is the smallest useful ToolRejecter: it counts refusals per tool in
+// State.KV and mirrors each one onto the run's bus as a core.ArgRejected.
+type eventPublisher struct {
+	agent.BaseMiddleware
+
+	kvAtEnd map[string]int
+}
+
+func (p *eventPublisher) OnToolReject(lc *agent.LoopContext, r agent.ToolRejection) {
+	key := "argcount." + r.Call.Name
+	count := p.bump(lc, key)
+	lc.Bus.Publish(lc.Topic, core.ArgRejected{
+		Tool:  r.Call.Name,
+		Class: r.Class.String(),
+		Count: count,
+		Step:  lc.Step,
+	})
+}
+
+func (p *eventPublisher) bump(lc *agent.LoopContext, key string) int {
+	n := 0
+	switch v := lc.State.KV[key].(type) {
+	case int:
+		n = v
+	case float64: // a count that came back through a JSONL checkpoint
+		n = int(v)
+	}
+	n++
+	lc.State.Apply(core.StateOp{Kind: core.OpSetKV, Key: key, Value: n})
+	return n
+}
+
+func (p *eventPublisher) FinishRun(rc *agent.RunContext, _ core.Result, _ error) {
+	p.kvAtEnd = map[string]int{}
+	for k, v := range rc.State.KV {
+		if !strings.HasPrefix(k, "argcount.") {
+			continue
+		}
+		if n, ok := v.(int); ok {
+			p.kvAtEnd[strings.TrimPrefix(k, "argcount.")] = n
+		}
+	}
+}
+
 // --- helpers ----------------------------------------------------------------
 
 // rejectSpy records what the loop reported. Its counters and maps are touched with
