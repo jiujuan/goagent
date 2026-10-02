@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"time"
 
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
@@ -32,6 +33,7 @@ type AgentLoop struct {
 	outputKey   string
 	modelOpts   []llm.Option
 	toolExec    ToolExecMode
+	toolTimeout time.Duration
 	mw          *Stack
 	tools       []tool.Tool
 	byName      map[string]tool.Tool
@@ -60,6 +62,7 @@ func newLoop(c config) *AgentLoop {
 		outputKey:   c.outputKey,
 		modelOpts:   c.modelOpts,
 		toolExec:    c.toolExec,
+		toolTimeout: c.toolTimeout,
 		mw:          NewStack(c.middleware...),
 		tools:       c.tools,
 		byName:      tool.ByName(c.tools),

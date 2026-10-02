@@ -54,6 +54,20 @@ type ModelContexter interface {
 	ModelContext(lc *LoopContext, ctx context.Context) context.Context
 }
 
+// ToolContexter is an optional middleware capability. If a middleware
+// implements it, the loop calls ToolContext to derive the context.Context handed
+// to one tool invocation, so a middleware can attach a span or give a particular
+// tool a tighter deadline than the agent's WithToolTimeout default. The core
+// holds no timeout policy of its own; it only offers this seam. Middleware that
+// does not implement it is skipped in the fold (Stack.ToolContext), so behaviour
+// is unchanged.
+//
+// ToolContext runs once per tool call, from that call's worker goroutine, so an
+// implementation must be goroutine-safe.
+type ToolContexter interface {
+	ToolContext(lc *LoopContext, ctx context.Context, call *core.ToolCall) context.Context
+}
+
 // HistoryCompacter is an optional middleware capability for rewriting the
 // conversation history itself at the start of each step. Unlike a ModifyRequest
 // hook (which reshapes only the outgoing request), a value returned from
@@ -124,6 +138,20 @@ func (s *Stack) ModelContext(lc *LoopContext, ctx context.Context) context.Conte
 	for _, m := range s.mws {
 		if mc, ok := m.(ModelContexter); ok {
 			ctx = mc.ModelContext(lc, ctx)
+		}
+	}
+	return ctx
+}
+
+// ToolContext folds the optional ToolContexter capability across the stack in
+// registration order: each implementer derives the context it is given, threaded
+// to the next. Middleware that does not implement it is skipped, so the returned
+// context equals the input when none does. It runs once per tool call, on that
+// call's worker goroutine.
+func (s *Stack) ToolContext(lc *LoopContext, ctx context.Context, call *core.ToolCall) context.Context {
+	for _, m := range s.mws {
+		if tc, ok := m.(ToolContexter); ok {
+			ctx = tc.ToolContext(lc, ctx, call)
 		}
 	}
 	return ctx

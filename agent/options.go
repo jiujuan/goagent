@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"time"
+
 	"github.com/jiujuan/goagent/bus"
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/llm"
@@ -22,6 +24,7 @@ type config struct {
 	subAgents   []*Agent
 	maxTurns    int
 	toolExec    ToolExecMode
+	toolTimeout time.Duration
 	modelOpts   []llm.Option
 	outputKey   string
 
@@ -90,6 +93,15 @@ func WithMaxTurns(n int) Option { return func(c *config) { c.maxTurns = n } }
 // Note: a tool wrapped with tool.AsSequential downgrades its whole batch to
 // serial regardless of this mode.
 func WithToolExecution(m ToolExecMode) Option { return func(c *config) { c.toolExec = m } }
+
+// WithToolTimeout bounds how long a single tool call may run (default 0 = no
+// bound). It is per call, not per batch: a sequential batch of N slow tools can
+// each use the full duration. When it fires, the context handed to the tool is
+// cancelled, so a tool that watches its context returns early; Go cannot stop a
+// function that is already running, so a tool that ignores the context keeps
+// executing. Total wall-clock for a whole run is RunBudget.MaxDuration's job,
+// not this one's.
+func WithToolTimeout(d time.Duration) Option { return func(c *config) { c.toolTimeout = d } }
 
 // WithOutputKey writes this agent's final answer text into State.KV under key,
 // for inter-stage coordination in a workflow. Later stages reference it in their
