@@ -141,6 +141,11 @@ func TestToolTimeoutCancelsCooperativeTool(t *testing.T) {
 	if !strings.Contains(answer, "context deadline exceeded") {
 		t.Fatalf("answer = %q, want the tool's own cancellation error", answer)
 	}
+	// The tool's report beats the loop's: a handler that watched the cancellation
+	// knows what it managed to do, and abandonGrace exists to let it say so.
+	if strings.Contains(answer, "timed out") {
+		t.Fatalf("answer = %q, want the handler's error, not the synthesized timeout", answer)
+	}
 }
 
 // TestToolTimeoutZeroLeavesRunUntouched: with no bound configured the call

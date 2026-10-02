@@ -2,7 +2,10 @@ package agent
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
+	"time"
 
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/tool"
@@ -19,6 +22,11 @@ import (
 // ToolStarted is published in call order; ToolDone as each result lands. The
 // Bus is concurrency-safe, so parallel publishes do not race. State mutations
 // from parallel tools are serialized under a mutex.
+//
+// A call bounded by WithToolTimeout (or by a middleware context bound) stops
+// being waited for when its deadline passes: the loop reports a timeout result
+// and moves on. The tool's late result, Control and State ops are then dropped,
+// so its external side effects may continue unseen — see timeoutResult.
 func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.ToolCall) ([]core.Part, []core.Directive) {
 	results := make([]core.Part, len(calls))
 	dirs := make([]core.Directive, len(calls))
@@ -27,17 +35,39 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 	run := func(i int, c core.ToolCall) {
 		callCtx, cancel := l.toolCallCtx(lc, &c)
 		defer cancel()
-		tr, control, ops := l.callOne(lc, callCtx, c)
-		if len(ops) > 0 {
+
+		// The handler runs on its own goroutine so the loop can stop waiting on
+		// it: Go cannot interrupt a function that is already running, so an
+		// uncooperative tool would otherwise hold the batch — and the run —
+		// forever. The channel is buffered by one, which is what lets an
+		// abandoned worker write its result and exit rather than blocking on a
+		// reader that has moved on.
+		ch := make(chan toolOutcome, 1)
+		go func() { ch <- l.callOne(lc, callCtx, c) }()
+
+		start := time.Now()
+		var out toolOutcome
+		select {
+		case out = <-ch:
+		case <-callCtx.Done():
+			out = awaitAbandoned(ch, callCtx, c, start)
+		}
+		tr := out.tr
+
+		// Anything the abandoned handler returns afterwards reaches nobody: the
+		// write went to a channel no one reads again, so its ops, Control and
+		// AfterTool pass are deliberately skipped here — that is the cost of
+		// bounding a call, and the timeout text tells the model to assume nothing.
+		if len(out.ops) > 0 {
 			stateMu.Lock()
-			rc.State.Apply(ops...)
+			rc.State.Apply(out.ops...)
 			stateMu.Unlock()
 		}
 		// A tool's own Control wins over an AfterTool directive only if higher
 		// precedence; Resolve folds both.
 		ds := []core.Directive{}
-		if control != nil {
-			ds = append(ds, *control)
+		if out.control != nil {
+			ds = append(ds, *out.control)
 		}
 		if d, err := l.mw.AfterTool(lc, &tr); err == nil {
 			ds = append(ds, d)
@@ -84,6 +114,30 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 	return results, dirs
 }
 
+// abandonGrace bounds how long the loop still listens to a call whose context has
+// just ended. A tool that watched the cancellation has its own error ready within
+// microseconds of it; measured without this window the loop won the race every
+// single time and threw the handler's better report away in favour of its own
+// wording. The cost is bounded and only falls on calls that are already stuck.
+const abandonGrace = 2 * time.Millisecond
+
+// awaitAbandoned decides what a bounded call reports once its context ended: the
+// handler's own outcome if it arrives within abandonGrace, otherwise the loop's
+// word for the abandonment.
+func awaitAbandoned(ch <-chan toolOutcome, callCtx context.Context, c core.ToolCall, start time.Time) toolOutcome {
+	timer := time.NewTimer(abandonGrace)
+	defer timer.Stop()
+	select {
+	case out := <-ch:
+		return out
+	case <-timer.C:
+		if errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+			return toolOutcome{tr: timeoutResult(c, time.Since(start))}
+		}
+		return toolOutcome{tr: cancelledResult(c)}
+	}
+}
+
 // toolCallCtx derives the context one tool call runs under: middleware first (a
 // span, or a per-tool bound), the agent's default deadline last. Only tightening
 // is expressible — a context can carry an earlier deadline, never a later one, so
@@ -119,12 +173,38 @@ func keepToolUpdates(ctx context.Context, rc *RunContext) context.Context {
 	return updaterContext{Context: ctx, up: rc}
 }
 
+// toolOutcome is everything one tool call produces: the result the model sees,
+// plus the control directive and state mutations its handler requested.
+type toolOutcome struct {
+	tr      core.ToolResult
+	control *core.Directive
+	ops     []core.StateOp
+}
+
+// timeoutResult reports a call the loop stopped waiting for. d is measured, not
+// the configured bound, so an agent default and a middleware limit word the same
+// way. The tool may still be running: the loop has already moved on, so the
+// model is told to assume nothing about its effects.
+func timeoutResult(c core.ToolCall, d time.Duration) core.ToolResult {
+	return errResult(c, fmt.Sprintf(
+		"tool %q timed out after %s and its result was discarded: it may still be running, "+
+			"so assume nothing about what it did. Retry with narrower arguments or another tool, "+
+			"or say that this step could not complete.", c.Name, d.Round(time.Millisecond)))
+}
+
+// cancelledResult reports the same abandonment when the run itself was cancelled
+// rather than out of time.
+func cancelledResult(c core.ToolCall) core.ToolResult {
+	return errResult(c, fmt.Sprintf(
+		"tool %q did not finish: the run was cancelled while it was executing.", c.Name))
+}
+
 // callOne dispatches a single tool call, returning its result plus any control
 // directive and state ops the tool requested. The name resolves against the
 // run's injected tools first, then the agent's own table. Unknown tools, rejected
 // or schema-invalid arguments, and handler errors all become error ToolResults
 // reported back to the model — the handler never runs for a bad call.
-func (l *AgentLoop) callOne(lc *LoopContext, callCtx context.Context, c core.ToolCall) (core.ToolResult, *core.Directive, []core.StateOp) {
+func (l *AgentLoop) callOne(lc *LoopContext, callCtx context.Context, c core.ToolCall) toolOutcome {
 	// Run-scoped injections resolve first, so a middleware can replace an
 	// agent-level tool by name or supply one the agent was built without.
 	t, ok := lc.dynamic.lookup(c.Name)
@@ -132,26 +212,29 @@ func (l *AgentLoop) callOne(lc *LoopContext, callCtx context.Context, c core.Too
 		t, ok = l.byName[c.Name]
 	}
 	if !ok {
-		return errResult(c, "unknown tool: "+c.Name), nil, nil
+		return toolOutcome{tr: errResult(c, "unknown tool: "+c.Name)}
 	}
 	raw := c.Args
 	if p, ok := t.(tool.ArgumentPreparer); ok {
 		prepared, err := p.PrepareArguments(raw)
 		if err != nil {
-			return errResult(c, "invalid arguments: "+err.Error()), nil, nil
+			return toolOutcome{tr: errResult(c, "invalid arguments: "+err.Error())}
 		}
 		raw = prepared
 	}
 	if err := tool.Validate(t.Schema(), raw); err != nil {
-		return errResult(c, "invalid arguments: "+err.Error()), nil, nil
+		return toolOutcome{tr: errResult(c, "invalid arguments: "+err.Error())}
 	}
 	tctx := &tool.Context{Context: keepToolUpdates(callCtx, lc.RunContext), State: lc.State, CallID: c.ID}
 	res, err := t.Call(tctx, raw)
 	if err != nil {
-		return errResult(c, err.Error()), nil, nil
+		return toolOutcome{tr: errResult(c, err.Error())}
 	}
-	tr := core.ToolResult{CallID: c.ID, Name: c.Name, Content: res.Content, IsError: res.IsError}
-	return tr, res.Control, res.State
+	return toolOutcome{
+		tr:      core.ToolResult{CallID: c.ID, Name: c.Name, Content: res.Content, IsError: res.IsError},
+		control: res.Control,
+		ops:     res.State,
+	}
 }
 
 func errResult(c core.ToolCall, msg string) core.ToolResult {
@@ -167,7 +250,11 @@ func errResult(c core.ToolCall, msg string) core.ToolResult {
 // handed a context that carries this capability (callOne, via keepToolUpdates),
 // so this is the only path a partial result takes. Like any other publish it is
 // safe from a tool's own goroutines; a ToolUpdate arriving after the batch's
-// ToolDone is a late report from a tool that did not join its workers, not a runtime event.
+// ToolDone is a late report from a tool that did not join its workers, not a
+// runtime event. A bounded call (WithToolTimeout) makes that ordinary: the loop
+// reports the timeout and moves on, so a partial arriving afterwards belongs to
+// a call the run has already answered — observers drop it by CallID, the loop
+// does not intercept it.
 func (rc *RunContext) UpdateTool(callID string, p core.Part) {
 	rc.publish(core.ToolUpdate{CallID: callID, Partial: p})
 }
