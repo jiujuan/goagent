@@ -26,11 +26,18 @@ import (
 // A call bounded by WithToolTimeout (or by a middleware context bound) stops
 // being waited for when its deadline passes: the loop reports a timeout result
 // and moves on. The tool's late result, Control and State ops are then dropped,
-// so its external side effects may continue unseen — see timeoutResult.
-func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.ToolCall) ([]core.Part, []core.Directive) {
+// so its external side effects may continue unseen — see abandonedAtBound.
+//
+// The third return value lists every call this batch rejected, with the class the
+// loop assigned it. The loop hands that list to Stack.ToolReject after the batch
+// has joined, not from a worker goroutine, so a ToolRejecter can write State.KV
+// without locking and its writes are checkpointed with this step.
+func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.ToolCall) ([]core.Part, []core.Directive, []ToolRejection) {
 	results := make([]core.Part, len(calls))
 	dirs := make([]core.Directive, len(calls))
 	var stateMu sync.Mutex
+	var rejects []ToolRejection
+	var rejectMu sync.Mutex
 
 	run := func(i int, c core.ToolCall) {
 		callCtx, cancel := l.toolCallCtx(lc, &c)
@@ -77,6 +84,11 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 		// history — consistent with the ToolDone event published below.
 		results[i] = tr
 		dirs[i] = core.Resolve(ds...)
+		if out.rejection != nil {
+			rejectMu.Lock()
+			rejects = append(rejects, *out.rejection)
+			rejectMu.Unlock()
+		}
 		rc.publish(core.ToolDone{Result: tr})
 	}
 
@@ -98,7 +110,7 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 			rc.publish(core.ToolStarted{Call: calls[i]})
 			run(i, calls[i])
 		}
-		return results, dirs
+		return results, dirs, rejects
 	}
 
 	var wg sync.WaitGroup
@@ -111,7 +123,7 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 		}(i, calls[i])
 	}
 	wg.Wait()
-	return results, dirs
+	return results, dirs, rejects
 }
 
 // abandonGrace bounds how long the loop still listens to a call whose context has
@@ -132,8 +144,11 @@ func awaitAbandoned(ch <-chan toolOutcome, callCtx context.Context, c core.ToolC
 		return out
 	case <-timer.C:
 		if errors.Is(callCtx.Err(), context.DeadlineExceeded) {
-			return toolOutcome{tr: timeoutResult(c, time.Since(start))}
+			return abandonedAtBound(c, time.Since(start))
 		}
+		// The run itself was cancelled, not the call out of time. That is not a
+		// rejection the loop is reporting on the tool's behalf — there is no later
+		// step left to act on it — so it carries no rejection.
 		return toolOutcome{tr: cancelledResult(c)}
 	}
 }
@@ -177,22 +192,29 @@ func keepToolUpdates(ctx context.Context, rc *RunContext) context.Context {
 }
 
 // toolOutcome is everything one tool call produces: the result the model sees,
-// plus the control directive and state mutations its handler requested.
+// plus the control directive and state mutations its handler requested, plus the
+// rejection the loop reports when the call never got a usable answer.
 type toolOutcome struct {
-	tr      core.ToolResult
-	control *core.Directive
-	ops     []core.StateOp
+	tr        core.ToolResult
+	control   *core.Directive
+	ops       []core.StateOp
+	rejection *ToolRejection
 }
 
-// timeoutResult reports a call the loop stopped waiting for. d is measured, not
-// the configured bound, so an agent default and a middleware limit word the same
-// way. The tool may still be running: the loop has already moved on, so the
-// model is told to assume nothing about its effects.
-func timeoutResult(c core.ToolCall, d time.Duration) core.ToolResult {
-	return errResult(c, fmt.Sprintf(
+// abandonedAtBound is the loop's own report for a call it stopped waiting on: the
+// error result the model gets and the rejection for ToolRejecter, both carrying the
+// same sentence. d is measured, not the configured bound, so an agent default and a
+// middleware limit word the same way. The tool may still be running: the loop has
+// already moved on, so the model is told to assume nothing about its effects.
+func abandonedAtBound(c core.ToolCall, d time.Duration) toolOutcome {
+	msg := fmt.Sprintf(
 		"tool %q timed out after %s and its result was discarded: it may still be running, "+
 			"so assume nothing about what it did. Retry with narrower arguments or another tool, "+
-			"or say that this step could not complete.", c.Name, d.Round(time.Millisecond)))
+			"or say that this step could not complete.", c.Name, d.Round(time.Millisecond))
+	return toolOutcome{
+		tr:        errResult(c, msg),
+		rejection: &ToolRejection{Call: c, Class: RejectTimedOut, Detail: msg},
+	}
 }
 
 // cancelledResult reports the same abandonment when the run itself was cancelled
@@ -206,7 +228,8 @@ func cancelledResult(c core.ToolCall) core.ToolResult {
 // directive and state ops the tool requested. The name resolves against the
 // run's injected tools first, then the agent's own table. Unknown tools, rejected
 // or schema-invalid arguments, and handler errors all become error ToolResults
-// reported back to the model — the handler never runs for a bad call.
+// reported back to the model — the handler never runs for a bad call — and each
+// one carries the rejection class alongside, which is what ToolRejecter observes.
 func (l *AgentLoop) callOne(lc *LoopContext, callCtx context.Context, c core.ToolCall) toolOutcome {
 	// Run-scoped injections resolve first, so a middleware can replace an
 	// agent-level tool by name or supply one the agent was built without.
@@ -215,28 +238,42 @@ func (l *AgentLoop) callOne(lc *LoopContext, callCtx context.Context, c core.Too
 		t, ok = l.byName[c.Name]
 	}
 	if !ok {
-		return toolOutcome{tr: errResult(c, "unknown tool: "+c.Name)}
+		return rejected(c, RejectUnknownTool, "unknown tool: "+c.Name)
 	}
 	raw := c.Args
 	if p, ok := t.(tool.ArgumentPreparer); ok {
 		prepared, err := p.PrepareArguments(raw)
 		if err != nil {
-			return toolOutcome{tr: errResult(c, "invalid arguments: "+err.Error())}
+			return rejected(c, RejectPrepareFailed, "invalid arguments: "+err.Error())
 		}
 		raw = prepared
 	}
 	if err := tool.Validate(t.Schema(), raw); err != nil {
-		return toolOutcome{tr: errResult(c, "invalid arguments: "+err.Error())}
+		return rejected(c, RejectSchemaInvalid, "invalid arguments: "+err.Error())
 	}
 	tctx := &tool.Context{Context: keepToolUpdates(callCtx, lc.RunContext), State: lc.State, CallID: c.ID}
 	res, err := t.Call(tctx, raw)
 	if err != nil {
-		return toolOutcome{tr: errResult(c, err.Error())}
+		return rejected(c, RejectHandlerError, err.Error())
 	}
+	// A handler that ran and reported its own failure (tool.ErrorResult, hence
+	// IsError) is not a rejection: the call was well-formed and answered, and the
+	// model may know what to do with the answer. Same for an IsError set later by
+	// an AfterTool hook — the loop never sees that pass here.
 	return toolOutcome{
 		tr:      core.ToolResult{CallID: c.ID, Name: c.Name, Content: res.Content, IsError: res.IsError},
 		control: res.Control,
 		ops:     res.State,
+	}
+}
+
+// rejected is one call the loop would not run (or could not finish): the error
+// result the model sees plus the fact reported to ToolRejecter. Detail is that same
+// text, so a guard can quote what the model was told without re-reading history.
+func rejected(c core.ToolCall, class RejectClass, msg string) toolOutcome {
+	return toolOutcome{
+		tr:        errResult(c, msg),
+		rejection: &ToolRejection{Call: c, Class: class, Detail: msg},
 	}
 }
 

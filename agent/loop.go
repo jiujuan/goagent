@@ -116,7 +116,12 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 	// one of them ends the run there, as it would mid-step.
 	if rb := rc.resumed; rb != nil {
 		rc.resumed = nil
-		parts, d := l.runResumed(rc, rb)
+		rlc := &LoopContext{RunContext: rc, Step: rb.step, MaxTurns: l.maxTurns, History: history}
+		parts, d, rejects := l.runResumed(rb, rlc)
+		// The rejected calls in a resumed batch are reported here rather than inside
+		// runResumed, so every phase ordering stays in the loop. Same position as a
+		// step's: batch joined, snapshot not yet written.
+		l.mw.ToolReject(rlc, rejects)
 		if len(parts) > 0 {
 			history = append(history, core.Message{Role: core.RoleTool, Parts: parts})
 			rc.State.Messages = history
@@ -221,7 +226,10 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 			continue
 		}
 
-		// Phase 3 — ExecuteTools: BeforeTool gate (HITL/permission) first.
+		// Phase 3 — ExecuteTools: BeforeTool gate (HITL/permission) first, then the
+		// batch, then the rejections it collected. Reporting them after the batch joined
+		// (not from a tool's worker) and before this step's snapshot is what lets a
+		// ToolRejecter write State.KV without locking and have the write checkpointed.
 		for i := range calls {
 			d, err := l.mw.BeforeTool(lc, &calls[i])
 			if err != nil {
@@ -243,7 +251,8 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 			}
 		}
 
-		results, dirs := l.execTools(rc, lc, calls)
+		results, dirs, rejects := l.execTools(rc, lc, calls)
+		l.mw.ToolReject(lc, rejects)
 		history = append(history, core.Message{Role: core.RoleTool, Parts: results})
 
 		// Phase 4 — Checkpoint the step's state.
@@ -359,6 +368,10 @@ func pendingFrom(calls []core.ToolCall) []core.ApprovalRequest {
 // truncatedResults fails a batch of tool calls from a max_tokens-truncated
 // reply, publishing ToolStarted/ToolDone pairs (mirroring execTools' event
 // shape) without invoking any handler.
+//
+// It reports no ToolRejection on purpose. Nothing was wrong with the call — the
+// reply was cut off before it finished — so counting it against a tool's argument
+// quality would let an output-cap problem trip an argument guard.
 func truncatedResults(rc *RunContext, calls []core.ToolCall) []core.Part {
 	parts := make([]core.Part, 0, len(calls))
 	for _, c := range calls {

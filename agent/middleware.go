@@ -28,6 +28,62 @@ type Middleware interface {
 	OnError(*LoopContext, error) (core.Directive, error)
 }
 
+// RejectClass names why a tool call was rejected before (or without) completing.
+// The loop decides it in callOne — the one place that knows which of its own steps
+// stopped the call — and applies no policy for it: it is a fact, and middleware
+// observes and decides. A rejection is not the same as a tool reporting failure: a
+// handler that ran and returned tool.ErrorResult is not a rejection.
+type RejectClass int
+
+const (
+	RejectUnknownTool   RejectClass = iota // name not in either tool table
+	RejectPrepareFailed                    // ArgumentPreparer rejected the args
+	RejectSchemaInvalid                    // tool.Validate rejected the args
+	RejectHandlerError                     // the handler returned a Go error
+	RejectTimedOut                         // abandoned at its bound (ADR-0029)
+)
+
+func (k RejectClass) String() string {
+	switch k {
+	case RejectUnknownTool:
+		return "unknown_tool"
+	case RejectPrepareFailed:
+		return "prepare_failed"
+	case RejectSchemaInvalid:
+		return "schema_invalid"
+	case RejectHandlerError:
+		return "handler_error"
+	case RejectTimedOut:
+		return "timed_out"
+	default:
+		return "unknown"
+	}
+}
+
+// ToolRejection is one rejected call, reported to ToolRejecter after its batch.
+// Detail is the text the model was given as the error result, so a guard can quote
+// the same words the model saw instead of re-deriving them from history.
+type ToolRejection struct {
+	Call   core.ToolCall
+	Class  RejectClass
+	Detail string
+}
+
+// ToolRejecter is an optional middleware capability for observing rejected tool
+// calls: unknown names, rejected arguments, handler errors, abandoned timeouts.
+// The loop dispatches a batch's rejections after execTools returns and before the
+// step is checkpointed, so the hook runs serially on the loop's goroutine — unlike
+// AfterTool it needs no goroutine safety, and State.KV writes it makes are
+// checkpointed with this step. Middleware that does not implement it is skipped in
+// the fold (Stack.ToolReject), so behaviour is unchanged.
+//
+// The hook sees one call at a time and returns nothing: it can record, warn and
+// count, but the action it wants belongs to the next step's BeforeTool, as with
+// LoopGuard. Do not mutate the batch's results from here.
+type ToolRejecter interface {
+	OnToolReject(lc *LoopContext, r ToolRejection)
+}
+
 // RunFinisher is an optional middleware capability for work that belongs at the
 // very end of a run rather than inside a step: memory consolidation, a final
 // summary, releasing a resource. Run.drive calls FinishRun once, before it
@@ -175,6 +231,21 @@ func (s *Stack) ToolContext(lc *LoopContext, ctx context.Context, call *core.Too
 	return ctx, func() {
 		for i := len(cancels) - 1; i >= 0; i-- {
 			cancels[i]()
+		}
+	}
+}
+
+// ToolReject folds the optional ToolRejecter capability across the stack: every
+// call the batch rejected is handed to each implementer in registration order. It is
+// observational — no directive comes back — and runs on the loop's goroutine with
+// the batch already joined, so an implementation may write State.KV without locking.
+// With no implementer, or no rejection, it does nothing.
+func (s *Stack) ToolReject(lc *LoopContext, rejects []ToolRejection) {
+	for _, r := range rejects {
+		for _, m := range s.mws {
+			if tr, ok := m.(ToolRejecter); ok {
+				tr.OnToolReject(lc, r)
+			}
 		}
 	}
 }

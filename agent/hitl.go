@@ -134,13 +134,14 @@ type resumeBatch struct {
 	final  core.Message // assistant message that issued the calls, if a call ends the run
 }
 
-// runResumed executes a resumeBatch and returns its tool results in the model's
-// original call order, plus the batch's folded directive. Approved calls go
-// through execTools as one batch — so they inherit its concurrency decision, its
-// events, its AfterTool hooks and its immediate state application; denied or
-// undecided calls never reach a handler.
-func (l *AgentLoop) runResumed(rc *RunContext, rb *resumeBatch) ([]core.Part, core.Directive) {
-	lc := &LoopContext{RunContext: rc, Step: rb.step, MaxTurns: l.maxTurns, History: rc.State.Messages}
+// runResumed executes a resumeBatch under the step context the loop built for it
+// and returns its tool results in the model's original call order, the batch's
+// folded directive, and the calls this batch rejected. Approved calls go through
+// execTools as one batch — so they inherit its concurrency decision, its events,
+// its AfterTool hooks and its immediate state application; denied or undecided
+// calls never reach a handler.
+func (l *AgentLoop) runResumed(rb *resumeBatch, lc *LoopContext) ([]core.Part, core.Directive, []ToolRejection) {
+	rc := lc.RunContext
 
 	approved := make([]core.ToolCall, 0, len(rb.calls))
 	for _, c := range rb.calls {
@@ -148,7 +149,7 @@ func (l *AgentLoop) runResumed(rc *RunContext, rb *resumeBatch) ([]core.Part, co
 			approved = append(approved, c)
 		}
 	}
-	results, dirs := l.execTools(rc, lc, approved)
+	results, dirs, rejects := l.execTools(rc, lc, approved)
 
 	parts := make([]core.Part, 0, len(rb.calls))
 	next := 0
@@ -161,7 +162,7 @@ func (l *AgentLoop) runResumed(rc *RunContext, rb *resumeBatch) ([]core.Part, co
 		}
 		parts = append(parts, deniedResult(rc, c, rejectionReason(ap, recorded)))
 	}
-	return parts, core.Resolve(dirs...)
+	return parts, core.Resolve(dirs...), rejects
 }
 
 // rejectionReason words a denial for the model, which may re-route on it: an
@@ -200,6 +201,9 @@ func lastAssistant(msgs []core.Message) core.Message {
 // an error result reported to the model. It publishes the ToolStarted/ToolDone
 // pair so the decision is visible on the event stream, but the handler never
 // runs — so no AfterTool hook sees it, the same contract truncatedResults uses.
+// It is deliberately not a ToolRejection either: a human saying no is a decision,
+// not a sign the call was malformed, and counting it would let a gate trip an
+// argument guard.
 func deniedResult(rc *RunContext, c core.ToolCall, reason string) core.ToolResult {
 	rc.publish(core.ToolStarted{Call: c})
 	tr := errResult(c, reason)
