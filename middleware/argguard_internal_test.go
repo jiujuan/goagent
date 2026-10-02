@@ -207,6 +207,35 @@ func TestArgBudgetTurnsMarksIntoStops(t *testing.T) {
 	}
 }
 
+// TestArgWarningNamesTheRealConsequence: the warning closes by telling the model
+// what the next refusals do, and that must be the consequence it will actually
+// meet — pausing for a decision while the budget lasts, ending the run after.
+func TestArgWarningNamesTheRealConsequence(t *testing.T) {
+	pause := ArgGuard(ArgGuardOptions{}).(*argGuard).warningMessage("search", 3, "detail", nil, false).Text()
+	if !strings.Contains(pause, "pause this run for a human decision") {
+		t.Fatalf("warning with budget left = %q", pause)
+	}
+
+	stop := ArgGuard(ArgGuardOptions{}).(*argGuard).warningMessage("search", 3, "detail", nil, true).Text()
+	if !strings.Contains(stop, "end this run") || strings.Contains(stop, "pause this run") {
+		t.Fatalf("warning after the budget = %q", stop)
+	}
+
+	forced := ArgGuard(ArgGuardOptions{OnEscalate: ArgGuardStop}).(*argGuard).warningMessage("search", 3, "detail", nil, false).Text()
+	if !strings.Contains(forced, "end this run") {
+		t.Fatalf("warning under the stop policy = %q", forced)
+	}
+	// The refused call's own text is quoted back, and a multi-line one is clipped
+	// to its first line so the warning stays one message.
+	withReason := ArgGuard(ArgGuardOptions{}).(*argGuard).warningMessage("search", 3, "line one\nline two", []string{"q"}, false).Text()
+	if !strings.Contains(withReason, "last reason: line one") || strings.Contains(withReason, "line two") {
+		t.Fatalf("warning = %q, want only the first line of the reason", withReason)
+	}
+	if !strings.Contains(withReason, "required arguments are: q") {
+		t.Fatalf("warning = %q, want the required list", withReason)
+	}
+}
+
 // TestArgLedgerWritesPlainMaps guards the one thing that would silently break
 // durability: a value JSON cannot describe.
 func TestArgLedgerWritesPlainMaps(t *testing.T) {

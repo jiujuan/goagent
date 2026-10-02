@@ -145,7 +145,8 @@ func (g *argGuard) OnToolReject(lc *agent.LoopContext, r agent.ToolRejection) {
 	case rec.count >= g.opts.WarnThreshold && !rec.warned:
 		rec.warned = true
 		ledger.tools[name] = rec
-		lc.Steer(g.warningMessage(name, rec.count, r.Detail, requiredArgs(lc, name)))
+		lc.Steer(g.warningMessage(name, rec.count, r.Detail, requiredArgs(lc, name),
+			ledger.interventions >= g.opts.MaxInterventions))
 	}
 	lc.State.Apply(ledger.ops()...)
 }
@@ -176,8 +177,9 @@ func (g *argGuard) observe(lc *agent.LoopContext, name string, count int, class 
 
 // warningMessage tells the model which tool it is failing, how often, why last
 // time, and what that tool requires. The required list is dropped when the
-// advertisement cannot be read (see requiredArgs).
-func (g *argGuard) warningMessage(name string, count int, detail string, required []string) core.Message {
+// advertisement cannot be read (see requiredArgs); budgetSpent says which
+// consequence the next refusals actually carry.
+func (g *argGuard) warningMessage(name string, count int, detail string, required []string, budgetSpent bool) core.Message {
 	var b strings.Builder
 	b.WriteString(WarnMarkerArg + " Tool " + strconv.Quote(name) + " has been refused " + strconv.Itoa(count) + " times")
 	if reason := firstLine(detail); reason != "" {
@@ -188,12 +190,12 @@ func (g *argGuard) warningMessage(name string, count int, detail string, require
 		b.WriteString(" Its required arguments are: " + strings.Join(required, ", ") + ".")
 	}
 	b.WriteString(" Supply every required argument in one call, get what is missing another way, or answer without this tool:")
-	b.WriteString(" further refusals will " + g.escalationWords() + ".")
+	b.WriteString(" further refusals will " + g.escalationWords(budgetSpent) + ".")
 	return core.UserText(b.String())
 }
 
-func (g *argGuard) escalationWords() string {
-	if g.opts.OnEscalate == ArgGuardStop {
+func (g *argGuard) escalationWords(budgetSpent bool) string {
+	if budgetSpent || g.opts.OnEscalate == ArgGuardStop {
 		return "end this run"
 	}
 	return "pause this run for a human decision"
