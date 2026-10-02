@@ -29,11 +29,27 @@ type tagger struct {
 	sawTool    string
 	deadlineAt time.Time
 
-	mu     sync.Mutex
-	cancel context.CancelFunc
+	mu sync.Mutex
 }
 
-func (t *tagger) ToolContext(lc *agent.LoopContext, ctx context.Context, call *core.ToolCall) context.Context {
+// cancelTag records the order in which its cancel runs.
+type cancelTag struct {
+	agent.BaseMiddleware
+
+	name string
+	mu   *sync.Mutex
+	log  *[]string
+}
+
+func (c cancelTag) ToolContext(_ *agent.LoopContext, ctx context.Context, _ *core.ToolCall) (context.Context, context.CancelFunc) {
+	return ctx, func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		*c.log = append(*c.log, c.name)
+	}
+}
+
+func (t *tagger) ToolContext(lc *agent.LoopContext, ctx context.Context, call *core.ToolCall) (context.Context, context.CancelFunc) {
 	t.mu.Lock()
 	if v, ok := ctx.Value(ctxKey("tag")).(string); ok {
 		t.sawParent = v
@@ -42,12 +58,10 @@ func (t *tagger) ToolContext(lc *agent.LoopContext, ctx context.Context, call *c
 	t.mu.Unlock()
 	if !t.deadlineAt.IsZero() {
 		dctx, cancel := context.WithDeadline(ctx, t.deadlineAt)
-		t.mu.Lock()
-		t.cancel = cancel
-		t.mu.Unlock()
-		return dctx
+		return dctx, cancel
 	}
-	return context.WithValue(ctx, ctxKey("tag"), t.mark)
+	// Nothing to release on this path, which also exercises a nil cancel.
+	return context.WithValue(ctx, ctxKey("tag"), t.mark), nil
 }
 
 func (t *tagger) seen() (string, string) {
@@ -73,7 +87,7 @@ func TestStackToolContextFoldsInOrder(t *testing.T) {
 	stack := agent.NewStack(first, skip, second)
 
 	base := context.WithValue(context.Background(), ctxKey("tag"), "root")
-	got := stack.ToolContext(lc, base, call)
+	got, cancel := stack.ToolContext(lc, base, call)
 
 	if v := got.Value(ctxKey("tag")); v != "second" {
 		t.Fatalf("fold left tag = %v, want the last implementer's value", v)
@@ -85,9 +99,30 @@ func TestStackToolContextFoldsInOrder(t *testing.T) {
 		t.Fatalf("first saw parent=%q, want root", parent)
 	}
 
+	// Nothing was attached that needs releasing on the value path, so releasing
+	// the fold is a no-op rather than a nil-call panic.
+	cancel()
+
 	none := agent.NewStack(&plain{})
-	if got := none.ToolContext(lc, base, call); got.Value(ctxKey("tag")) != "root" {
+	gotNone, noneCancel := none.ToolContext(lc, base, call)
+	if gotNone.Value(ctxKey("tag")) != "root" {
 		t.Fatal("fold with no implementer changed the context")
+	}
+	noneCancel()
+
+	// Releases run in reverse registration order, so a middleware whose derived
+	// context wraps another's is untangled before the inner one. The skip in the
+	// middle contributes nothing.
+	var order []string
+	mu := &sync.Mutex{}
+	_, release := agent.NewStack(
+		cancelTag{name: "outer", mu: mu, log: &order},
+		&plain{},
+		cancelTag{name: "inner", mu: mu, log: &order},
+	).ToolContext(lc, base, call)
+	release()
+	if len(order) != 2 || order[0] != "inner" || order[1] != "outer" {
+		t.Fatalf("release order = %v, want inner then outer", order)
 	}
 }
 

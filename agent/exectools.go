@@ -143,13 +143,16 @@ func awaitAbandoned(ch <-chan toolOutcome, callCtx context.Context, c core.ToolC
 // is expressible — a context can carry an earlier deadline, never a later one, so
 // a tool needing more time than WithToolTimeout grants means setting that default
 // to 0 and bounding per tool with middleware instead.
+//
+// The returned CancelFunc releases both layers; execTools defers it per call,
+// which is also what tells an abandoned handler its context is done.
 func (l *AgentLoop) toolCallCtx(lc *LoopContext, c *core.ToolCall) (context.Context, context.CancelFunc) {
-	ctx := l.mw.ToolContext(lc, lc.RunContext.Context, c)
+	ctx, mwCancel := l.mw.ToolContext(lc, lc.RunContext.Context, c)
 	if l.toolTimeout <= 0 {
-		return ctx, func() {}
+		return ctx, mwCancel
 	}
-	callCtx, cancel := context.WithTimeout(ctx, l.toolTimeout)
-	return callCtx, cancel
+	callCtx, deadlineCancel := context.WithTimeout(ctx, l.toolTimeout)
+	return callCtx, func() { deadlineCancel(); mwCancel() }
 }
 
 // updaterContext carries the run's tool.Updater capability through a derived call

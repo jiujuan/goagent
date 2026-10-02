@@ -62,10 +62,17 @@ type ModelContexter interface {
 // does not implement it is skipped in the fold (Stack.ToolContext), so behaviour
 // is unchanged.
 //
+// The returned CancelFunc releases what the middleware attached — a deadline
+// keeps a timer registered on its parent until it is cancelled or the parent
+// ends, and a call happens per tool invocation. The loop calls it when the call
+// ends, across the whole stack in reverse registration order, and never while
+// the handler is still running, so it must be safe to call and safe to call
+// early from elsewhere. Returning nil means there is nothing to release.
+//
 // ToolContext runs once per tool call, from that call's worker goroutine, so an
 // implementation must be goroutine-safe.
 type ToolContexter interface {
-	ToolContext(lc *LoopContext, ctx context.Context, call *core.ToolCall) context.Context
+	ToolContext(lc *LoopContext, ctx context.Context, call *core.ToolCall) (context.Context, context.CancelFunc)
 }
 
 // HistoryCompacter is an optional middleware capability for rewriting the
@@ -145,16 +152,31 @@ func (s *Stack) ModelContext(lc *LoopContext, ctx context.Context) context.Conte
 
 // ToolContext folds the optional ToolContexter capability across the stack in
 // registration order: each implementer derives the context it is given, threaded
-// to the next. Middleware that does not implement it is skipped, so the returned
-// context equals the input when none does. It runs once per tool call, on that
-// call's worker goroutine.
-func (s *Stack) ToolContext(lc *LoopContext, ctx context.Context, call *core.ToolCall) context.Context {
+// to the next, and whatever it needs released is collected into one CancelFunc
+// called in reverse order. Middleware that does not implement it is skipped, and
+// with no implementer the context and a no-op cancel come back unchanged. It
+// runs once per tool call, on that call's worker goroutine.
+func (s *Stack) ToolContext(lc *LoopContext, ctx context.Context, call *core.ToolCall) (context.Context, context.CancelFunc) {
+	var cancels []context.CancelFunc
 	for _, m := range s.mws {
-		if tc, ok := m.(ToolContexter); ok {
-			ctx = tc.ToolContext(lc, ctx, call)
+		tc, ok := m.(ToolContexter)
+		if !ok {
+			continue
+		}
+		next, cancel := tc.ToolContext(lc, ctx, call)
+		if cancel != nil {
+			cancels = append(cancels, cancel)
+		}
+		ctx = next
+	}
+	if len(cancels) == 0 {
+		return ctx, func() {}
+	}
+	return ctx, func() {
+		for i := len(cancels) - 1; i >= 0; i-- {
+			cancels[i]()
 		}
 	}
-	return ctx
 }
 
 // CompactHistory folds the optional HistoryCompacter capability across the
