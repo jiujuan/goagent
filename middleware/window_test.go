@@ -455,6 +455,82 @@ func fixedCounter(n int) middleware.TokenCounter {
 	return func([]core.Message) int { return n }
 }
 
+// TestWindowOrderWithCompaction pins what the registration order actually
+// changes. Stack.ModifyRequest runs middleware in registration order
+// (agent/middleware.go:187-194), so with both installed one of them sees the
+// full history and the other sees the first one's output.
+//
+// Final size does NOT distinguish the two orders: compaction only ever shrinks a
+// history (one note replaces a prefix), so whatever the window's cap was, putting
+// compaction after it cannot exceed it either. What does change is whether the
+// summarizer runs at all, and whether the summary note survives the step — which
+// is the cost that matters, because summarizing costs a model call.
+//
+//	Compaction → Window:  summarizer runs on the full history, then the window
+//	                      evicts the note it just produced.
+//	Window → Compaction:  the window shrinks first; the summarizer's threshold is
+//	                      no longer met, so no call is spent.
+func TestWindowOrderWithCompaction(t *testing.T) {
+	const summaryPrefix = "[earlier conversation summary] "
+	history := func() []core.Message {
+		out := make([]core.Message, 10)
+		for i := range out {
+			out[i] = core.UserText(strings.Repeat("q", 40))
+		}
+		return out
+	}
+	newCompaction := func(calls *int) agent.Middleware {
+		sum := mock.New("s", func(req *llm.Request) *llm.Response {
+			*calls++
+			if len(req.Messages) > 0 {
+				// The summarizer is handed one rendered transcript message.
+				_ = req.Messages[0].Text()
+			}
+			return mock.Text("SUMMARY")
+		})
+		return middleware.Compaction(middleware.CompactionOptions{
+			Model: sum, MaxTokens: 10, KeepRecent: 6,
+			Counter: fixedCounter(100), // always over the threshold once history is long
+		})
+	}
+	window := func() agent.Middleware {
+		return middleware.Window(middleware.WindowOptions{Strategy: middleware.RecentN(1)})
+	}
+
+	t.Run("compaction first spends the call and the window drops the note", func(t *testing.T) {
+		calls := 0
+		s := agent.NewStack(newCompaction(&calls), window())
+		req := &llm.Request{Messages: history()}
+		if err := s.ModifyRequest(wndLC(), req); err != nil {
+			t.Fatal(err)
+		}
+		if calls == 0 {
+			t.Fatal("compaction ran first and should have summarized")
+		}
+		if len(req.Messages) != 1 {
+			t.Fatalf("the window last: kept %d messages, want 1", len(req.Messages))
+		}
+		if strings.HasPrefix(req.Messages[0].Text(), summaryPrefix) {
+			t.Fatal("the note survived; the window did not evict it")
+		}
+	})
+
+	t.Run("window first leaves the summarizer nothing to do", func(t *testing.T) {
+		calls := 0
+		s := agent.NewStack(window(), newCompaction(&calls))
+		req := &llm.Request{Messages: history()}
+		if err := s.ModifyRequest(wndLC(), req); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 0 {
+			t.Fatalf("the window shrank the history first, yet the summarizer ran %d times", calls)
+		}
+		if len(req.Messages) != 1 {
+			t.Fatalf("kept %d messages, want 1", len(req.Messages))
+		}
+	})
+}
+
 // TestWindowImportanceKeepsTheMidConversationDecision is the end-to-end case for
 // ImportanceWeighted: a run whose tool outputs are bulky and whose decisive turn
 // sits in the middle. A time-based policy would drop that turn as "old"; scoring
