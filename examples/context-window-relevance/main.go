@@ -259,8 +259,10 @@ func (s *embeddingScorer) ScoreContent(ctx context.Context, ref string, msgs []c
 }
 
 func (s *embeddingScorer) stats() string {
-	return fmt.Sprintf("打分 %d 条消息，其中送去编码 %d 条、命中缓存 %d 次；另外为参考文本本身编码 %d 次，当前缓存 %d 项",
-		s.scored, s.embedded, s.hits, s.refVecs, len(s.cache))
+	// 上限一并打出来：本例只有十来条不同内容，512 这条丢弃路径不会被走到，看的人
+	// 不至于以为"满了整体丢弃"是这一段实测到的行为。
+	return fmt.Sprintf("打分 %d 条消息，其中送去编码 %d 条、命中缓存 %d 条；另外编码参考文本 %d 条；当前缓存 %d 项（上限 %d，本例未触顶）",
+		s.scored, s.embedded, s.hits, s.refVecs, len(s.cache), s.cap)
 }
 
 // msgText 取一条消息里模型能读到的全部文本，包括工具结果的内容——
