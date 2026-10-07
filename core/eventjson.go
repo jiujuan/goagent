@@ -36,6 +36,7 @@ type eventWire struct {
 	Tool     string            `json:"tool,omitempty"`
 	Class    string            `json:"class,omitempty"`
 	Count    int               `json:"count,omitempty"`
+	Strategy string            `json:"strategy,omitempty"`
 }
 
 // MarshalEvent encodes an Event to tagged JSON.
@@ -89,6 +90,8 @@ func MarshalEvent(ev Event) ([]byte, error) {
 		w.Type, w.Reason, w.Step = "budget_exceeded", e.Resource, e.Step
 	case HistoryCompacted:
 		w.Type, w.Dropped, w.Kept, w.EstTok, w.Step = "history_compacted", e.Dropped, e.Kept, e.EstTokens, e.Step
+	case WindowTrimmed:
+		w.Type, w.Strategy, w.Dropped, w.Kept, w.EstTok, w.Step = "window_trimmed", e.Strategy, e.Dropped, e.Kept, e.EstTokens, e.Step
 	case ArgRejected:
 		w.Type, w.Tool, w.Class, w.Count, w.Step = "arg_rejected", e.Tool, e.Class, e.Count, e.Step
 	default:
@@ -142,6 +145,8 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		return BudgetExceeded{Resource: w.Reason, Step: w.Step}, nil
 	case "history_compacted":
 		return HistoryCompacted{Dropped: w.Dropped, Kept: w.Kept, EstTokens: w.EstTok, Step: w.Step}, nil
+	case "window_trimmed":
+		return WindowTrimmed{Strategy: w.Strategy, Dropped: w.Dropped, Kept: w.Kept, EstTokens: w.EstTok, Step: w.Step}, nil
 	case "arg_rejected":
 		return ArgRejected{Tool: w.Tool, Class: w.Class, Count: w.Count, Step: w.Step}, nil
 	default:

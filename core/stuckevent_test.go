@@ -65,3 +65,19 @@ func TestArgRejectedEventRoundTrip(t *testing.T) {
 		t.Fatalf("round trip = %#v, want %#v", out, in)
 	}
 }
+
+func TestWindowTrimmedEventRoundTrip(t *testing.T) {
+	in := WindowTrimmed{Strategy: "importance_weighted", Dropped: 12, Kept: 5, EstTokens: 9400, Step: 6}
+	data, err := MarshalEvent(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := out.(WindowTrimmed)
+	if !ok || got != in {
+		t.Fatalf("round trip = %#v, want %#v", out, in)
+	}
+}

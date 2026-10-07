@@ -113,6 +113,22 @@ type HistoryCompacted struct {
 	Step      int
 }
 
+// WindowTrimmed is emitted by the Window middleware each time it evicts message
+// units from what a step would otherwise send. Strategy names the policy
+// ("recent_n" | "sliding_window" | "importance_weighted"), Dropped and Kept
+// count messages (not units) after the pairing repair, EstTokens is the
+// calibrated estimate of the history before eviction, and Step is the loop step.
+// Unlike HistoryCompacted — which fires only when a durable summarization
+// rewrote the history — this fires per actual eviction, so a request-mode window
+// emits one for each step it trimmed, distinguishable by Step.
+type WindowTrimmed struct {
+	Strategy  string
+	Dropped   int
+	Kept      int
+	EstTokens int
+	Step      int
+}
+
 // ArgRejected is emitted by the argument-guard middleware each time a tool call is
 // refused before completing. Tool names the refused tool, Class is the loop's
 // classification ("unknown_tool" | "prepare_failed" | "schema_invalid" |
@@ -146,6 +162,7 @@ func (PlanNodeDone) isEvent()     {}
 func (StuckDetected) isEvent()    {}
 func (BudgetExceeded) isEvent()   {}
 func (HistoryCompacted) isEvent() {}
+func (WindowTrimmed) isEvent()    {}
 func (ArgRejected) isEvent()      {}
 
 // --- Payload types ----------------------------------------------------------
