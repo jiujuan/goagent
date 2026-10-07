@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/jiujuan/goagent/agent"
 	"github.com/jiujuan/goagent/core"
+	"github.com/jiujuan/goagent/llm"
 )
 
 // winAsst is an assistant message carrying one tool call per id.
@@ -233,4 +235,104 @@ func winOrphanCallIDs(msgs []core.Message) []string {
 		}
 	}
 	return orphans
+}
+
+// --- the middleware body ------------------------------------------------------
+
+// newCounter gives each strategy test a token measure it can state exactly: n
+// messages weigh n×per, so a budget reads as a message count.
+func newCounter(per int) TokenCounter {
+	return func(msgs []core.Message) int { return len(msgs) * per }
+}
+
+func TestWindowApplyCalibratesCount(t *testing.T) {
+	st := &core.State{}
+	lc := newLC(st, nil)
+	w := Window(WindowOptions{Strategy: SlidingWindow(1000), Counter: newCounter(10)}).(*window)
+
+	msgs := []core.Message{winUser("a"), winUser("b"), winUser("c")}
+	// No calibration record yet → the factor is 1, so 3 messages × 10 = 30.
+	if _, est, trimmed := w.apply(lc, msgs); est != 30 || trimmed {
+		t.Fatalf("uncalibrated apply: est=%d trimmed=%v, want 30/false", est, trimmed)
+	}
+
+	saveCalibAt(lc, kvWindow, 2.0)
+	if _, est, _ := w.apply(lc, msgs); est != 60 {
+		t.Fatalf("calibrated at 2.0: est=%d, want 60", est)
+	}
+	// A different key must not be read: Compaction's factor stays out of it.
+	saveCalibAt(lc, kvCompaction, 0.5)
+	if _, est, _ := w.apply(lc, msgs); est != 60 {
+		t.Fatalf("_compaction leaked into the window factor: est=%d, want 60", est)
+	}
+}
+
+// keepAll is a strategy that evicts nothing but can be asked to.
+type keepAll struct{}
+
+func (keepAll) Name() string { return "keep_all" }
+func (keepAll) Select(_ *agent.LoopContext, _ TokenCounter, msgs []core.Message) []core.Message {
+	return msgs
+}
+
+func TestWindowApplySkipsRepairWhenNothingEvicted(t *testing.T) {
+	// A stored history carrying a pre-existing orphan result.
+	msgs := []core.Message{winUser("q"), winTool("gone")}
+	w := Window(WindowOptions{Strategy: keepAll{}, Counter: newCounter(1)}).(*window)
+
+	out, _, trimmed := w.apply(&agent.LoopContext{RunContext: &agent.RunContext{State: &core.State{}}}, msgs)
+	if trimmed {
+		t.Fatal("a strategy that evicts nothing must not report a trim")
+	}
+	if &out[0] != &msgs[0] {
+		t.Fatal("the no-eviction path must hand back the input slice, not a repaired copy")
+	}
+	// The same strategy asked to drop one unit does run repair on the result.
+	dropOne := func(lc *agent.LoopContext, count TokenCounter, m []core.Message) []core.Message {
+		units := groupUnits(m)
+		return keptMessages(m, units[1:])
+	}
+	w2 := Window(WindowOptions{Strategy: funcStrategy(dropOne), Counter: newCounter(1)}).(*window)
+	out2, _, trimmed2 := w2.apply(&agent.LoopContext{RunContext: &agent.RunContext{State: &core.State{}}}, msgs)
+	if !trimmed2 || len(out2) != 0 {
+		t.Fatalf("after eviction the orphan should be repaired away, got trimmed=%v len=%d", trimmed2, len(out2))
+	}
+}
+
+// funcStrategy adapts a plain function to WindowStrategy (test-only).
+type funcStrategy func(lc *agent.LoopContext, count TokenCounter, msgs []core.Message) []core.Message
+
+func (f funcStrategy) Name() string { return "func" }
+func (f funcStrategy) Select(lc *agent.LoopContext, count TokenCounter, msgs []core.Message) []core.Message {
+	return f(lc, count, msgs)
+}
+
+func TestWindowStrategyDefaults(t *testing.T) {
+	if r := RecentN(0).(*recentN); r.keep != 1 {
+		t.Fatalf("RecentN(0).keep = %d, want 1", r.keep)
+	}
+	if s := SlidingWindow(0).(*slidingWindow); s.budget != defaultWindowBudget {
+		t.Fatalf("SlidingWindow(0).budget = %d, want %d", s.budget, defaultWindowBudget)
+	}
+	if got := []string{RecentN(2).Name(), SlidingWindow(10).Name()}; got[0] != "recent_n" || got[1] != "sliding_window" {
+		t.Fatalf("strategy names = %v", got)
+	}
+	// A nil strategy is a no-op middleware, not a panic (the RAG posture).
+	mw := Window(WindowOptions{})
+	lc := newLC(&core.State{}, &llm.Request{Messages: []core.Message{winUser("a")}})
+	if err := mw.ModifyRequest(lc, lc.Request); err != nil {
+		t.Fatal(err)
+	}
+	if len(lc.Request.Messages) != 1 {
+		t.Fatalf("nil strategy must leave the request alone, got %d", len(lc.Request.Messages))
+	}
+	if got := mw.(agent.HistoryCompacter).CompactHistory(lc, []core.Message{winUser("a")}); len(got) != 1 {
+		t.Fatalf("nil strategy must leave the history alone, got %d", len(got))
+	}
+	if _, err := mw.AfterModel(lc, &llm.Response{Usage: &core.Usage{InputTokens: 10}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loadCalibAt(lc, kvWindow); ok {
+		t.Fatal("a middleware without a strategy must not write a calibration")
+	}
 }

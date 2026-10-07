@@ -1,16 +1,21 @@
 package middleware
 
 import (
+	"github.com/jiujuan/goagent/agent"
 	"github.com/jiujuan/goagent/core"
+	"github.com/jiujuan/goagent/llm"
 )
 
-// Context-window eviction. The window strategies (RecentN, SlidingWindow,
-// ImportanceWeighted) drop messages instead of summarizing them, and the whole
-// point of this file is that they drop *units*, never single messages: an
-// assistant tool call and the tool results that answer it travel together, or
-// the request reaches a provider with an orphan result it cannot match.
+// Context-window eviction. Window bounds one request's message history by
+// *evicting* whole message units, as opposed to Compaction, which *summarizes*
+// them: eviction costs no model call and gives a hard cap, but loses content.
+// The built-in policies are RecentN and SlidingWindow (see WindowStrategy for
+// the measure each one uses, and for ImportanceWeighted's scoring).
 //
-// The unit rules and the pairing repair below implement ADR-0031 §3.
+// The whole point of this file is that it drops *units*, never single messages:
+// an assistant tool call and the tool results that answer it travel together, or
+// the request reaches a provider with an orphan result it cannot match. The unit
+// rules and the pairing repair below implement ADR-0031 §3.
 
 // unit is one message or message group that eviction decides about as a whole.
 type unit struct {
@@ -131,3 +136,254 @@ func repairPairing(msgs []core.Message) []core.Message {
 	}
 	return out
 }
+
+// --- the middleware -----------------------------------------------------------
+
+// kvWindow holds this middleware's token-calibration factor. It is deliberately
+// not kvCompaction: saveCalibAt overwrites the whole value at its key, so two
+// writers sharing one key would silently erase each other's factor.
+const kvWindow = "_window"
+
+// WindowOptions configures Window.
+type WindowOptions struct {
+	// Strategy decides what survives the window. Without it Window is a no-op
+	// (same posture as RAG with a nil Retriever).
+	Strategy WindowStrategy
+	// Counter estimates tokens for a message slice. nil uses the built-in
+	// rune-aware estimator (estimateTokens). Ignored by RecentN, which measures
+	// units, not tokens.
+	Counter TokenCounter
+	// Persist has the same meaning as in CompactionOptions: rewrite the working
+	// history itself via the loop's HistoryCompacter capability, so the eviction
+	// is durable and shrinks the checkpointed state, instead of reshaping only
+	// the outgoing request every step. When true, ModifyRequest leaves the
+	// request untouched.
+	Persist bool
+}
+
+// Window bounds the message history of one model call by evicting whole message
+// units. Two mount points, two modes, mutually exclusive like Compaction's:
+//
+//   - request mode (default): rewrites only the outgoing request in
+//     ModifyRequest; stored State keeps the full history, and the decision is
+//     recomputed each step.
+//   - persist mode (Persist): rewrites the working history itself in
+//     CompactHistory, so what was evicted stays evicted and the checkpoint
+//     shrinks.
+//
+// Both modes scale their token measure by a rolling calibration factor learned
+// from each response's real Usage.InputTokens versus the estimate (kept in
+// State.KV under _window, so it survives resume), which corrects the estimator
+// and folds in the system-prompt and tool-schema overhead.
+//
+// Eviction is lossy in a way summarization is not: what leaves the window is
+// gone from what the model sees. The full history remains recoverable from
+// earlier checkpoints (a File checkpointer appends one whole snapshot per step)
+// and from working memory if it was written there, but neither is a path the
+// model can consult by itself.
+func Window(o WindowOptions) agent.Middleware {
+	counter := o.Counter
+	if counter == nil {
+		counter = estimateTokens
+	}
+	return &window{strategy: o.Strategy, counter: counter, persist: o.Persist}
+}
+
+type window struct {
+	agent.BaseMiddleware
+	strategy WindowStrategy
+	counter  TokenCounter
+	persist  bool
+}
+
+// ModifyRequest performs the request-mode rewrite; in persist mode the durable
+// rewrite happens in CompactHistory instead, so the request is left untouched.
+func (w *window) ModifyRequest(lc *agent.LoopContext, req *llm.Request) error {
+	if w.persist || w.strategy == nil {
+		return nil
+	}
+	in := req.Messages
+	out, est, trimmed := w.apply(lc, in)
+	if !trimmed {
+		return nil
+	}
+	req.Messages = out
+	w.publishTrimmed(lc, in, out, est)
+	return nil
+}
+
+// CompactHistory is the HistoryCompacter entry point: in persist mode it replaces
+// the working history with the evicted form, which the loop then checkpoints. A
+// no-op (history unchanged) in request mode.
+func (w *window) CompactHistory(lc *agent.LoopContext, history []core.Message) []core.Message {
+	if !w.persist || w.strategy == nil {
+		return history
+	}
+	out, est, trimmed := w.apply(lc, history)
+	if !trimmed {
+		return history
+	}
+	w.publishTrimmed(lc, history, out, est)
+	return out
+}
+
+// apply runs the three steps of one eviction decision: split into units, ask the
+// strategy which units survive, then repair pairing. est is the calibrated token
+// estimate of the input before eviction. trimmed is false when the strategy took
+// nothing out, in which case the input slice is returned unchanged — and pairing
+// repair is skipped too, so a pre-existing orphan in the stored history is never
+// silently rewritten by a step that decided to evict nothing.
+func (w *window) apply(lc *agent.LoopContext, msgs []core.Message) (out []core.Message, est int, trimmed bool) {
+	factor := loadCalibDefaultAt(lc, kvWindow)
+	count := func(m []core.Message) int { return int(float64(w.counter(m)) * factor) }
+	est = count(msgs)
+	kept := w.strategy.Select(lc, count, msgs)
+	if len(kept) >= len(msgs) {
+		return msgs, est, false
+	}
+	return repairPairing(kept), est, true
+}
+
+// publishTrimmed emits core.WindowTrimmed for one eviction that actually
+// happened. Dropped/Kept count messages (not units), measured against the input
+// of this step and after the pairing repair.
+func (w *window) publishTrimmed(lc *agent.LoopContext, in, out []core.Message, est int) {
+	if lc.Bus == nil {
+		return
+	}
+	lc.Bus.Publish(lc.Topic, core.WindowTrimmed{
+		Strategy:  w.strategy.Name(),
+		Dropped:   len(in) - len(out),
+		Kept:      len(out),
+		EstTokens: est,
+		Step:      lc.Step,
+	})
+}
+
+// AfterModel calibrates the estimator against the provider's real input-token
+// count, same algorithm as Compaction's (see compaction.go AfterModel). Two
+// facts about the plumbing are worth naming here because they make this
+// measurement coarser than it looks: lc.Request is the same pointer the request
+// middleware rewrote, and Stack.AfterModel runs in reverse registration order,
+// so when several window/compaction middleware are installed each one calibrates
+// against the FINAL message set that was sent — not against what it produced.
+// That is the right target (the estimator must explain the real bytes on the
+// wire), but it is not a per-middleware measurement.
+func (w *window) AfterModel(lc *agent.LoopContext, resp *llm.Response) (core.Directive, error) {
+	if lc.State == nil || resp.Usage == nil || resp.Usage.InputTokens <= 0 || lc.Request == nil || w.strategy == nil {
+		return core.Directive{}, nil
+	}
+	est := w.counter(lc.Request.Messages)
+	if est <= 0 {
+		return core.Directive{}, nil
+	}
+	ratio := clamp(float64(resp.Usage.InputTokens)/float64(est), 0.5, 2.0)
+	if prev, ok := loadCalibAt(lc, kvWindow); ok {
+		ratio = 0.7*prev + 0.3*ratio
+	}
+	saveCalibAt(lc, kvWindow, ratio)
+	return core.Directive{}, nil
+}
+
+// --- strategies ---------------------------------------------------------------
+
+// WindowStrategy decides which part of a message history survives the window.
+// The three built-in policies differ exactly as follows (ADR-0031 §1); the names
+// overlap in the wider world — "sliding window" elsewhere often means "the last
+// N messages", which is not what SlidingWindow here does:
+//
+//   - RecentN: keeps the last N units. Measures units, not tokens. Never calls
+//     count. Cheapest, lossiest.
+//   - SlidingWindow: keeps a contiguous tail of units whose calibrated tokens fit
+//     the budget. Measures tokens; gives a predictable request size.
+//   - ImportanceWeighted: keeps a scored, non-contiguous selection within the
+//     budget. Measures tokens and scores content.
+//
+// A strategy may only drop whole units. The middleware flattens the selection,
+// repairs pairing, and skips the step when nothing was taken out.
+type WindowStrategy interface {
+	// Select returns the messages to keep, in their original relative order.
+	// Returning msgs (or a slice of the same length) means "evict nothing this
+	// step". count is the run's calibrated token measure — never nil, and the
+	// only way to read the budget in tokens.
+	Select(lc *agent.LoopContext, count TokenCounter, msgs []core.Message) []core.Message
+	// Name identifies the policy in core.WindowTrimmed.
+	Name() string
+}
+
+// RecentN keeps the last keep message units verbatim and drops everything older.
+// The measure is units, so "one assistant tool call plus its results" counts as
+// one kept item — keeping N messages by count would cut a call off from its
+// results. No token counting is involved, so Options.Counter is ignored.
+func RecentN(keep int) WindowStrategy {
+	if keep <= 0 {
+		keep = 1
+	}
+	return &recentN{keep: keep}
+}
+
+type recentN struct{ keep int }
+
+func (r *recentN) Name() string { return "recent_n" }
+
+func (r *recentN) Select(_ *agent.LoopContext, _ TokenCounter, msgs []core.Message) []core.Message {
+	units := groupUnits(msgs)
+	if len(units) <= r.keep {
+		return msgs
+	}
+	return keptMessages(msgs, units[len(units)-r.keep:])
+}
+
+// defaultWindowBudget is the SlidingWindow fallback budget. 4000 tokens is
+// deliberately below Compaction's 8000 history threshold: a window asked to be
+// the last gate before sending should cap tighter than the summarizer.
+const defaultWindowBudget = 4000
+
+// SlidingWindow keeps the longest contiguous run of recent message units whose
+// calibrated token estimate fits budgetTokens. Unlike RecentN it measures
+// tokens, so one oversized tool result cannot blow up the request size: the run
+// simply starts later.
+//
+// The newest unit is always kept, even when it alone exceeds the budget. A window
+// is allowed to send too much; it is not allowed to send nothing, and trimming
+// *inside* a unit would mean rewriting a tool call or its result, which is the
+// tool layer's job (see ADR-0031 §1). The overrun is visible in the event: a step
+// with Dropped 0 and EstTokens above the budget was exactly that case.
+func SlidingWindow(budgetTokens int) WindowStrategy {
+	if budgetTokens <= 0 {
+		budgetTokens = defaultWindowBudget
+	}
+	return &slidingWindow{budget: budgetTokens}
+}
+
+type slidingWindow struct{ budget int }
+
+func (s *slidingWindow) Name() string { return "sliding_window" }
+
+func (s *slidingWindow) Select(_ *agent.LoopContext, count TokenCounter, msgs []core.Message) []core.Message {
+	units := groupUnits(msgs)
+	used, start := 0, len(units)
+	for i := len(units) - 1; i >= 0; i-- {
+		size := count(msgs[units[i].start:units[i].end])
+		if i == len(units)-1 {
+			// The newest unit goes in unconditionally — see SlidingWindow.
+			start = i
+			used += size
+			continue
+		}
+		if used+size > s.budget {
+			break
+		}
+		start = i
+		used += size
+	}
+	if start <= 0 {
+		return msgs
+	}
+	return keptMessages(msgs, units[start:])
+}
+
+var _ agent.Middleware = (*window)(nil)
+var _ agent.HistoryCompacter = (*window)(nil)
+var _ WindowStrategy = (*recentN)(nil)
+var _ WindowStrategy = (*slidingWindow)(nil)
