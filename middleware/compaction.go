@@ -202,11 +202,16 @@ func (c *compaction) summarize(ctx context.Context, msgs []core.Message) (string
 
 // --- calibration state --------------------------------------------------------
 
-func loadCalib(lc *agent.LoopContext) (float64, bool) {
+// The *At variants take the State.KV key explicitly so more than one middleware
+// can keep its own factor: saveCalibAt overwrites the whole value at its key, so
+// sharing a key would silently erase the other writer. loadCalibAt reads the
+// same shape written by saveCalibAt.
+
+func loadCalibAt(lc *agent.LoopContext, key string) (float64, bool) {
 	if lc.State == nil {
 		return 0, false
 	}
-	m, ok := lc.State.KV[kvCompaction].(map[string]any)
+	m, ok := lc.State.KV[key].(map[string]any)
 	if !ok {
 		return 0, false
 	}
@@ -217,16 +222,22 @@ func loadCalib(lc *agent.LoopContext) (float64, bool) {
 	return f, true
 }
 
-func loadCalibDefault(lc *agent.LoopContext) float64 {
-	if f, ok := loadCalib(lc); ok {
+func loadCalibDefaultAt(lc *agent.LoopContext, key string) float64 {
+	if f, ok := loadCalibAt(lc, key); ok {
 		return f
 	}
 	return 1.0
 }
 
-func saveCalib(lc *agent.LoopContext, v float64) {
-	lc.State.Apply(core.StateOp{Kind: core.OpSetKV, Key: kvCompaction, Value: map[string]any{"calib": v}})
+func saveCalibAt(lc *agent.LoopContext, key string, v float64) {
+	lc.State.Apply(core.StateOp{Kind: core.OpSetKV, Key: key, Value: map[string]any{"calib": v}})
 }
+
+func loadCalib(lc *agent.LoopContext) (float64, bool) { return loadCalibAt(lc, kvCompaction) }
+
+func loadCalibDefault(lc *agent.LoopContext) float64 { return loadCalibDefaultAt(lc, kvCompaction) }
+
+func saveCalib(lc *agent.LoopContext, v float64) { saveCalibAt(lc, kvCompaction, v) }
 
 func clamp(v, lo, hi float64) float64 {
 	if v < lo {
