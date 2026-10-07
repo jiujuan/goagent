@@ -454,3 +454,113 @@ func TestWindowCalibrationIsolatedFromCompaction(t *testing.T) {
 func fixedCounter(n int) middleware.TokenCounter {
 	return func([]core.Message) int { return n }
 }
+
+// TestWindowImportanceKeepsTheMidConversationDecision is the end-to-end case for
+// ImportanceWeighted: a run whose tool outputs are bulky and whose decisive turn
+// sits in the middle. A time-based policy would drop that turn as "old"; scoring
+// keeps it while giving up the bulky, stale tool results.
+//
+// The decision turn carries a small tool call as well as its text: an assistant
+// message without tool calls would end the run there, and the point is to keep
+// deciding *after* it. The assertions read the request the model actually
+// received (the middleware rewrites req.Messages before the call), not the
+// stored history.
+func TestWindowImportanceKeepsTheMidConversationDecision(t *testing.T) {
+	const decision = "decision: ship plan B, budget first"
+	turn := 0
+	var lastSent []core.Message
+	conv := mock.New("m", func(req *llm.Request) *llm.Response {
+		lastSent = req.Messages
+		turn++
+		switch turn {
+		case 1, 3, 4, 5: // each fetch returns 400 characters
+			return mock.CallTool("c"+string(rune('0'+turn)), "fetch", "{}")
+		case 2: // the decisive turn, plus one cheap call so the run continues
+			return &llm.Response{Message: core.Message{Role: core.RoleAssistant, Parts: []core.Part{
+				core.Text{Text: decision},
+				core.ToolCall{ID: "c2", Name: "note", Args: []byte("{}")},
+			}}}
+		default:
+			return mock.Text("done")
+		}
+	})
+	fetch := tool.New("fetch", "fetch", func(_ *tool.Context, _ struct{}) (string, error) {
+		return strings.Repeat("y", 400), nil
+	})
+	note := tool.New("note", "note", func(_ *tool.Context, _ struct{}) (string, error) {
+		return "noted", nil
+	})
+	store := checkpoint.NewMemory()
+	a, err := agent.New(
+		agent.WithModel(conv),
+		agent.WithTools(fetch, note),
+		agent.WithMiddleware(middleware.Window(middleware.WindowOptions{
+			// The built-in heuristic scorer: no injected scoring, no network.
+			Strategy: middleware.ImportanceWeighted(middleware.ImportanceOptions{BudgetTokens: 200}),
+		})),
+		agent.WithCheckpointer(store),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := a.Stream(context.Background(), "how do we cap the budget")
+	for range collect(run) {
+	}
+	if turn < 6 || lastSent == nil {
+		t.Fatalf("test premise broken: model calls = %d", turn)
+	}
+
+	var sent string
+	sentBig := 0
+	for _, m := range lastSent {
+		sent += m.Text()
+		for _, p := range m.Parts {
+			tr, ok := p.(core.ToolResult)
+			if !ok {
+				continue
+			}
+			for _, c := range tr.Content {
+				if t2, ok := c.(core.Text); ok && strings.Contains(t2.Text, strings.Repeat("y", 200)) {
+					sentBig++
+				}
+			}
+		}
+	}
+	if !strings.Contains(sent, decision) {
+		t.Fatalf("the mid-run decision is missing from what the model saw (%d messages, %d big results sent)", len(lastSent), sentBig)
+	}
+
+	cp, err := store.Latest(context.Background(), run.ThreadID)
+	if err != nil || cp == nil {
+		t.Fatalf("no checkpoint: %v", err)
+	}
+	storedBig := 0
+	for _, m := range cp.State.Messages {
+		for _, p := range m.Parts {
+			tr, ok := p.(core.ToolResult)
+			if !ok {
+				continue
+			}
+			for _, c := range tr.Content {
+				if t2, ok := c.(core.Text); ok && strings.Contains(t2.Text, strings.Repeat("y", 200)) {
+					storedBig++
+				}
+			}
+		}
+	}
+	if storedBig != 4 {
+		t.Fatalf("test premise broken: stored big tool results = %d, want 4", storedBig)
+	}
+	// The window did drop bulk: only the newest fetch unit can be in the request.
+	if sentBig == 0 || sentBig >= storedBig {
+		t.Fatalf("sent %d big results of %d stored: nothing was traded away", sentBig, storedBig)
+	}
+	// Request mode keeps everything in the store, so the trimmed turns are still
+	// recoverable from the checkpoint even though the model did not see them.
+	if len(cp.State.Messages) <= len(lastSent) {
+		t.Fatalf("stored history should be larger than the trimmed request: %d vs %d", len(cp.State.Messages), len(lastSent))
+	}
+	if orphans := wndOrphans(lastSent); len(orphans) > 0 {
+		t.Fatalf("the trimmed request carries orphan results %v", orphans)
+	}
+}

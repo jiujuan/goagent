@@ -1,10 +1,14 @@
 package middleware
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/jiujuan/goagent/agent"
+	"github.com/jiujuan/goagent/bus"
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/llm"
 )
@@ -305,6 +309,267 @@ type funcStrategy func(lc *agent.LoopContext, count TokenCounter, msgs []core.Me
 func (f funcStrategy) Name() string { return "func" }
 func (f funcStrategy) Select(lc *agent.LoopContext, count TokenCounter, msgs []core.Message) []core.Message {
 	return f(lc, count, msgs)
+}
+
+// --- the importance-weighted strategy ----------------------------------------
+
+// stubScorer is a MessageScorer whose per-message scores are supplied by hand,
+// so a test can separate the scoring policy from the selection policy.
+type stubScorer struct {
+	scores []float64
+	calls  int
+}
+
+func (s *stubScorer) ScoreContent(_ context.Context, _ string, msgs []core.Message) ([]float64, error) {
+	s.calls++
+	if len(s.scores) != len(msgs) {
+		return nil, nil
+	}
+	return s.scores, nil
+}
+
+// textMsg is a plain message of exactly n characters of the given filler, which
+// under the built-in estimator weighs n/4 + 4 tokens. The filler makes units
+// identifiable after keptMessages copies them: pointer identity cannot be used,
+// and equal-length fillers keep every unit the same size so that only the term
+// under test decides.
+func textMsg(role core.Role, n int) core.Message {
+	return textFill(role, 'x', n)
+}
+
+func textFill(role core.Role, fill byte, n int) core.Message {
+	return core.Message{Role: role, Parts: []core.Part{core.Text{Text: strings.Repeat(string(fill), n)}}}
+}
+
+// fills lists the filler of each message, i.e. which units survived.
+func fills(msgs []core.Message) string {
+	var b strings.Builder
+	for _, m := range msgs {
+		t := m.Text()
+		if t == "" {
+			b.WriteByte('-')
+			continue
+		}
+		b.WriteByte(t[0])
+	}
+	return b.String()
+}
+
+func TestImportanceGreedyUsesValuePerToken(t *testing.T) {
+	// One large unit with the highest content score (92 tokens), and six small
+	// ones (9 tokens each). The budget must be one the large unit can take first
+	// and then have little left for: at 120, ranking by score keeps the large unit
+	// plus two small ones, while ranking by score per token keeps all six small
+	// ones and drops the large one. At 100 the two rankings agree, which is why
+	// the first version of this test proved nothing.
+	msgs := []core.Message{
+		textFill(core.RoleAssistant, 'b', 350), // 92 tokens, score 1.0
+		textMsg(core.RoleAssistant, 20),        // 9 tokens each, score 0.2
+		textMsg(core.RoleAssistant, 20),
+		textMsg(core.RoleAssistant, 20),
+		textMsg(core.RoleAssistant, 20),
+		textMsg(core.RoleAssistant, 20),
+		textMsg(core.RoleAssistant, 20),
+	}
+	scores := []float64{1.0, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2}
+	st := &stubScorer{scores: scores}
+	s := ImportanceWeighted(ImportanceOptions{BudgetTokens: 120, Scorer: st, NoPinFirst: true})
+
+	out := s.Select(newLC(&core.State{}, nil), estimateTokens, msgs)
+	if got := fills(out); strings.Contains(got, "b") {
+		t.Fatalf("kept [%s]: the oversized unit was taken first, so ranking was by score, not score per token", got)
+	}
+	if len(out) < 6 {
+		t.Fatalf("kept %d messages [%s], want the six small units", len(out), fills(out))
+	}
+}
+
+func TestImportancePinFirstUser(t *testing.T) {
+	// Four units of identical size, identical content score; a budget for two.
+	// Without pinning, recency alone decides, so the oldest (the user turn) loses.
+	msgs := []core.Message{
+		textFill(core.RoleUser, 'q', 20),
+		textFill(core.RoleAssistant, 'a', 20),
+		textFill(core.RoleAssistant, 'b', 20),
+		textFill(core.RoleAssistant, 'c', 20),
+	}
+	scores := []float64{0.2, 0.2, 0.2, 0.2}
+
+	pinned := ImportanceWeighted(ImportanceOptions{BudgetTokens: 18, Scorer: &stubScorer{scores: scores}})
+	if got := fills(pinned.Select(newLC(&core.State{}, nil), estimateTokens, msgs)); got != "qc" {
+		t.Fatalf("with pinning kept [%s], want [qc] (the task definition plus the newest unit)", got)
+	}
+
+	unpinned := ImportanceWeighted(ImportanceOptions{BudgetTokens: 18, Scorer: &stubScorer{scores: scores}, NoPinFirst: true})
+	if got := fills(unpinned.Select(newLC(&core.State{}, nil), estimateTokens, msgs)); got != "bc" {
+		t.Fatalf("without pinning kept [%s], want [bc] (the two most recent units)", got)
+	}
+}
+
+func TestImportanceSkipsUnfitUnitsInsteadOfStopping(t *testing.T) {
+	// A unit that no longer fits is skipped, not a stopping point: otherwise one
+	// large valuable unit evaluated early would block every smaller one behind it.
+	// Units: A = a call plus its results (2 messages, content 0.8 each), B = one
+	// message (content 0.4), plus the newest unit which is always kept.
+	msgs := []core.Message{
+		winAsst("c1", "c2", "c3"),
+		winTool("c1", "c2", "c3"),
+		textFill(core.RoleAssistant, 'b', 20),
+		textFill(core.RoleAssistant, 'd', 20),
+	}
+	scores := []float64{0.8, 0.8, 0.4, 0.4}
+	s := ImportanceWeighted(ImportanceOptions{BudgetTokens: 2, Scorer: &stubScorer{scores: scores}, NoPinFirst: true})
+	out := s.Select(newLC(&core.State{}, nil), newCounter(1), msgs)
+	if got := fills(out); got != "bd" {
+		t.Fatalf("kept [%s], want [bd]: an unfit but valuable unit should be skipped, not stop the pass", got)
+	}
+}
+
+func TestImportanceUnitScoreIsSummed(t *testing.T) {
+	// A unit is a call and its result, and it is worth the sum of its parts: an
+	// average would make a two-message unit score like a one-message one, letting
+	// the budget prefer a lone turn over a decision plus its evidence. TauUnits is
+	// set huge so the recency term adds the same to every unit, leaving
+	// aggregation as the only thing that decides.
+	msgs := []core.Message{
+		winAsst("c1"),                         // content 0.9
+		winTool("c1"),                         // content 0.9 → unit A, two messages
+		textFill(core.RoleAssistant, 'b', 20), // content 0.6 → unit B, one message
+		textFill(core.RoleAssistant, 'd', 20), // newest unit, always kept
+	}
+	scores := []float64{0.9, 0.9, 0.6, 0.6}
+	s := ImportanceWeighted(ImportanceOptions{BudgetTokens: 3, TauUnits: 10000, Scorer: &stubScorer{scores: scores}, NoPinFirst: true})
+	out := s.Select(newLC(&core.State{}, nil), newCounter(1), msgs)
+	if len(out) != 3 {
+		t.Fatalf("kept %d messages [%s], want 3 (unit A plus the newest unit)", len(out), fills(out))
+	}
+	if _, ok := out[1].Parts[0].(core.ToolResult); !ok {
+		t.Fatalf("unit A's result is missing, so the unit was averaged rather than summed: [%s]", fills(out))
+	}
+}
+
+func TestImportanceRecencyBreaksTies(t *testing.T) {
+	// Equal content scores and equal sizes; a budget for two units. Without the
+	// recency term the tie would be broken by original order, keeping the OLDEST
+	// of the candidates instead of the one nearest the end.
+	msgs := []core.Message{
+		textFill(core.RoleAssistant, 'a', 20),
+		textFill(core.RoleAssistant, 'b', 20),
+		textFill(core.RoleAssistant, 'c', 20),
+		textFill(core.RoleAssistant, 'd', 20),
+	}
+	scores := []float64{0.5, 0.5, 0.5, 0.5}
+	s := ImportanceWeighted(ImportanceOptions{BudgetTokens: 18, Scorer: &stubScorer{scores: scores}, NoPinFirst: true})
+	if got := fills(s.Select(newLC(&core.State{}, nil), estimateTokens, msgs)); got != "cd" {
+		t.Fatalf("kept [%s], want [cd]: recency did not break the tie", got)
+	}
+}
+
+func TestImportanceScorerErrorLeavesHistoryUnchanged(t *testing.T) {
+	msgs := []core.Message{core.UserText("q"), textMsg(core.RoleAssistant, 60), textMsg(core.RoleAssistant, 60)}
+	// The stub returns a usable-looking result AND an error: a stub that returned
+	// nil with the error would let an "ignore the error" defect hide behind the
+	// length check, and the test would pass for the wrong reason.
+	bad := errScorer{scores: []float64{0.9, 0.9, 0.9}}
+	s := ImportanceWeighted(ImportanceOptions{BudgetTokens: 1, Scorer: bad})
+
+	// Direct call: untouched.
+	if out := s.Select(newLC(&core.State{}, nil), estimateTokens, msgs); &out[0] != &msgs[0] {
+		t.Fatal("a scorer error must return the input history")
+	}
+	// Through the middleware: no rewrite and no event.
+	b := bus.New()
+	ch, cancel := b.Subscribe("importance-error", bus.Lossy)
+	defer cancel()
+	lc := &agent.LoopContext{RunContext: &agent.RunContext{
+		Context: context.Background(), State: &core.State{}, Bus: b, Topic: "importance-error",
+	}}
+	req := &llm.Request{Messages: msgs}
+	if err := Window(WindowOptions{Strategy: s}).ModifyRequest(lc, req); err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Messages) != len(msgs) {
+		t.Fatalf("a scorer error must not evict, kept %d of %d", len(req.Messages), len(msgs))
+	}
+	cancel()
+	if n := len(winDrainEvents(ch)); n != 0 {
+		t.Fatalf("a failed scoring step must publish nothing, saw %d", n)
+	}
+}
+
+// errScorer hands back a full-length result together with an error.
+type errScorer struct{ scores []float64 }
+
+func (e errScorer) ScoreContent(context.Context, string, []core.Message) ([]float64, error) {
+	return e.scores, errors.New("scorer down")
+}
+
+// winDrainEvents reads a closed event channel dry.
+func winDrainEvents(ch <-chan core.Event) []core.Event {
+	var out []core.Event
+	for ev := range ch {
+		out = append(out, ev)
+	}
+	return out
+}
+
+func TestHeuristicScorerReadsToolResultsAndCJK(t *testing.T) {
+	// A tool result mentioning the question's terms must not score below an
+	// assistant message that does not: Message.Text() alone cannot see inside a
+	// ToolResult, so windowText has to.
+	tool := core.Message{Role: core.RoleTool, Parts: []core.Part{
+		core.ToolResult{CallID: "c1", Name: "t", Content: []core.Part{core.Text{Text: "the budget table rows"}}},
+	}}
+	plain := textMsg(core.RoleAssistant, 20)
+	scores, err := heuristicScorer{}.ScoreContent(context.Background(), "budget table rows", []core.Message{tool, plain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scores[0] <= scores[1] {
+		t.Fatalf("a tool result matching the query scored %v, an unmatched assistant %v", scores[0], scores[1])
+	}
+
+	// Chinese is not split on whitespace: single wide characters become tokens, so
+	// a CJK question must still match a CJK message.
+	cjkTool := core.Message{Role: core.RoleTool, Parts: []core.Part{
+		core.ToolResult{CallID: "c1", Name: "t", Content: []core.Part{core.Text{Text: "会话预算已经超了"}}},
+	}}
+	cjkPlain := core.Message{Role: core.RoleAssistant, Parts: []core.Part{core.Text{Text: "一切正常"}}}
+	got, err := heuristicScorer{}.ScoreContent(context.Background(), "预算超了", []core.Message{cjkTool, cjkPlain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0] <= got[1] {
+		t.Fatalf("CJK matching failed: matched tool %v, unmatched assistant %v", got[0], got[1])
+	}
+	// Empty ref: role prior only, and no division by zero.
+	empty, err := heuristicScorer{}.ScoreContent(context.Background(), "", []core.Message{core.UserText("x"), cjkTool})
+	if err != nil || empty[0] <= empty[1] {
+		t.Fatalf("with no query the role prior should decide, got %v err=%v", empty, err)
+	}
+}
+
+func TestImportanceDefaults(t *testing.T) {
+	s := ImportanceWeighted(ImportanceOptions{}).(*importanceWeighted)
+	if s.budget != defaultWindowBudget || s.tau != float64(defaultImportanceTau) || !s.pinFirst {
+		t.Fatalf("defaults = %+v, want budget %d tau %d pinned", s, defaultWindowBudget, defaultImportanceTau)
+	}
+	if _, ok := s.scorer.(heuristicScorer); !ok {
+		t.Fatalf("scorer = %T, want the built-in heuristic", s.scorer)
+	}
+	if s.Name() != "importance_weighted" {
+		t.Fatalf("Name = %q", s.Name())
+	}
+	// An empty history and a scorer returning the wrong length are both no-ops.
+	count := newCounter(1)
+	if out := s.Select(newLC(&core.State{}, nil), count, nil); out != nil {
+		t.Fatalf("empty history should come back empty, got %d", len(out))
+	}
+	wrongLen := ImportanceWeighted(ImportanceOptions{Scorer: &stubScorer{scores: []float64{1}}})
+	msgs := []core.Message{core.UserText("a"), core.UserText("b")}
+	if out := wrongLen.Select(newLC(&core.State{}, nil), count, msgs); &out[0] != &msgs[0] {
+		t.Fatal("a scorer result of the wrong length must leave the history alone")
+	}
 }
 
 func TestWindowStrategyDefaults(t *testing.T) {

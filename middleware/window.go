@@ -1,6 +1,12 @@
 package middleware
 
 import (
+	"context"
+	"math"
+	"sort"
+	"strings"
+	"unicode"
+
 	"github.com/jiujuan/goagent/agent"
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/llm"
@@ -9,8 +15,8 @@ import (
 // Context-window eviction. Window bounds one request's message history by
 // *evicting* whole message units, as opposed to Compaction, which *summarizes*
 // them: eviction costs no model call and gives a hard cap, but loses content.
-// The built-in policies are RecentN and SlidingWindow (see WindowStrategy for
-// the measure each one uses, and for ImportanceWeighted's scoring).
+// The built-in policies are RecentN, SlidingWindow and ImportanceWeighted; see
+// WindowStrategy for the measure each one uses.
 //
 // The whole point of this file is that it drops *units*, never single messages:
 // an assistant tool call and the tool results that answer it travel together, or
@@ -383,7 +389,281 @@ func (s *slidingWindow) Select(_ *agent.LoopContext, count TokenCounter, msgs []
 	return keptMessages(msgs, units[start:])
 }
 
+// --- the importance-weighted strategy ----------------------------------------
+
+// Default tuning for ImportanceWeighted. Both are fixed, not options: the
+// adjustment面 is MessageScorer, and a second layer of weights on top of it
+// would just be more numbers to reason about without changing what is kept.
+const (
+	// defaultImportanceTau is the recency half-life measured in units. At 12,
+	// a unit 12 places back keeps about 37% of its recency term, so age nudges
+	// the choice without dominating it.
+	defaultImportanceTau = 12
+	// importanceRecencyWeight is how much recency can add to a unit's content
+	// score. Content is meant to lead; the newest turns are meant to be favored.
+	importanceRecencyWeight = 0.5
+	// importanceRoleShare / importanceTextShare split the content score between
+	// who wrote the message and how much it matches the current question.
+	importanceRoleShare = 0.35
+	importanceTextShare = 0.65
+)
+
+// MessageScorer scores messages by content only.
+//
+// It must not depend on position: the strategy adds the recency term itself, and
+// a scorer backed by a remote call (an embedding, a judge model) is expected to
+// cache results by message content — a position-sensitive score would freeze a
+// stale recency in that cache. Scores are read as [0,1]; anything outside is
+// clamped by the caller's arithmetic being monotone, not corrected.
+//
+// Returning an error makes ImportanceWeighted leave the history untouched for
+// that step (same best-effort posture as Compaction on a failed summary), so a
+// scoring outage degrades to "no eviction", never to "wrong eviction".
+type MessageScorer interface {
+	// ScoreContent returns one relevance score per message against ref, in the
+	// same order and with the same length as msgs.
+	ScoreContent(ctx context.Context, ref string, msgs []core.Message) ([]float64, error)
+}
+
+// ImportanceOptions configures ImportanceWeighted.
+type ImportanceOptions struct {
+	// BudgetTokens is the calibrated token budget for the kept set.
+	BudgetTokens int
+	// TauUnits is the recency decay constant in units (default 12).
+	TauUnits int
+	// Scorer supplies content relevance. nil uses the built-in heuristic
+	// (role prior + query-term overlap), which needs no network and no model.
+	Scorer MessageScorer
+	// NoPinFirst drops the default protection of the first user message — the
+	// task definition. Named as an opt-out because pinning is on by default
+	// (same posture as RunBudgetOptions.NoWrapUpLastTurn).
+	NoPinFirst bool
+}
+
+// ImportanceWeighted keeps a scored, non-contiguous selection of message units
+// inside BudgetTokens. It is the only built-in policy that can preserve an old
+// but decisive turn while dropping the recent-but-noisy tool output next to it.
+//
+// Selection is greedy on score per token, not on score: a unit that is relevant
+// but enormous would otherwise eat the whole budget and push out several small
+// ones that carried the thread. Units are therefore taken in descending
+// score/size order, and one that does not fit is skipped rather than stopping the
+// pass — a smaller, still-valuable unit later in line should get its chance.
+//
+// Two things are always kept: the newest unit (ImportanceWeighted inherits the
+// rule stated on SlidingWindow — send too much rather than send nothing) and,
+// unless NoPinFirst is set, the first user message.
+func ImportanceWeighted(o ImportanceOptions) WindowStrategy {
+	if o.BudgetTokens <= 0 {
+		o.BudgetTokens = defaultWindowBudget
+	}
+	if o.TauUnits <= 0 {
+		o.TauUnits = defaultImportanceTau
+	}
+	scorer := o.Scorer
+	if scorer == nil {
+		scorer = heuristicScorer{}
+	}
+	return &importanceWeighted{
+		budget:   o.BudgetTokens,
+		tau:      float64(o.TauUnits),
+		scorer:   scorer,
+		pinFirst: !o.NoPinFirst,
+	}
+}
+
+type importanceWeighted struct {
+	budget   int
+	tau      float64
+	scorer   MessageScorer
+	pinFirst bool
+}
+
+func (s *importanceWeighted) Name() string { return "importance_weighted" }
+
+func (s *importanceWeighted) Select(lc *agent.LoopContext, count TokenCounter, msgs []core.Message) []core.Message {
+	units := groupUnits(msgs)
+	if len(units) == 0 {
+		return msgs
+	}
+	content, err := s.scorer.ScoreContent(lc.Context, lastUserText(msgs), msgs)
+	if err != nil || len(content) != len(msgs) {
+		return msgs // best effort: an unusable score leaves the history alone
+	}
+
+	size := make([]int, len(units))
+	for i, u := range units {
+		size[i] = count(msgs[u.start:u.end])
+	}
+	kept := make([]bool, len(units))
+	used := 0
+	take := func(i int) {
+		if !kept[i] {
+			kept[i] = true
+			used += size[i]
+		}
+	}
+
+	// The newest unit is unconditional, so a budget too small for even one unit
+	// over-sends instead of sending nothing.
+	take(len(units) - 1)
+	if s.pinFirst {
+		for i, u := range units {
+			if unitHasUser(msgs[u.start:u.end]) {
+				take(i)
+				break
+			}
+		}
+	}
+
+	type candidate struct {
+		idx   int
+		ratio float64
+	}
+	cands := make([]candidate, 0, len(units))
+	for i, u := range units {
+		if kept[i] {
+			continue
+		}
+		score := 0.0
+		for j := u.start; j < u.end; j++ {
+			score += content[j] // summed: a call and its results matter as a whole
+		}
+		score += importanceRecencyWeight * math.Exp(-float64(len(units)-1-i)/s.tau)
+		denom := float64(size[i])
+		if denom < 1 {
+			denom = 1
+		}
+		cands = append(cands, candidate{idx: i, ratio: score / denom})
+	}
+	sort.SliceStable(cands, func(i, j int) bool { return cands[i].ratio > cands[j].ratio })
+	for _, c := range cands {
+		if used+size[c.idx] > s.budget {
+			continue // skip the unfit unit; a smaller one may still earn its place
+		}
+		take(c.idx)
+	}
+
+	if len(kept) == 0 {
+		return msgs
+	}
+	selection := make([]unit, 0, len(units))
+	n := 0
+	for i, u := range units {
+		if kept[i] {
+			selection = append(selection, u)
+			n++
+		}
+	}
+	if n == len(units) {
+		return msgs
+	}
+	return keptMessages(msgs, selection)
+}
+
+// unitHasUser reports whether any message in the slice is a user turn.
+func unitHasUser(msgs []core.Message) bool {
+	for _, m := range msgs {
+		if m.Role == core.RoleUser {
+			return true
+		}
+	}
+	return false
+}
+
+// heuristicScorer is the default MessageScorer: who wrote the message, plus how
+// many of the current question's terms it contains. No network, no model.
+type heuristicScorer struct{}
+
+func (heuristicScorer) ScoreContent(_ context.Context, ref string, msgs []core.Message) ([]float64, error) {
+	query := tokenSet(ref)
+	out := make([]float64, len(msgs))
+	for i, m := range msgs {
+		base := importanceRoleWeight(m.Role)
+		matches := 0
+		if len(query) > 0 {
+			own := tokenSet(windowText(m))
+			for tok := range own {
+				if query[tok] {
+					matches++
+				}
+			}
+		}
+		overlap := float64(matches) / float64(max(len(query), 1))
+		if overlap > 1 {
+			overlap = 1
+		}
+		out[i] = importanceRoleShare*base + importanceTextShare*overlap
+	}
+	return out, nil
+}
+
+// importanceRoleWeight is the prior on what a message of this role contributes.
+// Tool results sit lowest on purpose: they dominate the volume of a long run and
+// go stale fastest, so they should be the first thing a budget drops.
+func importanceRoleWeight(r core.Role) float64 {
+	switch r {
+	case core.RoleUser:
+		return 1
+	case core.RoleAssistant:
+		return 0.7
+	default: // tool results, and anything a provider adds later
+		return 0.35
+	}
+}
+
+// windowText is the text a scorer should look at: a message's own Text parts plus
+// the payloads of its tool results. Message.Text() only concatenates top-level
+// Text parts, so without this a tool message would always score zero relevance
+// and be dropped on content grounds no matter what it said — the same reason
+// estimateTokens walks ToolResult.Content (see compaction.go).
+func windowText(m core.Message) string {
+	s := m.Text()
+	for _, p := range m.Parts {
+		tr, ok := p.(core.ToolResult)
+		if !ok {
+			continue
+		}
+		for _, cp := range tr.Content {
+			if t, ok := cp.(core.Text); ok {
+				s += t.Text
+			}
+		}
+	}
+	return s
+}
+
+// tokenSet splits text into comparable terms: wide (CJK) characters become
+// single-token entries because they carry meaning on their own, and runs of other
+// letters and digits become lower-cased words. Splitting on whitespace alone
+// would make every Chinese question a single unmatched token.
+func tokenSet(s string) map[string]bool {
+	set := map[string]bool{}
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() > 0 {
+			set[cur.String()] = true
+			cur.Reset()
+		}
+	}
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case isWideRune(r):
+			flush()
+			set[string(r)] = true
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			cur.WriteRune(r)
+		default:
+			flush()
+		}
+	}
+	flush()
+	return set
+}
+
 var _ agent.Middleware = (*window)(nil)
 var _ agent.HistoryCompacter = (*window)(nil)
 var _ WindowStrategy = (*recentN)(nil)
 var _ WindowStrategy = (*slidingWindow)(nil)
+var _ WindowStrategy = (*importanceWeighted)(nil)
+var _ MessageScorer = heuristicScorer{}
