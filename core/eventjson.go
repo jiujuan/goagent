@@ -16,27 +16,31 @@ import (
 // original value).
 
 type eventWire struct {
-	Type     string            `json:"type"`
-	RunID    string            `json:"run_id,omitempty"`
-	ThreadID string            `json:"thread_id,omitempty"`
-	Step     int               `json:"step,omitempty"`
-	Message  *Message          `json:"message,omitempty"`
-	Usage    *Usage            `json:"usage,omitempty"`
-	Err      string            `json:"err,omitempty"`
-	Pending  []ApprovalRequest `json:"pending,omitempty"`
-	Progress *ProgressInfo     `json:"progress,omitempty"`
-	NodeID   string            `json:"node_id,omitempty"`
-	Status   string            `json:"status,omitempty"`
-	CallID   string            `json:"call_id,omitempty"`
-	Rule     string            `json:"rule,omitempty"`
-	Reason   string            `json:"reason,omitempty"`
-	Dropped  int               `json:"dropped,omitempty"`
-	Kept     int               `json:"kept,omitempty"`
-	EstTok   int               `json:"est_tokens,omitempty"`
-	Tool     string            `json:"tool,omitempty"`
-	Class    string            `json:"class,omitempty"`
-	Count    int               `json:"count,omitempty"`
-	Strategy string            `json:"strategy,omitempty"`
+	Type      string            `json:"type"`
+	RunID     string            `json:"run_id,omitempty"`
+	ThreadID  string            `json:"thread_id,omitempty"`
+	Step      int               `json:"step,omitempty"`
+	Message   *Message          `json:"message,omitempty"`
+	Usage     *Usage            `json:"usage,omitempty"`
+	Err       string            `json:"err,omitempty"`
+	Pending   []ApprovalRequest `json:"pending,omitempty"`
+	Progress  *ProgressInfo     `json:"progress,omitempty"`
+	NodeID    string            `json:"node_id,omitempty"`
+	Status    string            `json:"status,omitempty"`
+	CallID    string            `json:"call_id,omitempty"`
+	Rule      string            `json:"rule,omitempty"`
+	Reason    string            `json:"reason,omitempty"`
+	Dropped   int               `json:"dropped,omitempty"`
+	Kept      int               `json:"kept,omitempty"`
+	EstTok    int               `json:"est_tokens,omitempty"`
+	Tool      string            `json:"tool,omitempty"`
+	Class     string            `json:"class,omitempty"`
+	Count     int               `json:"count,omitempty"`
+	Strategy  string            `json:"strategy,omitempty"`
+	Phase     string            `json:"phase,omitempty"`
+	Recovery  string            `json:"recovery,omitempty"`
+	Approval  *ApprovalDecision `json:"approval,omitempty"`
+	Duplicate bool              `json:"duplicate,omitempty"`
 }
 
 // MarshalEvent encodes an Event to tagged JSON.
@@ -72,8 +76,11 @@ func MarshalEvent(ev Event) ([]byte, error) {
 	case ToolDone:
 		w.Type = "tool_done"
 		w.Message = &Message{Role: RoleTool, Parts: []Part{e.Result}}
+	case ApprovalDecided:
+		d := e.Decision
+		w.Type, w.Approval, w.Duplicate = "approval_decided", &d, e.Duplicate
 	case Interrupted:
-		w.Type, w.Pending = "interrupted", e.Pending
+		w.Type, w.Pending, w.Phase, w.Reason, w.Recovery = "interrupted", e.Pending, e.Phase, e.Reason, e.Recovery
 	case Progress:
 		p := e.Job
 		w.Type, w.Progress = "progress", &p
@@ -127,8 +134,13 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		return ToolUpdate{CallID: w.CallID, Partial: firstPart(w.Message)}, nil
 	case "tool_done":
 		return ToolDone{Result: firstPartOf[ToolResult](w.Message)}, nil
+	case "approval_decided":
+		if w.Approval == nil {
+			return nil, fmt.Errorf("core: approval_decided missing approval payload")
+		}
+		return ApprovalDecided{Decision: *w.Approval, Duplicate: w.Duplicate}, nil
 	case "interrupted":
-		return Interrupted{Pending: w.Pending}, nil
+		return Interrupted{Pending: w.Pending, Phase: w.Phase, Reason: w.Reason, Recovery: w.Recovery}, nil
 	case "progress":
 		var p ProgressInfo
 		if w.Progress != nil {

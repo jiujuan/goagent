@@ -63,11 +63,26 @@ type ToolUpdate struct {
 // ToolDone carries a tool's final result.
 type ToolDone struct{ Result ToolResult }
 
+// ApprovalDecided is the durable audit event for a structured human decision.
+// It intentionally does not overload ToolResult: the model still receives a
+// readable rejection result, while observers can retain the decision identity,
+// pause binding and policy evidence separately.
+type ApprovalDecided struct {
+	Decision  ApprovalDecision
+	Duplicate bool
+}
+
 // --- Control / async --------------------------------------------------------
 
-// Interrupted is emitted when the loop pauses for human-in-the-loop. The run is
-// checkpointed; the caller resumes after deciding on Pending.
-type Interrupted struct{ Pending []ApprovalRequest }
+// Interrupted is emitted when the loop pauses. The run is checkpointed; Phase,
+// Reason and Recovery explain whether callers should decide on Pending or expect
+// the next run to replay a model request.
+type Interrupted struct {
+	Pending  []ApprovalRequest
+	Phase    string
+	Reason   string
+	Recovery string
+}
 
 // Progress reports the state of a long-running asynchronous job on transient
 // events (media generation, background work).
@@ -155,6 +170,7 @@ func (MessageDone) isEvent()      {}
 func (ToolStarted) isEvent()      {}
 func (ToolUpdate) isEvent()       {}
 func (ToolDone) isEvent()         {}
+func (ApprovalDecided) isEvent()  {}
 func (Interrupted) isEvent()      {}
 func (Progress) isEvent()         {}
 func (PlanNodeStarted) isEvent()  {}
@@ -178,4 +194,19 @@ type ApprovalRequest struct {
 	CallID string `json:"call_id"`
 	Tool   string `json:"tool"`
 	Args   []byte `json:"args,omitempty"`
+}
+
+// ApprovalDecision is the durable form of a human approval. Digest covers all
+// fields that change its meaning; ParameterDigest separately exposes the exact
+// approved tool argument identity without storing arguments a second time.
+type ApprovalDecision struct {
+	DecisionID      string `json:"decision_id"`
+	PauseID         string `json:"pause_id"`
+	CallID          string `json:"call_id"`
+	Tool            string `json:"tool"`
+	ParameterDigest string `json:"parameter_digest"`
+	PolicyVersion   string `json:"policy_version"`
+	Approved        bool   `json:"approved"`
+	Reason          string `json:"reason,omitempty"`
+	Digest          string `json:"digest"`
 }

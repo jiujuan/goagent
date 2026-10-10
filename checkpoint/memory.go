@@ -12,11 +12,15 @@ import (
 type Memory struct {
 	mu       sync.RWMutex
 	byThread map[string][]*Checkpoint
+	durable  map[string]*memoryDurableState
 }
 
 // NewMemory constructs an in-memory checkpointer.
 func NewMemory() *Memory {
-	return &Memory{byThread: map[string][]*Checkpoint{}}
+	return &Memory{
+		byThread: map[string][]*Checkpoint{},
+		durable:  map[string]*memoryDurableState{},
+	}
 }
 
 // Save appends a checkpoint to its thread.
@@ -26,8 +30,8 @@ func (m *Memory) Save(_ context.Context, cp *Checkpoint) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.byThread[cp.ThreadID] = append(m.byThread[cp.ThreadID], cp)
-	return nil
+	_, err := m.commitLocked(CommitRequest{Checkpoint: cp})
+	return err
 }
 
 // Load returns the checkpoint with checkpointID in threadID, or an error.

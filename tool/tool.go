@@ -39,11 +39,17 @@ type Result struct {
 
 // Context is handed to a tool on invocation. It embeds the request context and
 // exposes the live run State directly (no session indirection). CallID
-// correlates the invocation to its originating ToolCall.
+// correlates the invocation to its originating ToolCall. InvocationID and
+// IdempotencyKey are stable across a fenced resume of the same call; tools that
+// invoke an external service should forward IdempotencyKey where the service
+// supports it.
 type Context struct {
 	context.Context
-	State  *core.State
-	CallID string
+	State          *core.State
+	CallID         string
+	InvocationID   string
+	IdempotencyKey string
+	Attempt        int
 }
 
 // Updater is an optional capability of the context a tool is invoked with: it
