@@ -87,7 +87,10 @@ func TestThreadAccumulatesAndResumes(t *testing.T) {
 // gate interrupts before any tool call.
 type gate struct{ agent.BaseMiddleware }
 
-func (gate) BeforeTool(*agent.LoopContext, *core.ToolCall) (core.Directive, error) {
+func (gate) BeforeTool(lc *agent.LoopContext, c *core.ToolCall) (core.Directive, error) {
+	if lc.IsApproved(c) {
+		return core.Directive{}, nil
+	}
 	return core.Directive{Kind: core.Interrupt, Reason: "approval required"}, nil
 }
 

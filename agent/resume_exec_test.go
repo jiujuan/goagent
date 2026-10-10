@@ -27,7 +27,10 @@ type gateOnce struct {
 	steps []int
 }
 
-func (*gateOnce) BeforeTool(*agent.LoopContext, *core.ToolCall) (core.Directive, error) {
+func (*gateOnce) BeforeTool(lc *agent.LoopContext, c *core.ToolCall) (core.Directive, error) {
+	if lc.IsApproved(c) {
+		return core.Directive{}, nil
+	}
 	return core.Directive{Kind: core.Interrupt, Reason: "approval required"}, nil
 }
 

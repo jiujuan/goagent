@@ -62,3 +62,27 @@ func TestFileLatestEmpty(t *testing.T) {
 		t.Fatalf("empty thread should be (nil,nil), got (%v,%v)", got, err)
 	}
 }
+
+func TestFilePreservesPauseMetadata(t *testing.T) {
+	ctx := context.Background()
+	store, err := checkpoint.NewFile(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := &checkpoint.Pause{Phase: "after_model", Reason: "review", Recovery: checkpoint.RecoveryReplayModel}
+	if err := store.Save(ctx, &checkpoint.Checkpoint{
+		ID:       "paused",
+		ThreadID: "t1",
+		State:    core.State{},
+		Pause:    want,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Latest(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Pause == nil || *got.Pause != *want {
+		t.Fatalf("pause = %#v, want %#v", got, want)
+	}
+}

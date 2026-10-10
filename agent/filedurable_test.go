@@ -72,8 +72,11 @@ func peekModel() llm.Model {
 // before the pause.
 type dangerGate struct{ agent.BaseMiddleware }
 
-func (dangerGate) BeforeTool(_ *agent.LoopContext, c *core.ToolCall) (core.Directive, error) {
+func (dangerGate) BeforeTool(lc *agent.LoopContext, c *core.ToolCall) (core.Directive, error) {
 	if c.Name == "danger" {
+		if lc.IsApproved(c) {
+			return core.Directive{}, nil
+		}
 		return core.Directive{Kind: core.Interrupt, Reason: "approval required"}, nil
 	}
 	return core.Directive{}, nil

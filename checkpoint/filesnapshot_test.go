@@ -128,7 +128,7 @@ func TestFileLegacyLineReadable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cp.ID != "old" || cp.FileSnapshot != nil {
+	if cp.ID != "old" || cp.FileSnapshot != nil || cp.Pause != nil {
 		t.Fatalf("legacy read = %+v", cp)
 	}
 	if len(cp.State.Messages) != 1 {

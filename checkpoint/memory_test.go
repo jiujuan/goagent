@@ -32,6 +32,28 @@ func TestMemorySaveLoadLatestHistory(t *testing.T) {
 	}
 }
 
+func TestMemoryPreservesPauseMetadata(t *testing.T) {
+	ctx := context.Background()
+	store := checkpoint.NewMemory()
+	want := &checkpoint.Pause{Phase: "before_tool", Reason: "approval required", Recovery: checkpoint.RecoveryResumeTools}
+	if err := store.Save(ctx, &checkpoint.Checkpoint{
+		ID:       "paused",
+		ThreadID: "t1",
+		State:    core.State{},
+		Pending:  &checkpoint.PendingHITL{Pending: []core.ToolCall{{ID: "c1", Name: "danger"}}},
+		Pause:    want,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Latest(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Pause == nil || *got.Pause != *want {
+		t.Fatalf("pause = %#v, want %#v", got, want)
+	}
+}
+
 func TestForkIsolatesParent(t *testing.T) {
 	parent := &checkpoint.Checkpoint{
 		ID: "p", ThreadID: "t1", Step: 5,
