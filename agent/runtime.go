@@ -36,6 +36,11 @@ type RunContext struct {
 	// and consumed once by the loop before its first model call (see hitl.go).
 	resumed *resumeBatch
 
+	// durable holds state that must travel with a resumed execution until its
+	// next checkpoint commit. It is shared by nested contexts so a child cannot
+	// bypass the parent's inbox acknowledgements or resume fencing token.
+	durable *durableRunState
+
 	steering steeringQueue
 
 	// dynamic holds tools injected into this run by middleware
@@ -58,6 +63,7 @@ func (rc *RunContext) deeper() *RunContext {
 		State:         rc.State,
 		branch:        rc.branch,
 		transferDepth: rc.transferDepth + 1,
+		durable:       rc.durable,
 	}
 }
 
@@ -78,6 +84,7 @@ func (rc *RunContext) subRun(input core.Message) *RunContext {
 		Topic:    rc.Topic,
 		Store:    rc.Store,
 		State:    st,
+		durable:  rc.durable,
 	}
 }
 
@@ -97,6 +104,7 @@ func (rc *RunContext) forBranch(branch string) *RunContext {
 		Store:    rc.Store,
 		State:    &st,
 		branch:   branch,
+		durable:  rc.durable,
 	}
 }
 

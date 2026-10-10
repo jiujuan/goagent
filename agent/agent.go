@@ -201,6 +201,7 @@ func (a *Agent) newRunHandle(ctx context.Context, threadID string, state *core.S
 		Topic:    topic,
 		Store:    a.store,
 		State:    state,
+		durable:  newDurableRunState(),
 	}
 	return &Run{
 		ID:       runID,

@@ -2,11 +2,15 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/tool"
 )
@@ -29,15 +33,19 @@ import (
 // so its external side effects may continue unseen — see abandonedAtBound.
 //
 // The third return value lists every call this batch rejected, with the class the
-// loop assigned it. The loop hands that list to Stack.ToolReject after the batch
-// has joined, not from a worker goroutine, so a ToolRejecter can write State.KV
-// without locking and its writes are checkpointed with this step.
-func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.ToolCall) ([]core.Part, []core.Directive, []ToolRejection) {
+// loop assigned it. The final error joins all AfterTool failures after the whole
+// batch has settled, so completed results are still available for the failure
+// checkpoint instead of silently disappearing with the hook error.
+func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.ToolCall) ([]core.Part, []core.Directive, []ToolRejection, error) {
 	results := make([]core.Part, len(calls))
 	dirs := make([]core.Directive, len(calls))
 	var stateMu sync.Mutex
 	var rejects []ToolRejection
 	var rejectMu sync.Mutex
+	var afterErrs []error
+	var afterErrMu sync.Mutex
+	var runErrs []error
+	var runErrMu sync.Mutex
 
 	run := func(i int, c core.ToolCall) {
 		callCtx, cancel := l.toolCallCtx(lc, &c)
@@ -60,6 +68,11 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 			out = awaitAbandoned(ch, callCtx, c, start)
 		}
 		tr := out.tr
+		if out.err != nil {
+			runErrMu.Lock()
+			runErrs = append(runErrs, out.err)
+			runErrMu.Unlock()
+		}
 
 		// Anything the abandoned handler returns afterwards reaches nobody: the
 		// write went to a channel no one reads again, so its ops, Control and
@@ -76,8 +89,21 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 		if out.control != nil {
 			ds = append(ds, *out.control)
 		}
-		if d, err := l.mw.AfterTool(lc, &tr); err == nil {
-			ds = append(ds, d)
+		if !out.skipAfter {
+			if d, err := l.mw.AfterTool(lc, &tr); err != nil {
+				afterErrMu.Lock()
+				afterErrs = append(afterErrs, err)
+				afterErrMu.Unlock()
+			} else {
+				ds = append(ds, d)
+			}
+		}
+		if out.execution != nil {
+			ex := *out.execution
+			ex.State = checkpoint.ToolCompleted
+			result := core.Message{Role: core.RoleTool, Parts: []core.Part{tr}}
+			ex.Result = &result
+			rc.addCompletedTool(ex)
 		}
 		// Store the result AFTER AfterTool so a hook that rewrites tr (e.g. an
 		// eval ToolGuard marking a bad result IsError) is what the model sees in
@@ -110,7 +136,7 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 			rc.publish(core.ToolStarted{Call: calls[i]})
 			run(i, calls[i])
 		}
-		return results, dirs, rejects
+		return results, dirs, rejects, errors.Join(append(afterErrs, runErrs...)...)
 	}
 
 	var wg sync.WaitGroup
@@ -123,7 +149,7 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 		}(i, calls[i])
 	}
 	wg.Wait()
-	return results, dirs, rejects
+	return results, dirs, rejects, errors.Join(append(afterErrs, runErrs...)...)
 }
 
 // abandonGrace bounds how long the loop still listens to a call whose context has
@@ -199,6 +225,13 @@ type toolOutcome struct {
 	control   *core.Directive
 	ops       []core.StateOp
 	rejection *ToolRejection
+	err       error
+
+	// skipAfter is used for a result restored from the durable journal. It has
+	// already passed AfterTool in the run that first completed it, and replaying
+	// that hook can duplicate its own side effects.
+	skipAfter bool
+	execution *checkpoint.ToolExecution
 }
 
 // abandonedAtBound is the loop's own report for a call it stopped waiting on: the
@@ -251,20 +284,134 @@ func (l *AgentLoop) callOne(lc *LoopContext, callCtx context.Context, c core.Too
 	if err := tool.Validate(t.Schema(), raw); err != nil {
 		return rejected(c, RejectSchemaInvalid, "invalid arguments: "+err.Error())
 	}
-	tctx := &tool.Context{Context: keepToolUpdates(callCtx, lc.RunContext), State: lc.State, CallID: c.ID}
+
+	invocationID, idempotencyKey := toolInvocation(lc.ThreadID, lc.Step, c)
+	var execution *checkpoint.ToolExecution
+	if durable, ok := lc.durableStore(); ok {
+		ex, err := durable.ClaimTool(callCtx, checkpoint.ToolClaimRequest{
+			ThreadID:       lc.ThreadID,
+			InvocationID:   invocationID,
+			CallID:         c.ID,
+			Tool:           c.Name,
+			IdempotencyKey: idempotencyKey,
+			Claim:          lc.durableClaim(),
+		})
+		switch {
+		case errors.Is(err, checkpoint.ErrToolOutcomeUnknown):
+			return toolOutcome{tr: unknownToolResult(c, ex.IdempotencyKey)}
+		case err != nil:
+			return toolOutcome{
+				tr:  errResult(c, "tool execution could not be fenced: "+err.Error()),
+				err: fmt.Errorf("tool %q durable claim: %w", c.Name, err),
+			}
+		case ex.State == checkpoint.ToolCompleted:
+			tr, ok := resultFromExecution(ex, c)
+			if !ok {
+				return toolOutcome{
+					tr:  errResult(c, "stored tool result is invalid and cannot be replayed"),
+					err: fmt.Errorf("tool %q has invalid durable result for invocation %q", c.Name, invocationID),
+				}
+			}
+			return toolOutcome{tr: tr, skipAfter: true}
+		default:
+			execution = &ex
+		}
+	}
+
+	tctx := &tool.Context{
+		Context:        keepToolUpdates(callCtx, lc.RunContext),
+		State:          lc.State,
+		CallID:         c.ID,
+		InvocationID:   invocationID,
+		IdempotencyKey: idempotencyKey,
+		Attempt:        toolAttempt(execution),
+	}
 	res, err := t.Call(tctx, raw)
 	if err != nil {
-		return rejected(c, RejectHandlerError, err.Error())
+		out := rejected(c, RejectHandlerError, err.Error())
+		out.execution = execution
+		return out
+	}
+	if res == nil {
+		out := rejected(c, RejectHandlerError, "tool returned no result")
+		out.execution = execution
+		return out
 	}
 	// A handler that ran and reported its own failure (tool.ErrorResult, hence
 	// IsError) is not a rejection: the call was well-formed and answered, and the
 	// model may know what to do with the answer. Same for an IsError set later by
 	// an AfterTool hook — the loop never sees that pass here.
 	return toolOutcome{
-		tr:      core.ToolResult{CallID: c.ID, Name: c.Name, Content: res.Content, IsError: res.IsError},
-		control: res.Control,
-		ops:     res.State,
+		tr:        core.ToolResult{CallID: c.ID, Name: c.Name, Content: res.Content, IsError: res.IsError},
+		control:   res.Control,
+		ops:       res.State,
+		execution: execution,
 	}
+}
+
+// toolInvocation identifies one logical tool-call occurrence. Provider call IDs
+// are only unique within a response in practice, so the loop step is part of
+// the identity. A paused batch resumes at that same step; a later model turn
+// cannot accidentally replay its completed result merely by reusing a call ID.
+func toolInvocation(threadID string, step int, c core.ToolCall) (string, string) {
+	h := sha256.New()
+	_, _ = h.Write([]byte(threadID))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write(strconv.AppendInt(nil, int64(step), 10))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(c.ID))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(c.Name))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write(c.Args)
+	sum := hex.EncodeToString(h.Sum(nil))
+	return "tool-" + sum, "idemp-" + sum
+}
+
+func pendingExecutions(threadID string, step int, calls []core.ToolCall) []checkpoint.ToolExecution {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]checkpoint.ToolExecution, 0, len(calls))
+	for _, c := range calls {
+		invocationID, idempotencyKey := toolInvocation(threadID, step, c)
+		out = append(out, checkpoint.ToolExecution{
+			InvocationID:   invocationID,
+			CallID:         c.ID,
+			Tool:           c.Name,
+			IdempotencyKey: idempotencyKey,
+			State:          checkpoint.ToolPending,
+		})
+	}
+	return out
+}
+
+func toolAttempt(execution *checkpoint.ToolExecution) int {
+	if execution == nil || execution.Attempt < 1 {
+		return 1
+	}
+	return execution.Attempt
+}
+
+func resultFromExecution(ex checkpoint.ToolExecution, call core.ToolCall) (core.ToolResult, bool) {
+	if ex.Result == nil {
+		return core.ToolResult{}, false
+	}
+	for _, p := range ex.Result.Parts {
+		tr, ok := p.(core.ToolResult)
+		if ok && tr.CallID == call.ID && tr.Name == call.Name {
+			return tr, true
+		}
+	}
+	return core.ToolResult{}, false
+}
+
+func unknownToolResult(c core.ToolCall, idempotencyKey string) core.ToolResult {
+	msg := fmt.Sprintf("tool %q was started before recovery but its outcome was not durably recorded; do not retry it automatically because an external side effect may already have occurred", c.Name)
+	if idempotencyKey != "" {
+		msg += "; query the external system or request human confirmation using idempotency key " + idempotencyKey
+	}
+	return errResult(c, msg)
 }
 
 // rejected is one call the loop would not run (or could not finish): the error

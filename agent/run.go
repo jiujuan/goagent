@@ -101,11 +101,15 @@ func (r *Run) Cancel() { r.cancel() }
 func (r *Run) drive() {
 	r.startOnce.Do(func() {
 		go func() {
+			defer r.rc.releaseDurableClaim()
 			r.bus.Publish(r.topic, core.RunStarted{RunID: r.ID, ThreadID: r.ThreadID})
 			if r.startErr != nil {
 				r.bus.Publish(r.topic, core.RunFailed{Err: r.startErr})
 				r.finish(core.Result{}, r.startErr)
 				return
+			}
+			for _, ev := range r.rc.drainApprovalEvents() {
+				r.bus.Publish(r.topic, ev)
 			}
 			out := r.runnable.run(r.rc)
 			switch {
@@ -116,7 +120,12 @@ func (r *Run) drive() {
 			case out.Control.Kind == core.Interrupt:
 				// Paused, not finished: run-end hooks wait for the eventual
 				// completion (or failure) after a resume.
-				r.bus.Publish(r.topic, core.Interrupted{Pending: out.Pending})
+				r.bus.Publish(r.topic, core.Interrupted{
+					Pending:  out.Pending,
+					Phase:    out.Phase,
+					Reason:   out.Reason,
+					Recovery: out.Recovery,
+				})
 				r.finish(core.Result{}, nil)
 			default:
 				r.agent.finishRun(r.rc, out.Result, nil)

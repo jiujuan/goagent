@@ -85,7 +85,10 @@ func (g *skillGate) BeforeTool(lc *agent.LoopContext, c *core.ToolCall) (core.Di
 	if !anyDeclaresTools(g.lib, active) {
 		return core.Directive{}, nil
 	}
-	if Preapproved(g.lib, active)[c.Name] {
+	// A resumed call still reaches every gate, but this gate has already asked
+	// for and received approval for this exact call. Hard policy checks run
+	// before BeforeTool, so recognizing it here cannot override a denial.
+	if lc.IsApproved(c) || Preapproved(g.lib, active)[c.Name] {
 		return core.Directive{}, nil
 	}
 	return core.Directive{

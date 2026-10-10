@@ -84,6 +84,17 @@ type ToolRejecter interface {
 	OnToolReject(lc *LoopContext, r ToolRejection)
 }
 
+// ToolPolicyChecker is an optional middleware capability for a non-bypassable
+// safety decision. It is evaluated for the whole batch before any BeforeTool
+// directive is resolved, and again when a paused batch resumes. A policy error
+// fails the batch; it cannot be overridden by an Interrupt or a human approval.
+//
+// Ordinary BeforeTool remains the place for pause, routing and advisory gates.
+// Implement this interface only for hard safety refusals.
+type ToolPolicyChecker interface {
+	CheckToolPolicy(*LoopContext, *core.ToolCall) error
+}
+
 // RunFinisher is an optional middleware capability for work that belongs at the
 // very end of a run rather than inside a step: memory consolidation, a final
 // summary, releasing a resource. Run.drive calls FinishRun once, before it
@@ -285,6 +296,21 @@ func (s *Stack) BeforeTool(lc *LoopContext, call *core.ToolCall) (core.Directive
 		ds = append(ds, d)
 	}
 	return core.Resolve(ds...), nil
+}
+
+// CheckToolPolicy runs every hard policy for every call before a batch can
+// execute. The first denial is enough because no call in that batch has started.
+func (s *Stack) CheckToolPolicy(lc *LoopContext, calls []core.ToolCall) error {
+	for i := range calls {
+		for _, m := range s.mws {
+			if p, ok := m.(ToolPolicyChecker); ok {
+				if err := p.CheckToolPolicy(lc, &calls[i]); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Stack) AfterTool(lc *LoopContext, res *core.ToolResult) (core.Directive, error) {

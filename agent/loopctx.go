@@ -17,6 +17,29 @@ type LoopContext struct {
 	MaxTurns int // the loop's step cap, for budget/wrap-up middleware to observe
 	Request  *llm.Request
 	History  []core.Message
+	approved map[toolApprovalKey]struct{}
+}
+
+// IsApproved reports whether this exact persisted tool call was explicitly
+// approved for the resumed batch currently being checked. It intentionally does
+// not provide a generic "skip gates" switch: middleware that does not opt into
+// this narrow capability still sees the resumed call and may interrupt it again.
+func (lc *LoopContext) IsApproved(c *core.ToolCall) bool {
+	if lc == nil || c == nil {
+		return false
+	}
+	_, ok := lc.approved[toolApprovalKeyFor(*c)]
+	return ok
+}
+
+type toolApprovalKey struct {
+	ID   string
+	Name string
+	Args string
+}
+
+func toolApprovalKeyFor(c core.ToolCall) toolApprovalKey {
+	return toolApprovalKey{ID: c.ID, Name: c.Name, Args: string(c.Args)}
 }
 
 // AddTool makes a tool callable for the rest of this run and advertises it on the

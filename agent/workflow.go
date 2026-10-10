@@ -71,8 +71,15 @@ func Loop(name string, maxIter int, subs ...*Agent) *Agent {
 // gets its own bus/store so it is independently Run-able; children are driven
 // with the workflow's RunContext, so their events land on the workflow's topic.
 func wrapWorkflow(name string, r Runnable) *Agent {
+	return wrapWorkflowWithStore(name, r, nil)
+}
+
+func wrapWorkflowWithStore(name string, r Runnable, store checkpoint.Checkpointer) *Agent {
+	if store == nil {
+		store = checkpoint.NewMemory()
+	}
 	c := config{name: name}
-	return &Agent{cfg: c, runnable: r, bus: bus.New(), store: checkpoint.NewMemory()}
+	return &Agent{cfg: c, runnable: r, bus: bus.New(), store: store}
 }
 
 // --- Sequential -------------------------------------------------------------

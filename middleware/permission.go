@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"fmt"
+
 	"github.com/jiujuan/goagent/agent"
 	"github.com/jiujuan/goagent/core"
 )
@@ -18,8 +20,9 @@ const (
 	DenyTool
 )
 
-// Rule decides what to do with a tool call. Rules are evaluated in order; the
-// first non-AllowTool verdict wins.
+// Rule decides what to do with a tool call. DenyTool always wins over AskTool,
+// regardless of rule order; this prevents an approval rule from masking a
+// later hard safety refusal.
 type Rule func(call *core.ToolCall) Decision
 
 // RequireApprovalFor asks for human approval before the named tools run.
@@ -54,16 +57,44 @@ type permission struct {
 	rules []Rule
 }
 
-func (p *permission) BeforeTool(_ *agent.LoopContext, c *core.ToolCall) (core.Directive, error) {
+func (p *permission) BeforeTool(lc *agent.LoopContext, c *core.ToolCall) (core.Directive, error) {
+	switch p.decision(c) {
+	case DenyTool:
+		return core.Directive{Kind: core.Stop, Reason: "tool " + c.Name + " denied by policy"}, nil
+	case AskTool:
+		if lc.IsApproved(c) {
+			return core.Directive{}, nil
+		}
+		return core.Directive{Kind: core.Interrupt, Reason: "tool " + c.Name + " requires approval"}, nil
+	default:
+		return core.Directive{}, nil
+	}
+}
+
+// CheckToolPolicy implements agent.ToolPolicyChecker. It deliberately does not
+// return a Directive: directives are ordered for flow control, while a Deny is
+// a safety constraint that must survive both an Ask and a later Resume.
+func (p *permission) CheckToolPolicy(_ *agent.LoopContext, c *core.ToolCall) error {
+	if p.decision(c) == DenyTool {
+		return fmt.Errorf("tool %q denied by permission policy", c.Name)
+	}
+	return nil
+}
+
+func (p *permission) decision(c *core.ToolCall) Decision {
+	ask := false
 	for _, r := range p.rules {
 		switch r(c) {
-		case AskTool:
-			return core.Directive{Kind: core.Interrupt, Reason: "tool " + c.Name + " requires approval"}, nil
 		case DenyTool:
-			return core.Directive{Kind: core.Stop, Reason: "tool " + c.Name + " denied by policy"}, nil
+			return DenyTool
+		case AskTool:
+			ask = true
 		}
 	}
-	return core.Directive{}, nil
+	if ask {
+		return AskTool
+	}
+	return AllowTool
 }
 
 func toSet(names []string) map[string]bool {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/vfs"
 )
@@ -72,6 +73,41 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 	if cp == nil {
 		return nil, fmt.Errorf("agent: no checkpoint to resume for thread %q", threadID)
 	}
+	if err := validatePause(cp); err != nil {
+		return nil, err
+	}
+	var (
+		durable          checkpoint.Durable
+		claim            *checkpoint.Claim
+		durableDecisions []core.ApprovalDecision
+	)
+	if store, ok := a.store.(checkpoint.Durable); ok {
+		durable = store
+		claimed, err := durable.Claim(ctx, checkpoint.ClaimRequest{
+			ThreadID: threadID,
+			Revision: cp.Revision,
+			PauseID:  checkpoint.EffectivePauseID(cp),
+			Owner:    core.NewID("resume"),
+			Lease:    checkpoint.DefaultLease,
+		})
+		if err != nil {
+			return nil, err
+		}
+		claim = &claimed
+		durableDecisions, err = durable.Decisions(ctx, threadID, claimed.PauseID)
+		if err != nil {
+			_ = durable.ReleaseClaim(context.Background(), claimed)
+			return nil, err
+		}
+	}
+	durableApprovals, err := approvalsFromDurable(cp, durableDecisions)
+	if err != nil {
+		if claim != nil {
+			_ = durable.ReleaseClaim(context.Background(), *claim)
+		}
+		return nil, err
+	}
+	allApprovals := append(durableApprovals, approvals...)
 	state := cloneState(cp.State)
 	applyFileSnapshot(&state, cp.FileSnapshot)
 	if state.Files == nil {
@@ -81,7 +117,7 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 	// executor) can consume them too; the LLM path below reads the approvals
 	// directly. Merge into any existing decisions so per-node approvals accumulate
 	// across multiple pause/resume waves.
-	if len(approvals) > 0 {
+	if len(allApprovals) > 0 {
 		if state.KV == nil {
 			state.KV = map[string]any{}
 		}
@@ -91,7 +127,7 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 				merged[k] = v
 			}
 		}
-		for _, ap := range approvals {
+		for _, ap := range allApprovals {
 			if ap.Approve {
 				merged[ap.CallID] = "allow"
 			} else {
@@ -101,6 +137,10 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		state.KV[approvalsKey] = merged
 	}
 	run := a.newRunHandle(ctx, threadID, &state)
+	run.rc.setDurableClaim(claim)
+	for _, decision := range durableDecisions {
+		run.rc.queueApprovalEvent(core.ApprovalDecided{Decision: decision})
+	}
 
 	if cp.Pending == nil || len(cp.Pending.Pending) == 0 {
 		return run, nil
@@ -116,13 +156,27 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		run.rc.State.Messages = append(run.rc.State.Messages, core.Message{Role: core.RoleTool, Parts: parts})
 		return run, nil
 	}
-	run.rc.resumed = &resumeBatch{
-		step:   cp.Pending.Step,
-		calls:  cp.Pending.Pending,
-		decide: decisionsBy(approvals),
-		final:  lastAssistant(state.Messages),
-	}
+	run.rc.resumed = newResumeBatch(cp.Pending.Step, cp.Pending.Pending, allApprovals, lastAssistant(state.Messages))
 	return run, nil
+}
+
+func validatePause(cp *checkpoint.Checkpoint) error {
+	if cp.Pause == nil {
+		return nil // checkpoint format before pause metadata
+	}
+	switch cp.Pause.Recovery {
+	case checkpoint.RecoveryReplayModel:
+		if cp.Pending != nil && len(cp.Pending.Pending) > 0 {
+			return fmt.Errorf("agent: replay-model pause cannot carry pending tools")
+		}
+	case checkpoint.RecoveryResumeTools:
+		if cp.Pending == nil || len(cp.Pending.Pending) == 0 {
+			return fmt.Errorf("agent: resume-tools pause has no pending tools")
+		}
+	default:
+		return fmt.Errorf("agent: unsupported checkpoint pause recovery %q", cp.Pause.Recovery)
+	}
+	return nil
 }
 
 // resumeBatch is the pending tool-call batch a HITL pause left behind, carried
@@ -131,44 +185,100 @@ type resumeBatch struct {
 	step   int             // loop step the run paused at
 	calls  []core.ToolCall // pending calls, in the model's original order
 	decide map[string]Approval
+	ids    map[string]int
 	final  core.Message // assistant message that issued the calls, if a call ends the run
 }
 
-// runResumed executes a resumeBatch under the step context the loop built for it
-// and returns its tool results in the model's original call order, the batch's
-// folded directive, and the calls this batch rejected. Approved calls go through
-// execTools as one batch — so they inherit its concurrency decision, its events,
-// its AfterTool hooks and its immediate state application; denied or undecided
-// calls never reach a handler.
-func (l *AgentLoop) runResumed(rb *resumeBatch, lc *LoopContext) ([]core.Part, core.Directive, []ToolRejection) {
+func newResumeBatch(step int, calls []core.ToolCall, approvals []Approval, final core.Message) *resumeBatch {
+	ids := make(map[string]int, len(calls))
+	for _, c := range calls {
+		ids[c.ID]++
+	}
+	return &resumeBatch{
+		step:   step,
+		calls:  append([]core.ToolCall(nil), calls...),
+		decide: decisionsBy(approvals),
+		ids:    ids,
+		final:  final,
+	}
+}
+
+// resumedBatchOutcome is the result of revalidating and possibly executing a
+// checkpointed batch. A regular gate can interrupt it again before any handler
+// starts; in that case all calls remain pending because none was executed.
+type resumedBatchOutcome struct {
+	parts   []core.Part
+	control core.Directive
+	rejects []ToolRejection
+	err     error
+	pause   bool
+	reason  string
+}
+
+// runResumed executes a resumeBatch under the step context the loop built for it.
+// Every approved call re-enters BeforeTool. Only middleware that recognizes
+// LoopContext.IsApproved may waive its own approval prompt; custom gates still
+// get a chance to interrupt or reject the resumed batch.
+func (l *AgentLoop) runResumed(rb *resumeBatch, lc *LoopContext) resumedBatchOutcome {
 	rc := lc.RunContext
 
-	approved := make([]core.ToolCall, 0, len(rb.calls))
-	for _, c := range rb.calls {
-		if ap, ok := rb.decide[c.ID]; ok && ap.Approve {
-			approved = append(approved, c)
+	approvedIndexes := make([]int, 0, len(rb.calls))
+	lc.approved = make(map[toolApprovalKey]struct{}, len(rb.calls))
+	for i := range rb.calls {
+		c := rb.calls[i]
+		if ap, ok := rb.approvalFor(c); ok && ap.Approve {
+			approvedIndexes = append(approvedIndexes, i)
+			lc.approved[toolApprovalKeyFor(c)] = struct{}{}
 		}
 	}
-	results, dirs, rejects := l.execTools(rc, lc, approved)
+	for _, i := range approvedIndexes {
+		d, err := l.mw.BeforeTool(lc, &rb.calls[i])
+		if err != nil {
+			return resumedBatchOutcome{err: err}
+		}
+		switch d.Kind {
+		case core.Interrupt:
+			return resumedBatchOutcome{pause: true, reason: d.Reason}
+		case core.Stop, core.Escalate, core.Transfer:
+			return resumedBatchOutcome{control: d}
+		}
+	}
+	approved := make([]core.ToolCall, 0, len(approvedIndexes))
+	for _, i := range approvedIndexes {
+		approved = append(approved, rb.calls[i])
+	}
+	results, dirs, rejects, execErr := l.execTools(rc, lc, approved)
 
 	parts := make([]core.Part, 0, len(rb.calls))
 	next := 0
 	for _, c := range rb.calls {
-		ap, recorded := rb.decide[c.ID]
+		ap, recorded := rb.approvalFor(c)
 		if recorded && ap.Approve {
 			parts = append(parts, results[next])
 			next++
 			continue
 		}
-		parts = append(parts, deniedResult(rc, c, rejectionReason(ap, recorded)))
+		tr := deniedResult(rc, c, rejectionReason(ap, recorded, rb.ids[c.ID] != 1))
+		rc.recordSkippedTool(rb.step, c, tr)
+		parts = append(parts, tr)
 	}
-	return parts, core.Resolve(dirs...), rejects
+	return resumedBatchOutcome{parts: parts, control: core.Resolve(dirs...), rejects: rejects, err: execErr}
+}
+
+func (rb *resumeBatch) approvalFor(c core.ToolCall) (Approval, bool) {
+	if rb.ids[c.ID] != 1 {
+		return Approval{}, false
+	}
+	ap, ok := rb.decide[c.ID]
+	return ap, ok
 }
 
 // rejectionReason words a denial for the model, which may re-route on it: an
 // explicit rejection carries its reason, an absent decision says so.
-func rejectionReason(ap Approval, recorded bool) string {
+func rejectionReason(ap Approval, recorded, ambiguous bool) string {
 	switch {
+	case ambiguous:
+		return "rejected: ambiguous call ID"
 	case recorded && ap.Reason != "":
 		return "rejected: " + ap.Reason
 	case recorded:
@@ -209,4 +319,24 @@ func deniedResult(rc *RunContext, c core.ToolCall, reason string) core.ToolResul
 	tr := errResult(c, reason)
 	rc.publish(core.ToolDone{Result: tr})
 	return tr
+}
+
+// recordSkippedTool closes a pending durable invocation when a human rejects it
+// or declines to decide. The result is committed with the resumed history, so a
+// later recovery neither reopens the approval nor mistakes the call for an
+// unobserved handler execution.
+func (rc *RunContext) recordSkippedTool(step int, c core.ToolCall, tr core.ToolResult) {
+	if _, ok := rc.durableStore(); !ok {
+		return
+	}
+	invocationID, idempotencyKey := toolInvocation(rc.ThreadID, step, c)
+	result := core.Message{Role: core.RoleTool, Parts: []core.Part{tr}}
+	rc.addCompletedTool(checkpoint.ToolExecution{
+		InvocationID:   invocationID,
+		CallID:         c.ID,
+		Tool:           c.Name,
+		IdempotencyKey: idempotencyKey,
+		State:          checkpoint.ToolCompleted,
+		Result:         &result,
+	})
 }

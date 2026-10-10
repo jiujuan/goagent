@@ -17,6 +17,11 @@ import (
 // the model producing a tool-call-free reply.
 var ErrMaxTurnsExceeded = errors.New("agent: loop exceeded MaxTurns")
 
+// ErrCheckpointUnavailable is returned when a path that promises a recoverable
+// pause has no checkpointer. Ordinary in-memory work may omit persistence, but
+// an Interrupted event must always correspond to a saved checkpoint.
+var ErrCheckpointUnavailable = errors.New("agent: checkpoint store is required for a recoverable pause")
+
 const defaultMaxTurns = 16
 
 // AgentLoop is the runtime's controllable loop, an explicit phase machine. One
@@ -109,6 +114,7 @@ func mergeSchema(list []llm.ToolSchema, s llm.ToolSchema) []llm.ToolSchema {
 
 func (l *AgentLoop) run(rc *RunContext) runOutcome {
 	history := append([]core.Message(nil), rc.State.Messages...)
+	startStep := 0
 
 	// A resumed run carries the tool batch its HITL pause left behind. Execute it
 	// before consulting the model, so approved calls behave exactly like a batch
@@ -117,19 +123,36 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 	if rb := rc.resumed; rb != nil {
 		rc.resumed = nil
 		rlc := &LoopContext{RunContext: rc, Step: rb.step, MaxTurns: l.maxTurns, History: history}
-		parts, d, rejects := l.runResumed(rb, rlc)
+		if err := l.mw.CheckToolPolicy(rlc, rb.calls); err != nil {
+			return l.fail(rc, rb.step, history, err)
+		}
+		resumed := l.runResumed(rb, rlc)
 		// The rejected calls in a resumed batch are reported here rather than inside
 		// runResumed, so every phase ordering stays in the loop. Same position as a
 		// step's: batch joined, snapshot not yet written.
-		l.mw.ToolReject(rlc, rejects)
-		if len(parts) > 0 {
-			history = append(history, core.Message{Role: core.RoleTool, Parts: parts})
+		l.mw.ToolReject(rlc, resumed.rejects)
+		if resumed.pause {
+			return l.interrupt(rc, rb.step, history, rb.calls, "before_tool", resumed.reason, checkpoint.RecoveryResumeTools)
+		}
+		if len(resumed.parts) > 0 {
+			history = append(history, core.Message{Role: core.RoleTool, Parts: resumed.parts})
+		}
+		if resumed.err != nil {
+			return l.fail(rc, rb.step, history, resumed.err)
+		}
+		if len(resumed.parts) > 0 || resumed.control.Kind != core.Continue {
 			rc.State.Messages = history
-			l.checkpoint(rc, rb.step, nil)
+			if err := l.checkpoint(rc, rb.step, nil, nil, resumed.control.Kind != core.Continue); err != nil {
+				return runOutcome{Err: err}
+			}
 		}
-		if d.Kind != core.Continue {
-			return runOutcome{Result: core.Result{Message: rb.final}, Control: d}
+		if resumed.control.Kind != core.Continue {
+			return runOutcome{Result: core.Result{Message: rb.final}, Control: resumed.control}
 		}
+		// The recovered batch belongs to rb.step. Start fresh model work at the
+		// next logical step so a provider that reuses a tool-call ID cannot replay
+		// the batch's durable result.
+		startStep = rb.step + 1
 	}
 
 	// Render the system prompt once per run: a prompt.Builder (if set) wins over
@@ -150,13 +173,27 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		system = s
 	}
 
-	for step := 0; step < l.maxTurns; step++ {
+	for step := startStep; step < startStep+l.maxTurns; step++ {
 		lc := &LoopContext{RunContext: rc, Step: step, MaxTurns: l.maxTurns, History: history}
 		rc.publish(core.TurnStarted{Step: step})
 
-		// Phase 1 — PrepareTurn: drain steering, then BeforeModel.
+		// Phase 1 — PrepareTurn: drain volatile steering, then the durable inbox.
 		if steers := rc.steering.drain(); len(steers) > 0 {
 			history = append(history, steers...)
+		}
+		if durable, ok := rc.durableStore(); ok {
+			inbox, err := durable.Inbox(rc, rc.ThreadID)
+			if err != nil {
+				return l.fail(rc, step, history, err)
+			}
+			if len(inbox) > 0 {
+				ids := make([]string, 0, len(inbox))
+				for _, msg := range inbox {
+					history = append(history, msg.Message)
+					ids = append(ids, msg.ID)
+				}
+				rc.addInboxAcks(ids)
+			}
 		}
 		// Let history-compacters (durable compaction) rewrite the working history
 		// before the model is consulted. The replacement flows into this step's
@@ -166,8 +203,17 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		lc.History = history
 		if d, err := l.mw.BeforeModel(lc); err != nil {
 			return l.fail(rc, step, history, err)
-		} else if out, stop := terminalFromDirective(d, core.Message{}); stop {
-			return out
+		} else {
+			switch d.Kind {
+			case core.Interrupt:
+				return l.interrupt(rc, step, history, nil, "before_model", d.Reason, checkpoint.RecoveryReplayModel)
+			case core.Stop, core.Escalate, core.Transfer:
+				rc.State.Messages = history
+				if err := l.checkpoint(rc, step, nil, nil, true); err != nil {
+					return runOutcome{Err: err}
+				}
+				return runOutcome{Control: d}
+			}
 		}
 
 		// Phase 2 — CallModel: ModifyRequest → stream → AfterModel.
@@ -196,8 +242,20 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 
 		if d, err := l.mw.AfterModel(lc, finalResp); err != nil {
 			return l.fail(rc, step, history, err)
-		} else if out, stop := terminalFromDirective(d, final); stop {
-			return out
+		} else {
+			switch d.Kind {
+			case core.Interrupt:
+				// Persist the model-request boundary, not final: a resumed run must
+				// re-ask the model rather than continue an uncheckpointed reply.
+				return l.interrupt(rc, step, history, nil, "after_model", d.Reason, checkpoint.RecoveryReplayModel)
+			case core.Stop, core.Escalate, core.Transfer:
+				history = append(history, final)
+				rc.State.Messages = history
+				if err := l.checkpoint(rc, step, nil, nil, true); err != nil {
+					return runOutcome{Err: err}
+				}
+				return runOutcome{Result: core.Result{Message: final}, Control: d}
+			}
 		}
 
 		history = append(history, final)
@@ -208,7 +266,9 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 				rc.State.Apply(core.StateOp{Kind: core.OpSetKV, Key: l.outputKey, Value: final.Text()})
 			}
 			rc.State.Messages = history
-			l.checkpoint(rc, step, nil)
+			if err := l.checkpoint(rc, step, nil, nil, true); err != nil {
+				return runOutcome{Err: err}
+			}
 			rc.publish(core.TurnDone{Step: step})
 			return runOutcome{Result: core.Result{Message: final}}
 		}
@@ -221,7 +281,9 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		if finalResp.StopReason == llm.StopMaxTokens {
 			history = append(history, core.Message{Role: core.RoleTool, Parts: truncatedResults(rc, calls)})
 			rc.State.Messages = history
-			l.checkpoint(rc, step, nil)
+			if err := l.checkpoint(rc, step, nil, nil, false); err != nil {
+				return runOutcome{Err: err}
+			}
 			rc.publish(core.TurnDone{Step: step})
 			continue
 		}
@@ -230,6 +292,9 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		// batch, then the rejections it collected. Reporting them after the batch joined
 		// (not from a tool's worker) and before this step's snapshot is what lets a
 		// ToolRejecter write State.KV without locking and have the write checkpointed.
+		if err := l.mw.CheckToolPolicy(lc, calls); err != nil {
+			return l.fail(rc, step, history, err)
+		}
 		for i := range calls {
 			d, err := l.mw.BeforeTool(lc, &calls[i])
 			if err != nil {
@@ -237,52 +302,45 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 			}
 			switch d.Kind {
 			case core.Interrupt:
-				// Persist history (incl. the assistant tool-call message) plus the
-				// still-pending calls, so Resume can apply approvals.
-				rc.State.Messages = history
-				l.checkpoint(rc, step, &checkpoint.PendingHITL{Step: step, Pending: calls[i:]})
-				return runOutcome{Control: core.Directive{Kind: core.Interrupt}, Pending: pendingFrom(calls[i:])}
+				// No handler has started yet. Save the whole original batch: calls
+				// checked before this gate were only preflighted, not executed.
+				return l.interrupt(rc, step, history, calls, "before_tool", d.Reason, checkpoint.RecoveryResumeTools)
 			case core.Stop, core.Escalate, core.Transfer:
 				// A gate denied/redirected before any tool ran; end this unit with
 				// that control directive.
 				rc.State.Messages = history
-				l.checkpoint(rc, step, nil)
+				if err := l.checkpoint(rc, step, nil, nil, true); err != nil {
+					return runOutcome{Err: err}
+				}
 				return runOutcome{Result: core.Result{Message: final}, Control: d}
 			}
 		}
 
-		results, dirs, rejects := l.execTools(rc, lc, calls)
+		results, dirs, rejects, execErr := l.execTools(rc, lc, calls)
 		l.mw.ToolReject(lc, rejects)
 		history = append(history, core.Message{Role: core.RoleTool, Parts: results})
+		if execErr != nil {
+			return l.fail(rc, step, history, execErr)
+		}
 
 		// Phase 4 — Checkpoint the step's state.
 		rc.State.Messages = history
-		l.checkpoint(rc, step, nil)
+		next := core.Resolve(dirs...)
+		if err := l.checkpoint(rc, step, nil, nil, next.Kind != core.Continue); err != nil {
+			return runOutcome{Err: err}
+		}
 		rc.publish(core.TurnDone{Step: step})
 
 		// Phase 5 — ApplyDirectives. A tool/AfterTool directive (Stop/Escalate/
 		// Transfer) ends this unit and propagates up via the outcome.
-		if d := core.Resolve(dirs...); d.Kind != core.Continue {
-			return runOutcome{Result: core.Result{Message: final}, Control: d}
+		if next.Kind != core.Continue {
+			return runOutcome{Result: core.Result{Message: final}, Control: next}
 		}
 	}
 
 	// The budget ran out mid-conversation: the seam is still worth keeping, so
 	// Resume can continue the thread with a larger budget instead of rewinding.
-	return l.fail(rc, l.maxTurns-1, history, ErrMaxTurnsExceeded)
-}
-
-// terminalFromDirective turns a Before/AfterModel directive into a terminal
-// outcome, reporting whether the loop should stop.
-func terminalFromDirective(d core.Directive, final core.Message) (runOutcome, bool) {
-	switch d.Kind {
-	case core.Interrupt:
-		return runOutcome{Control: core.Directive{Kind: core.Interrupt}}, true
-	case core.Stop, core.Escalate, core.Transfer:
-		return runOutcome{Result: core.Result{Message: final}, Control: d}, true
-	default:
-		return runOutcome{}, false
-	}
+	return l.fail(rc, startStep+l.maxTurns-1, history, ErrMaxTurnsExceeded)
 }
 
 // streamModel runs one model call, publishing MessageDelta for partials and
@@ -308,18 +366,42 @@ func (l *AgentLoop) streamModel(genCtx context.Context, rc *RunContext, lc *Loop
 }
 
 // checkpoint snapshots the current State for resume/branch/time-travel. A nil
-// Store is a no-op.
-func (l *AgentLoop) checkpoint(rc *RunContext, step int, pending *checkpoint.PendingHITL) {
+// Store is allowed for ordinary best-effort computation, but never for a
+// recoverable pause.
+func (l *AgentLoop) checkpoint(rc *RunContext, step int, pending *checkpoint.PendingHITL, pause *checkpoint.Pause, releaseClaim bool, extra ...checkpoint.ToolExecution) error {
 	if rc.Store == nil {
-		return
+		if pending != nil || pause != nil {
+			return ErrCheckpointUnavailable
+		}
+		return nil
 	}
-	_ = rc.Store.Save(rc, &checkpoint.Checkpoint{
+	return rc.commitCheckpoint(&checkpoint.Checkpoint{
 		ID:       core.NewID("cp"),
 		ThreadID: rc.ThreadID,
 		Step:     step,
 		State:    *rc.State,
 		Pending:  pending,
-	})
+		Pause:    pause,
+	}, releaseClaim, extra...)
+}
+
+func (l *AgentLoop) interrupt(rc *RunContext, step int, history []core.Message, pending []core.ToolCall, phase, reason, recovery string) runOutcome {
+	rc.State.Messages = history
+	var hitl *checkpoint.PendingHITL
+	if len(pending) > 0 {
+		hitl = &checkpoint.PendingHITL{Step: step, Pending: pending}
+	}
+	pause := &checkpoint.Pause{ID: core.NewID("pause"), Phase: phase, Reason: reason, Recovery: recovery}
+	if err := l.checkpoint(rc, step, hitl, pause, true, pendingExecutions(rc.ThreadID, step, pending)...); err != nil {
+		return runOutcome{Err: err}
+	}
+	return runOutcome{
+		Control:  core.Directive{Kind: core.Interrupt},
+		Pending:  pendingFrom(pending),
+		Phase:    phase,
+		Reason:   reason,
+		Recovery: recovery,
+	}
 }
 
 // fail ends the run on an error, first persisting the conversation up to the last
@@ -337,7 +419,9 @@ func (l *AgentLoop) fail(rc *RunContext, step int, history []core.Message, err e
 	}
 	if step >= 0 {
 		rc.State.Messages = seam(history)
-		l.checkpoint(rc, step, nil)
+		if checkpointErr := l.checkpoint(rc, step, nil, nil, true); checkpointErr != nil {
+			err = errors.Join(err, checkpointErr)
+		}
 	}
 	return runOutcome{Err: err}
 }

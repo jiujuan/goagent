@@ -27,6 +27,11 @@ type runOutcome struct {
 	Control core.Directive
 	// Pending lists the tool calls awaiting approval when Control is Interrupt.
 	Pending []core.ApprovalRequest
+	// Pause metadata is emitted with Interrupted so callers can distinguish a
+	// tool-approval pause from a model-request replay pause.
+	Phase    string
+	Reason   string
+	Recovery string
 	// Err is set when the unit failed.
 	Err error
 }

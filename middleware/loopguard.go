@@ -169,13 +169,20 @@ func (g *loopGuard) AfterModel(lc *agent.LoopContext, resp *llm.Response) (core.
 }
 
 func (g *loopGuard) BeforeTool(lc *agent.LoopContext, c *core.ToolCall) (core.Directive, error) {
-	act, ok := markedAction(lc, signature(c.Name, c.Args, g.strip))
+	sig := signature(c.Name, c.Args, g.strip)
+	act, ok := markedAction(lc, sig)
 	if !ok {
 		return core.Directive{}, nil
 	}
 	reason := "loop-guard: stuck-pattern tool call " + c.Name + " (see preceding " + WarnMarker + " warning)"
 	if act == actionStop {
 		return core.Directive{Kind: core.Stop, Reason: reason}, nil
+	}
+	if lc.IsApproved(c) {
+		// LoopGuard is a first-party HITL gate. A human approval consumes this
+		// one interrupt mark, but never changes a hard stop decision above.
+		clearMarkedAction(lc, sig)
+		return core.Directive{}, nil
 	}
 	return core.Directive{Kind: core.Interrupt, Reason: reason}, nil
 }
@@ -390,18 +397,37 @@ func interventions(lc *agent.LoopContext) int {
 // by AfterModel on the same *State, so live runs see map[string]string and a
 // resumed run (after JSON round-trip) sees map[string]any.
 func markedAction(lc *agent.LoopContext, sig string) (string, bool) {
+	act, ok := loopActions(lc)[sig]
+	return act, ok
+}
+
+func clearMarkedAction(lc *agent.LoopContext, sig string) {
 	if lc.State == nil {
-		return "", false
+		return
+	}
+	actions := loopActions(lc)
+	delete(actions, sig)
+	lc.State.Apply(core.StateOp{Kind: core.OpSetKV, Key: kvLoopActions, Value: actions})
+}
+
+func loopActions(lc *agent.LoopContext) map[string]string {
+	actions := map[string]string{}
+	if lc.State == nil {
+		return actions
 	}
 	switch m := lc.State.KV[kvLoopActions].(type) {
 	case map[string]string:
-		act, ok := m[sig]
-		return act, ok
+		for sig, act := range m {
+			actions[sig] = act
+		}
 	case map[string]any:
-		act, ok := m[sig].(string)
-		return act, ok
+		for sig, raw := range m {
+			if act, ok := raw.(string); ok {
+				actions[sig] = act
+			}
+		}
 	}
-	return "", false
+	return actions
 }
 
 // --- message/text helpers -----------------------------------------------------
