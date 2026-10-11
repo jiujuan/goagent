@@ -93,12 +93,13 @@ type Claim struct {
 // committed with the snapshot, preventing a result from being remembered while
 // the history that explains it is lost (or vice versa).
 type CommitRequest struct {
-	Checkpoint     *Checkpoint
-	AckMessageIDs  []string
-	Claim          *Claim
-	Lease          time.Duration
-	ReleaseClaim   bool
-	ToolExecutions []ToolExecution
+	Checkpoint       *Checkpoint
+	ExpectedRevision *uint64
+	AckMessageIDs    []string
+	Claim            *Claim
+	Lease            time.Duration
+	ReleaseClaim     bool
+	ToolExecutions   []ToolExecution
 }
 
 type CommitReceipt struct {

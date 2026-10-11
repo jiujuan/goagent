@@ -22,6 +22,12 @@ type memoryDurableState struct {
 	claim      *Claim
 	decisions  map[string]core.ApprovalDecision
 	executions map[string]ToolExecution
+	commits    map[string]memoryCommitRecord
+}
+
+type memoryCommitRecord struct {
+	digest   string
+	revision uint64
 }
 
 func (m *Memory) durableLocked(threadID string) *memoryDurableState {
@@ -32,6 +38,7 @@ func (m *Memory) durableLocked(threadID string) *memoryDurableState {
 		inbox:      map[string]InboxMessage{},
 		decisions:  map[string]core.ApprovalDecision{},
 		executions: map[string]ToolExecution{},
+		commits:    map[string]memoryCommitRecord{},
 	}
 	for _, cp := range m.byThread[threadID] {
 		if cp.Revision == 0 {
@@ -96,12 +103,6 @@ func (m *Memory) Commit(_ context.Context, req CommitRequest) (CommitReceipt, er
 
 func (m *Memory) commitLocked(req CommitRequest) (CommitReceipt, error) {
 	cp := req.Checkpoint
-	for _, old := range m.byThread[cp.ThreadID] {
-		if cp.ID != "" && old.ID == cp.ID {
-			st := m.durableLocked(cp.ThreadID)
-			return CommitReceipt{Revision: old.Revision, Claim: cloneClaim(st.claim)}, nil
-		}
-	}
 	for _, ex := range req.ToolExecutions {
 		if ex.InvocationID == "" {
 			return CommitReceipt{}, fmt.Errorf("checkpoint: tool execution requires invocation ID")
@@ -115,15 +116,38 @@ func (m *Memory) commitLocked(req CommitRequest) (CommitReceipt, error) {
 	if err != nil {
 		return CommitReceipt{}, err
 	}
+	digest, err := commitRequestDigest(stored, req.AckMessageIDs, req.Claim, executions)
+	if err != nil {
+		return CommitReceipt{}, err
+	}
 
 	st := m.durableLocked(cp.ThreadID)
-	now := time.Now()
+	now := m.nowTime()
+	if cp.ID != "" {
+		if committed, ok := st.commits[cp.ID]; ok {
+			if committed.digest != digest {
+				return CommitReceipt{}, ErrCheckpointConflict
+			}
+			cp.Revision = committed.revision
+			return CommitReceipt{Revision: committed.revision, Claim: retryReceiptClaim(st, req.Claim, now)}, nil
+		}
+		for _, old := range m.byThread[cp.ThreadID] {
+			if old.ID == cp.ID {
+				return CommitReceipt{}, ErrCheckpointConflict
+			}
+		}
+	}
 	if err := validateCommitClaim(st, req.Claim, now); err != nil {
 		return CommitReceipt{}, err
+	}
+	if req.ExpectedRevision != nil && currentRevision(m.byThread[cp.ThreadID]) != *req.ExpectedRevision {
+		return CommitReceipt{}, ErrRevisionConflict
 	}
 
 	revision := st.revision + 1
 	stored.Revision = revision
+	claim := renewedClaim(st, req, now)
+
 	st.revision = revision
 	m.byThread[cp.ThreadID] = append(m.byThread[cp.ThreadID], stored)
 	for _, id := range req.AckMessageIDs {
@@ -132,11 +156,18 @@ func (m *Memory) commitLocked(req CommitRequest) (CommitReceipt, error) {
 	for _, ex := range executions {
 		st.executions[ex.InvocationID] = ex
 	}
-
-	claim := renewedClaim(st, req, now)
+	if st.claim != nil && claimExpired(st.claim, now) && req.Claim == nil {
+		st.claim = nil
+	}
+	if claim != nil {
+		st.claim = cloneClaim(claim)
+	}
 	if req.ReleaseClaim && req.Claim != nil {
 		st.claim = nil
 		claim = nil
+	}
+	if cp.ID != "" {
+		st.commits[cp.ID] = memoryCommitRecord{digest: digest, revision: revision}
 	}
 	cp.Revision = revision
 	return CommitReceipt{Revision: revision, Claim: claim}, nil
@@ -153,7 +184,7 @@ func (m *Memory) Claim(_ context.Context, req ClaimRequest) (Claim, error) {
 	if cp == nil || cp.Revision != req.Revision || EffectivePauseID(cp) != req.PauseID {
 		return Claim{}, ErrClaimConflict
 	}
-	now := time.Now()
+	now := m.nowTime()
 	if st.claim != nil && !claimExpired(st.claim, now) {
 		if st.claim.Owner != req.Owner || st.claim.Revision != req.Revision || st.claim.PauseID != req.PauseID {
 			return Claim{}, ErrClaimConflict
@@ -225,7 +256,7 @@ func (m *Memory) ClaimTool(_ context.Context, req ToolClaimRequest) (ToolExecuti
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	st := m.durableLocked(req.ThreadID)
-	if err := validateCommitClaim(st, req.Claim, time.Now()); err != nil {
+	if err := validateCommitClaim(st, req.Claim, m.nowTime()); err != nil {
 		return ToolExecution{}, err
 	}
 	if old, ok := st.executions[req.InvocationID]; ok {
@@ -301,7 +332,6 @@ func validateCommitClaim(st *memoryDurableState, got *Claim, now time.Time) erro
 		if got != nil {
 			return ErrStaleFencingToken
 		}
-		st.claim = nil
 		return nil
 	}
 	if got == nil {
@@ -317,9 +347,24 @@ func renewedClaim(st *memoryDurableState, req CommitRequest, now time.Time) *Cla
 	if req.Claim == nil || st.claim == nil {
 		return nil
 	}
-	st.claim.ExpiresAt = now.Add(normalizeLease(req.Lease))
 	c := *st.claim
+	c.ExpiresAt = now.Add(normalizeLease(req.Lease))
 	return &c
+}
+
+func retryReceiptClaim(st *memoryDurableState, requested *Claim, now time.Time) *Claim {
+	if requested == nil || st.claim == nil || claimExpired(st.claim, now) || !sameClaim(*st.claim, *requested) {
+		return nil
+	}
+	return cloneClaim(st.claim)
+}
+
+func currentRevision(checkpoints []*Checkpoint) uint64 {
+	head := latestLocked(checkpoints)
+	if head == nil {
+		return 0
+	}
+	return head.Revision
 }
 
 func normalizeLease(lease time.Duration) time.Duration {

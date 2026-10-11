@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // Memory is an in-memory Checkpointer for prototyping and tests. Checkpoints are
@@ -13,6 +14,7 @@ type Memory struct {
 	mu       sync.RWMutex
 	byThread map[string][]*Checkpoint
 	durable  map[string]*memoryDurableState
+	now      func() time.Time
 }
 
 // NewMemory constructs an in-memory checkpointer.
@@ -20,7 +22,15 @@ func NewMemory() *Memory {
 	return &Memory{
 		byThread: map[string][]*Checkpoint{},
 		durable:  map[string]*memoryDurableState{},
+		now:      time.Now,
 	}
+}
+
+func (m *Memory) nowTime() time.Time {
+	if m.now == nil {
+		return time.Now()
+	}
+	return m.now()
 }
 
 // Save appends a checkpoint to its thread.

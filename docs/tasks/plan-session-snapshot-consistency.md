@@ -370,13 +370,15 @@ go test ./agent ./checkpoint ./middleware -count=1
 
 **依赖：**SC-02；按推荐顺序在 SC-05 后执行。**交付：**新的可选接口在 Memory 上有完整契约测试。
 
+**状态：**已完成（2026-10-12）。
+
 **文件：**新增 D:/codeproject/mygo/goagent/checkpoint/coordinator.go、D:/codeproject/mygo/goagent/checkpoint/coordinator_memory.go、D:/codeproject/mygo/goagent/checkpoint/coordinator_contract_test.go；修改 D:/codeproject/mygo/goagent/checkpoint/durable.go、D:/codeproject/mygo/goagent/checkpoint/durable_memory.go。
 
-- [ ] 按 D4/D5 定义接口、错误和 ExpectedRevision，增加编译期接口断言；旧 Durable 实现仍可编译。
-- [ ] 在 Memory.mu 内实现 BeginRun：先检查未过期 owner；检查暂停；克隆 head；在所有可失败步骤成功后登记 claim/fencing。相同 owner 的幂等 BeginRun 不重复推进 fencing；每次真正启动必须使用新 owner ID。
-- [ ] 在同一租约状态上实现 RenewClaim；过期、owner/pause/revision/fencing 不符返回 ErrStaleFencingToken，不能把过期 lease 复活。
-- [ ] 实现 ExpectedRevision 校验，新增重复请求摘要/等价性检查；摘要在发布提交结果之前算好，错误不修改状态；保存“提交请求摘要”与原 Revision 供后续幂等确认。
-- [ ] 按下表编写共享契约测试，先让 Memory 通过。测试中的短租期使用可注入时钟或显式控制到期，避免用大段 sleep 猜测调度。
+- [x] 按 D4/D5 定义接口、错误和 ExpectedRevision，增加编译期接口断言；旧 Durable 实现仍可编译。
+- [x] 在 Memory.mu 内实现 BeginRun：先检查未过期 owner；检查暂停；克隆 head；在所有可失败步骤成功后登记 claim/fencing。相同 owner 的幂等 BeginRun 不重复推进 fencing；每次真正启动必须使用新 owner ID。
+- [x] 在同一租约状态上实现 RenewClaim；过期、owner/pause/revision/fencing 不符返回 ErrStaleFencingToken，不能把过期 lease 复活。
+- [x] 实现 ExpectedRevision 校验，新增重复请求摘要/等价性检查；摘要在发布提交结果之前算好，错误不修改状态；保存“提交请求摘要”与原 Revision 供后续幂等确认。
+- [x] 按下表编写共享契约测试，先让 Memory 通过。测试中的短租期使用可注入时钟或显式控制到期，避免用大段 sleep 猜测调度。
 
 | 测试名 | 必须断言 |
 | --- | --- |
@@ -392,6 +394,14 @@ go test ./agent ./checkpoint ./middleware -count=1
 go test ./checkpoint -run '^TestSnapshotConsistency(BeginRun|RenewClaim|ExpectedRevision|CommitRetry|StaleWriter)' -count=1
 go test ./checkpoint -count=1
 ```
+
+**实施记录（2026-10-12）：**
+
+- RED：共享契约测试首次运行因缺少 BeginRun 等协调 API 而编译失败，确认测试先于实现捕获能力缺口。
+- GREEN：Memory 在同一互斥区内完成原子 BeginRun、可注入时钟续租、ExpectedRevision CAS、fencing 接管与提交幂等；同 ID 等价重试只返回原 Revision，不重复 ack、工具完成、续租或释放，也不泄漏其他 owner 的 claim。
+- 摘要语义：覆盖冻结 checkpoint、文件、ack 集合、工具执行及 claim 身份，忽略 store Revision、ExpectedRevision、Lease 和 ReleaseClaim；工具执行按 InvocationID 的最终可见值规范化后排序。截断 ToolCall Args 作为原始字节参与摘要，不收紧既有可保存消息的兼容边界。
+- 验证：定向契约测试、go test ./checkpoint -count=1、go test ./... -count=1、定向 go test -race、go vet ./... 与 git diff --check 均通过。
+- 范围：提交摘要和协调状态当前仅由 Memory 保存；File journal 的跨实例持久化、重开恢复与 Sync 失败确认属于 SC-07，尚未标记完成。
 
 **验收：**接口契约、空线程、CAS、续租、幂等和 stale owner 全部通过；现有恢复 claim 行为没有被新的普通 writer 绕过。
 
@@ -638,7 +648,7 @@ Windows 的 -race 需要可用的 cgo/C 编译工具链。若当前环境不支�
 - [x] SC-03：文件冻结与保存。
 - [x] SC-04：完整 Fork。
 - [x] SC-05：Agent 恢复及内部数据隔离。
-- [ ] SC-06：Memory 协调与 CAS。
+- [x] SC-06：Memory 协调与 CAS。
 - [ ] SC-07：File 持久化协调。
 - [ ] SC-08：writer guard 与续租。
 - [ ] SC-09：运行生命周期接入。
