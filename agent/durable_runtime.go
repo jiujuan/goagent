@@ -18,6 +18,7 @@ type durableRunState struct {
 	ackMessageIDs  []string
 	executions     map[string]checkpoint.ToolExecution
 	claim          *checkpoint.Claim
+	guard          *writeGuard
 	approvalEvents []core.ApprovalDecided
 }
 

@@ -438,6 +438,8 @@ go test ./checkpoint -run 'TestFile|TestExpiredOwner|TestInboxHistory' -count=1
 
 **依赖：**SC-06、SC-07。**交付：**一个供普通 Run/Resume/内部工作流共用的所有权管理实现，本卡先单独测试，不改变 Agent 启动入口。
 
+**状态：**已完成（2026-10-12）。
+
 **文件：**新增 D:/codeproject/mygo/goagent/agent/write_guard.go、D:/codeproject/mygo/goagent/agent/write_guard_test.go；在 D:/codeproject/mygo/goagent/agent/durable_runtime.go 的 durableRunState 中增加 guard 引用。
 
 **内部模型：**
@@ -466,17 +468,24 @@ func (g *writeGuard) err() error
 func (g *writeGuard) stopAndRelease(ctx context.Context) error
 ```
 
-- [ ] start 先做一次身份校验/续租，成功才启动后台 ticker；已经过期的 prepared Resume 失败而不重新申请。
-- [ ] commit 在操作锁内读取 headRevision，设置 ExpectedRevision/Claim，禁用子步骤直接 ReleaseClaim，成功后更新 headRevision 和自己的 claim；失败时不推进 headRevision。
-- [ ] 续租与提交、释放共享操作锁，避免续租结果用旧 ExpiresAt 覆盖新状态。后台续租失败只记录首个错误，取消根 context；之后 commit 立即返回该错误。
-- [ ] stopAndRelease 幂等；先停止 ticker 并等待退出，再在有限 context 内释放；即使根 context 已取消也能完成清理。不在持有操作锁时等待需要该锁才能退出的 goroutine。
-- [ ] 添加 TestSnapshotConsistencyGuardRenewal、TestSnapshotConsistencyGuardLostLease、TestSnapshotConsistencyGuardCommitSerial、TestSnapshotConsistencyGuardStop；用 fake coordinator、屏障 channel 和可控 ticker 验证顺序，无真实模型调用。
-- [ ] 测试 commit 与 renew 同时到达、stop 与 renew 同时到达、初次 renew 失败、释放失败、重复 stop、取消后的清理、后台 goroutine 退出。
+- [x] start 先做一次身份校验/续租，成功才启动后台 ticker；已经过期的 prepared Resume 失败而不重新申请。
+- [x] commit 在操作锁内读取 headRevision，设置 ExpectedRevision/Claim，禁用子步骤直接 ReleaseClaim，成功后更新 headRevision 和自己的 claim；失败时不推进 headRevision。
+- [x] 续租与提交、释放共享操作锁，避免续租结果用旧 ExpiresAt 覆盖新状态。后台续租失败只记录首个错误，取消根 context；之后 commit 立即返回该错误。
+- [x] stopAndRelease 幂等；先停止 ticker 并等待退出，再在有限 context 内释放；即使根 context 已取消也能完成清理。不在持有操作锁时等待需要该锁才能退出的 goroutine。
+- [x] 添加 TestSnapshotConsistencyGuardRenewal、TestSnapshotConsistencyGuardLostLease、TestSnapshotConsistencyGuardCommitSerial、TestSnapshotConsistencyGuardStop；用 fake coordinator、屏障 channel 和可控 ticker 验证顺序，无真实模型调用。
+- [x] 测试 commit 与 renew 同时到达、stop 与 renew 同时到达、初次 renew 失败、释放失败、重复 stop、取消后的清理、后台 goroutine 退出。
 
 ```powershell
 go test ./agent -run '^TestSnapshotConsistencyGuard' -count=1
 go test -race ./agent -run '^TestSnapshotConsistencyGuard' -count=1
 ```
+
+**实施记录（2026-10-12）：**
+
+- RED：四组 guard 测试首次运行因缺少 newWriteGuard 和 writeGuardTicker 而编译失败；补充的取消场景还复现了初次续租因 context 取消失败后仍可提交的问题。
+- GREEN：guard 在首次身份续租成功后按半个 lease 周期启动后台续租；Commit、RenewClaim、ReleaseClaim 通过同一操作锁串行，提交成功才推进 head revision 和 claim，所有初次续租失败及后台续租失败都会阻止后续提交。
+- 停止顺序：stopAndRelease 先标记停止并取消续租，等待 goroutine 退出后使用独立的五秒清理 context 释放 claim；sync.Once 保证并发或重复停止只释放一次。
+- 验证：定向 guard 测试、定向 go test -race、agent 与全仓测试、go vet ./... 和 git diff --check 均通过；本卡没有接入 Run、Resume 或工作流，生命周期接入保留给 SC-09。
 
 **验收：**无重复续租/释放，无泄漏；提交串行推进 revision；失败后不再允许新提交；lease 的所有权与 head revision 始终分开。
 
@@ -659,8 +668,8 @@ Windows 的 -race 需要可用的 cgo/C 编译工具链。若当前环境不支�
 - [x] SC-04：完整 Fork。
 - [x] SC-05：Agent 恢复及内部数据隔离。
 - [x] SC-06：Memory 协调与 CAS。
-- [ ] SC-07：File 持久化协调。
-- [ ] SC-08：writer guard 与续租。
+- [x] SC-07：File 持久化协调。
+- [x] SC-08：writer guard 与续租。
 - [ ] SC-09：运行生命周期接入。
 - [ ] SC-10：模型/工具分发门禁。
 - [ ] SC-11：跨进程及故障回归。
