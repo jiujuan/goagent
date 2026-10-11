@@ -108,8 +108,19 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		return nil, err
 	}
 	allApprovals := append(durableApprovals, approvals...)
-	state := cloneState(cp.State)
-	applyFileSnapshot(&state, cp.FileSnapshot)
+	state, err := cloneState(cp.State)
+	if err != nil {
+		if claim != nil {
+			_ = durable.ReleaseClaim(context.Background(), *claim)
+		}
+		return nil, err
+	}
+	if err := applyFileSnapshot(&state, cp.FileSnapshot); err != nil {
+		if claim != nil {
+			_ = durable.ReleaseClaim(context.Background(), *claim)
+		}
+		return nil, err
+	}
 	if state.Files == nil {
 		state.Files = vfs.NewInState()
 	}

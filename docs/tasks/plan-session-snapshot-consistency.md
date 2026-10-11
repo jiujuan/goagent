@@ -336,26 +336,35 @@ go test ./checkpoint -count=1
 
 **依赖：**SC-04。**交付：**外部 store 返回共享对象时，Agent 也不改写其历史状态。
 
+**状态：**已完成（2026-10-12）。
+
 **文件：**修改 D:/codeproject/mygo/goagent/agent/agent.go、D:/codeproject/mygo/goagent/agent/hitl.go、D:/codeproject/mygo/goagent/agent/runtime.go、D:/codeproject/mygo/goagent/agent/workflow.go；新增 D:/codeproject/mygo/goagent/agent/state_isolation_test.go。
 
-- [ ] 添加 TestSnapshotConsistencyAgentRestore，使用故意返回共享 checkpoint 指针的只读测试 store，验证 Agent 在独立运行状态上追加消息及修改嵌套数据。
-- [ ] 将 agent.cloneState 改为使用 core.CloneStateData 并传播 error；restore/Resume/forBranch 的所有调用点都处理错误。forBranch 返回 (*RunContext,error)，parallelRunner 在启动分支前完成所有分支的克隆验证，失败时不能只启动一半分支。
-- [ ] applyFileSnapshot 改为返回 error；恢复优先级遵守 D1。WithRunFiles 覆盖时不先还原一个随后会丢弃的 snapshot，也不因被覆盖的无效 snapshot 产生伪失败。
-- [ ] 添加 TestSnapshotConsistencyAgentForkFiles，完成保存源节点→重开 store→Fork→保存分支→Agent.OnThread 分支读取文件的闭环。
-- [ ] 添加 TestSnapshotConsistencyParallelNestedState 和 TestSnapshotConsistencySubagentFilesShared：内部 Parallel 的数据隔离仍成立，subRun/deeper 有意共享的活跃 Files 仍共享，不把运行时协作误变成文件隔离。
+- [x] 添加 TestSnapshotConsistencyAgentRestore，使用故意返回共享 checkpoint 指针的只读测试 store，验证 Agent 在独立运行状态上追加消息及修改嵌套数据。
+- [x] 将 agent.cloneState 改为使用 core.CloneStateData 并传播 error；restore/Resume/forBranch 的所有调用点都处理错误。forBranch 返回 (*RunContext,error)，parallelRunner 在启动分支前完成所有分支的克隆验证，失败时不能只启动一半分支。
+- [x] applyFileSnapshot 改为返回 error；恢复优先级遵守 D1。WithRunFiles 覆盖时不先还原一个随后会丢弃的 snapshot，也不因被覆盖的无效 snapshot 产生伪失败。
+- [x] 添加 TestSnapshotConsistencyAgentForkFiles，完成保存源节点→重开 store→Fork→保存分支→Agent.OnThread 分支读取文件的闭环。
+- [x] 添加 TestSnapshotConsistencyParallelNestedState 和 TestSnapshotConsistencySubagentFilesShared：内部 Parallel 的数据隔离仍成立，subRun/deeper 有意共享的活跃 Files 仍共享，不把运行时协作误变成文件隔离。
 
 ```powershell
 go test ./agent -run '^TestSnapshotConsistency(Agent|ParallelNested|SubagentFiles)' -count=1
 go test ./agent ./checkpoint ./middleware -count=1
 ```
 
+**实施记录（2026-10-12）：**
+
+- RED：定向测试稳定复现 Agent restore 污染共享 checkpoint、克隆失败未传播、非 nil 空文件快照未替换旧句柄，以及 Parallel 分支共享嵌套 KV 和克隆失败后仍启动分支。
+- GREEN：cloneState 统一委托 core.CloneStateData；restore、Resume 和 forBranch 传播错误，Resume 在取得 Durable claim 后遇到克隆/还原失败会释放 claim；Parallel 在启动任何 goroutine 前完成全部分支克隆。
+- 文件语义：显式 WithRunFiles 直接覆盖恢复文件并跳过 FileSnapshot 还原；没有覆盖时，任何非 nil FileSnapshot（含空 map）都生成新的 InState 并替换旧句柄；subRun/deeper 继续共享当前活跃 Files。
+- 验证：定向测试、go test ./agent ./checkpoint ./middleware -count=1、go test ./... -count=1、定向 go test -race 与 go vet ./... 均通过。
+
 **验收：**三个原始问题中的 P0-A/P0-B 完成；第三方 store 的共享读取不会污染运行历史；恢复错误可见，内部工作流原语义通过回归。
 
 **检查点 A：**
 
-- [ ] SC-01～05 的新增用例和既有相关测试均通过。
-- [ ] 输入、读取、Fork、Agent restore 四处不再使用仅复制外层容器作为完整隔离措施。
-- [ ] File 的冻结快照路径可以独立于活跃文件句柄工作。
+- [x] SC-01～05 的新增用例和既有相关测试均通过。
+- [x] 输入、读取、Fork、Agent restore 四处不再使用仅复制外层容器作为完整隔离措施。
+- [x] File 的冻结快照路径可以独立于活跃文件句柄工作。
 
 ### TASK-SC-06：实现 Memory 线程协调、续租与 CAS
 
@@ -628,7 +637,7 @@ Windows 的 -race 需要可用的 cgo/C 编译工具链。若当前环境不支�
 - [x] SC-02：Memory 不可变快照。
 - [x] SC-03：文件冻结与保存。
 - [x] SC-04：完整 Fork。
-- [ ] SC-05：Agent 恢复及内部数据隔离。
+- [x] SC-05：Agent 恢复及内部数据隔离。
 - [ ] SC-06：Memory 协调与 CAS。
 - [ ] SC-07：File 持久化协调。
 - [ ] SC-08：writer guard 与续租。

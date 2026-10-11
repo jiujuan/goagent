@@ -93,8 +93,11 @@ func (rc *RunContext) subRun(input core.Message) *RunContext {
 // (so events merge into one observable stream and snapshots share a thread). A
 // fresh steering queue is intentional. It does NOT struct-copy rc (that would
 // copy the steering mutex).
-func (rc *RunContext) forBranch(branch string) *RunContext {
-	st := cloneState(*rc.State)
+func (rc *RunContext) forBranch(branch string) (*RunContext, error) {
+	st, err := cloneState(*rc.State)
+	if err != nil {
+		return nil, err
+	}
 	return &RunContext{
 		Context:  rc.Context,
 		RunID:    rc.RunID,
@@ -105,7 +108,7 @@ func (rc *RunContext) forBranch(branch string) *RunContext {
 		State:    &st,
 		branch:   branch,
 		durable:  rc.durable,
-	}
+	}, nil
 }
 
 // Steer injects a message to be delivered before the next model call. Safe to
@@ -186,19 +189,6 @@ func (d *dynamicTools) advertised() []llm.ToolSchema {
 
 // cloneState makes a safe copy of a checkpoint's State so a run cannot mutate a
 // stored snapshot. Files is a backend handle and is shared intentionally.
-func cloneState(s core.State) core.State {
-	out := core.State{Files: s.Files}
-	if s.Messages != nil {
-		out.Messages = append([]core.Message(nil), s.Messages...)
-	}
-	if s.Todos != nil {
-		out.Todos = append([]core.Todo(nil), s.Todos...)
-	}
-	if s.KV != nil {
-		out.KV = make(map[string]any, len(s.KV))
-		for k, v := range s.KV {
-			out.KV[k] = v
-		}
-	}
-	return out
+func cloneState(s core.State) (core.State, error) {
+	return core.CloneStateData(s)
 }

@@ -145,14 +145,20 @@ func (p *parallelRunner) run(rc *RunContext) runOutcome {
 
 	results := make([]runOutcome, len(p.subs))
 	branches := make([]*RunContext, len(p.subs))
+	for i := range p.subs {
+		child, err := rc.forBranch(p.subs[i].cfg.name)
+		if err != nil {
+			return runOutcome{Err: err}
+		}
+		branches[i] = child
+	}
+
 	var wg sync.WaitGroup
 	for i := range p.subs {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			child := rc.forBranch(p.subs[i].cfg.name)
-			branches[i] = child
-			results[i] = p.subs[i].runnable.run(child)
+			results[i] = p.subs[i].runnable.run(branches[i])
 		}(i)
 	}
 	wg.Wait()

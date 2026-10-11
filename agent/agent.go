@@ -12,6 +12,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/jiujuan/goagent/bus"
 	"github.com/jiujuan/goagent/checkpoint"
@@ -137,7 +138,7 @@ func (a *Agent) Stream(ctx context.Context, input string, opts ...RunOption) *Ru
 	var state *core.State
 	var err error
 	if err = core.CheckThreadID(rc.ThreadID); err == nil {
-		state, err = a.restore(ctx, rc.ThreadID)
+		state, err = a.restore(ctx, rc.ThreadID, rc.Files)
 	} else {
 		state = &core.State{}
 	}
@@ -156,16 +157,27 @@ func (a *Agent) Stream(ctx context.Context, input string, opts ...RunOption) *Ru
 
 // restore loads the latest checkpoint's state for a thread, or a fresh State.
 // On store error it returns an empty state plus the error (surfaced via the run).
-func (a *Agent) restore(ctx context.Context, threadID string) (*core.State, error) {
+// An explicit runFiles backend wins without restoring a snapshot that would be
+// discarded immediately.
+func (a *Agent) restore(ctx context.Context, threadID string, runFiles core.FileStore) (*core.State, error) {
 	cp, err := a.store.Latest(ctx, threadID)
 	if err != nil {
 		return &core.State{}, err
 	}
 	if cp == nil {
-		return &core.State{}, nil
+		return &core.State{Files: runFiles}, nil
 	}
-	st := cloneState(cp.State)
-	applyFileSnapshot(&st, cp.FileSnapshot)
+	st, err := cloneState(cp.State)
+	if err != nil {
+		return &core.State{}, err
+	}
+	if runFiles != nil {
+		st.Files = runFiles
+		return &st, nil
+	}
+	if err := applyFileSnapshot(&st, cp.FileSnapshot); err != nil {
+		return &core.State{}, err
+	}
 	return &st, nil
 }
 
@@ -175,16 +187,18 @@ func (a *Agent) restore(ctx context.Context, threadID string) (*core.State, erro
 // served them back on Checkpoint.FileSnapshot. A nil snapshot (nothing ever
 // written, an externally managed backend, or an in-memory checkpointer whose
 // live handle already travelled with the state) leaves Files untouched for the
-// caller's fallback rules.
-func applyFileSnapshot(st *core.State, snap map[string][]byte) {
-	if st == nil || st.Files != nil || snap == nil {
-		return
+// caller's fallback rules. A non-nil snapshot, including an empty one, replaces
+// any retained handle with an independent in-memory view.
+func applyFileSnapshot(st *core.State, snap map[string][]byte) error {
+	if st == nil || snap == nil {
+		return nil
 	}
 	fs := vfs.NewInState()
 	if err := fs.Restore(snap); err != nil {
-		return
+		return fmt.Errorf("agent: restore file snapshot: %w", err)
 	}
 	st.Files = fs
+	return nil
 }
 
 // newRunHandle builds the per-run execution environment (RunContext) and its
