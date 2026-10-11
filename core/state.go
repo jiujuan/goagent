@@ -5,8 +5,10 @@ package core
 // step via a Checkpointer, which is simpler and the substrate for resume /
 // branch / time-travel.
 //
-// State must stay serializable: Messages, Todos and KV round-trip through JSON;
-// Files is a pluggable backend handle, excluded from inline serialization.
+// State must stay serializable and cloneable: Messages, Todos and KV round-trip
+// through JSON, and KV values must satisfy the CloneStateData contract. Files
+// is a pluggable backend handle excluded from inline serialization and retained
+// as-is by CloneStateData; checkpoint stores freeze file contents separately.
 type State struct {
 	Messages []Message      `json:"messages,omitempty"`
 	Todos    []Todo         `json:"todos,omitempty"`
