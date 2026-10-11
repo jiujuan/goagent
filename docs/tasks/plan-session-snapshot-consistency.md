@@ -9,7 +9,7 @@
 **Tech Stack：**Go（go.mod 声明 1.25.0）、testing、现有 Memory/File checkpointer、JSONL journal、现有 mock 模型；不引入新的第三方依赖。
 
 - 日期：2026-10-11。
-- 状态：待实施；本次仅编写计划。
+- 状态：已完成（2026-10-12）；SC-01 至 SC-12 均已实施并通过最终验收。
 - 代码基线：02dbb6e430b7675e908cb534a63d4893b146f84e。执行前重新读取工作区，行号仅帮助定位，函数名和实际代码优先。
 - 输入分析：[goagent-genkit-session-snapshot-review.md](D:/codeproject/mygo/goagent/docs/analysis/goagent-genkit-session-snapshot-review.md:25)。
 - 工作目录：D:/codeproject/mygo/goagent。
@@ -662,14 +662,42 @@ Windows 的 -race 需要可用的 cgo/C 编译工具链。若当前环境不支�
 
 **依赖：**SC-11。**交付：**行为变化、迁移方式和验证结果可被下一位维护者查阅。
 
-**文件：**新增 D:/codeproject/mygo/goagent/docs/adr/ADR-0032-session-snapshot-consistency.md（执行时若编号已被占用，使用实际下一个空号并更新本文引用）；更新 D:/codeproject/mygo/goagent/docs/adr/ADR-0026-state-files-durability.md、D:/codeproject/mygo/goagent/docs/tasks/plan-session-snapshot-consistency.md，以及当前介绍 Fork/Checkpointer 的实际文档段落。
+**状态：**已完成（2026-10-12）。
 
-- [ ] 记录为什么保留 append-only、为什么文件冻结与活跃文件共享分开、为什么 BeginRun 返回原子 head，以及顶层统一释放的约束。
-- [ ] 给出 Fork 从一个返回值迁移到 (checkpoint,error) 的完整调用示例；明确不复制暂停/审批/工具账本。
-- [ ] 列出 KV 支持类型和拒绝类型，明确新增 ErrStateNotCloneable；不要把类型化业务 codec 或 schema 迁移写成已实现。
-- [ ] 更新 ADR-0026 中“Memory 共享活跃句柄即可正确持久化”的旧说明，记录 Memory 对可快照文件的行为变化，保留外部目录与 subagent 协作契约。
-- [ ] 说明 WithThreadCoordinationRequired、普通运行冲突、暂停必须 Resume、惰性加载时点变化、Prepared Resume 过期以及旧 store 的保证边界。
-- [ ] 回填本文件的任务状态、实际修改文件、测试命令/结果、相关提交和偏离设计的原因。只有真实通过的项才能勾选。
+**文件：**新增 D:/codeproject/mygo/goagent/docs/adr/ADR-0032-session-snapshot-consistency.md；更新 D:/codeproject/mygo/goagent/docs/adr/ADR-0026-state-files-durability.md、D:/codeproject/mygo/goagent/docs/tasks/plan-session-snapshot-consistency.md、D:/codeproject/mygo/goagent/README.md。
+
+- [x] 记录为什么保留 append-only、为什么文件冻结与活跃文件共享分开、为什么 BeginRun 返回原子 head，以及顶层统一释放的约束。
+- [x] 给出 Fork 从一个返回值迁移到 (checkpoint,error) 的完整调用示例；明确不复制暂停/审批/工具账本。
+- [x] 列出 KV 支持类型和拒绝类型，明确新增 ErrStateNotCloneable；不要把类型化业务 codec 或 schema 迁移写成已实现。
+- [x] 更新 ADR-0026 中“Memory 共享活跃句柄即可正确持久化”的旧说明，记录 Memory 对可快照文件的行为变化，保留外部目录与 subagent 协作契约。
+- [x] 说明 WithThreadCoordinationRequired、普通运行冲突、暂停必须 Resume、惰性加载时点变化、Prepared Resume 过期以及旧 store 的保证边界。
+- [x] 回填本文件的任务状态、实际修改文件、测试命令/结果、相关提交和偏离设计的原因。只有真实通过的项才能勾选。
+
+**实施记录（2026-10-12）：**
+
+- 新增 ADR-0032，归档三个已复现问题、append-only 与不可变边界、KV 克隆白名单/拒绝类型、文件冻结、Fork 迁移、线程协调、惰性运行、Prepared Resume 和第三方 store 兼容边界。
+- 修订 ADR-0026，把“Memory 依赖活跃指针共享即可正确持久化”明确标记为修复前历史事实；现行契约改为 Memory/File 均冻结可快照文件，读取时再次克隆，同时保留 subagent 的运行期活跃句柄共享和外部托管后端规则。
+- README 增加“会话快照与并发”，说明默认协调行为、冲突/暂停错误、严格协调选项、外部文件后端和 Fork 新签名。
+- 最终验收通过：`go test ./core ./checkpoint ./agent ./vfs ./middleware -count=1`、`go test -race ./core ./checkpoint ./agent ./vfs -count=1`、`go test ./... -count=1`、`go vet ./...`、`git diff --check`。
+
+**提交映射：**
+
+```text
+SC-01 5c25f51 feat(core): add deep-copy primitives
+SC-02 1d8feca fix(checkpoint): isolate in-memory snapshot data
+SC-03 b01c7a7 fix(checkpoint): persist frozen file snapshots
+SC-04 73eb587 fix(checkpoint): freeze forked snapshots
+SC-05 23a8019 fix(agent): isolate restored and parallel state
+SC-06 664aad8 fix(checkpoint): coordinate in-memory writers
+SC-07 4b3ffc3 fix(checkpoint): coordinate file-backed writers
+SC-08 f7ec99b fix(agent): guard durable writer lifecycle
+SC-09 ec84e20 fix(agent): coordinate lazy run lifecycle
+SC-10 e9d6818 fix(agent): gate model and tool dispatch
+SC-11 3fcec2a test(checkpoint): verify cross-process recovery
+SC-12 当前工作区文档变更，按执行会话流程待单独提交
+```
+
+**设计偏差与边界：**没有影响 P0-A/P0-B/P0-C 验收的功能偏离。SC-11 只补跨进程、故障注入和稳定性测试，没有生产代码变更。旧第三方 store 通过可选接口保持兼容，但不会自动获得新协调保证；需要强保证时使用 `WithThreadCoordinationRequired(true)`。业务 codec、schema migration、Session 门面、完整快照树、自动排队和自动重试仍明确不属于本批交付。
 
 **验收：**文档与实际签名/行为一致；没有“将在以后补完”才能满足本批三个目标的尾项；提交、推送、PR 按执行会话的授权处理，本计划不要求直接合入主分支。
 
@@ -701,7 +729,7 @@ Windows 的 -race 需要可用的 cgo/C 编译工具链。若当前环境不支�
 - [x] SC-09：运行生命周期接入。
 - [x] SC-10：模型/工具分发门禁。
 - [x] SC-11：跨进程及故障回归。
-- [ ] SC-12：文档迁移与验收归档。
+- [x] SC-12：文档迁移与验收归档。
 
 执行者完成本批时，应能回答并用测试证明：保存后改 input 会不会改历史、读取后改 output 会不会改历史、Fork 是否带回文件、提前创建的两个句柄是否看见正确 head、真正并发是否在副作用前冲突、长调用是否持续持有租约、旧 writer 是否永远不能提交新 owner 的状态。
 
@@ -712,4 +740,4 @@ Windows 的 -race 需要可用的 cgo/C 编译工具链。若当前环境不支�
 - TestSnapshotConsistencyMemorySave：saved snapshot changed through input: changed。
 - TestSnapshotConsistencyLazyRunsUseCurrentHead：user messages = [seed request-B], want [seed request-A request-B]。
 
-这两次失败用于验证计划中的回归测试能捕获现有缺陷，不是实施完成后的验收结果。本文所有实施复选框仍保持未完成；本次没有修改 core/checkpoint/agent 的实现文件，也没有执行全仓回归。文件分支问题沿用输入分析中已记录的复现结果，SC-03/04 要将其固化为正式测试。
+这两次失败用于验证计划中的回归测试能捕获当时缺陷，不是实施完成后的验收结果。在 2026-10-11 的计划编写阶段，实施复选框仍未完成，也没有修改 core/checkpoint/agent 的实现文件或执行全仓回归；后续 SC-01 至 SC-12 的实施和最终验收记录以上文各任务卡为准。

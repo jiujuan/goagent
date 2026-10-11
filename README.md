@@ -270,6 +270,15 @@ go run ./examples/quickstart
 5. 业务步骤固定时用 `Sequential` / `Parallel` / `Loop` / `Pipeline`；带依赖的复杂任务用 `agent.NewPlan`；需要领域专家协作时配置 `WithSubAgents` 或 `AsTool`。
 6. 对外部命令、删除、支付等高风险动作，同时使用 `sandbox` 与 `middleware.Permission(...)`。
 
+### 会话快照与并发
+
+- checkpoint 历史保持 append-only。Memory 和 File checkpointer 都会冻结状态数据与可快照文件，`Load`、`Latest`、`History` 和 Fork 返回的内容可独立修改，不会反向污染历史。
+- `Stream` 在创建句柄时不读取 checkpoint；第一次 `Wait`/`Iter` 才原子取得同线程 writer 并加载当前 head。同线程真正并发的普通运行会在模型和工具执行前返回 `checkpoint.ErrClaimConflict`。
+- 暂停线程必须用 `Resume` 继续，普通 `Run`/`Stream` 返回 `checkpoint.ErrResumeRequired`。Prepared Resume 在 drive 前会验证租约，过期时返回 `checkpoint.ErrStaleFencingToken`，不会重新执行已批准工具。
+- Memory/File 默认实现线程协调。第三方 checkpointer 只有显式实现 `checkpoint.ThreadCoordinator` 才有同等跨实例保证；可用 `agent.WithThreadCoordinationRequired(true)` 在 `agent.New` 时强制检查。
+- `vfs.InState` 等 `core.Snapshottable` 后端会进入快照。真实目录或远端等外部托管后端需要在每个恢复进程重新传 `agent.WithRunFiles`，其内容不随时间旅行回滚。
+- `checkpoint.Fork` 现在返回 `(*checkpoint.Checkpoint, error)`，且只构造未保存的分支快照；调用方必须检查错误并显式 `Save`。完整迁移方式和并发边界见 [ADR-0032](docs/adr/ADR-0032-session-snapshot-consistency.md)。
+
 ## 目录概览
 
 ```text

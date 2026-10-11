@@ -1,8 +1,10 @@
 # ADR-0026: State.Files 的持久化与快照契约修正
 
-- 状态: Accepted（P0+P1 已实施：`core.Snapshottable/Restorable`、`vfs.InState.Snapshot/Restore`、`checkpoint/file.go` blob sidecar+索引+去重缓存、`Checkpoint.FileSnapshot` 内存手递、`agent` restore/Resume 三优先级还原；P2 未做）
+- 状态: Accepted（P0+P1 已实施；2026-10-12 由 ADR-0032 补强 Memory/File 的不可变冻结、读取隔离与 Fork 契约；P2 未做）
 - 日期: 2026-09-29
-- 关联: ADR-0022(workspace 的 os.Root 文件工具)、ADR-0025(历史落盘，同属"别让每步重复膨胀")、`core/state.go`、`checkpoint/file.go`、`agent/{agent,hitl,runtime,subagent}.go`、`vfs/instate.go`
+- 关联: ADR-0022(workspace 的 os.Root 文件工具)、ADR-0025(历史落盘，同属"别让每步重复膨胀")、ADR-0032（会话快照不可变性与线程写入协调）、`core/state.go`、`checkpoint/file.go`、`agent/{agent,hitl,runtime,subagent}.go`、`vfs/instate.go`
+
+> **2026-10-12 后续修订：**本 ADR 第一次记录的是修复前事实和 P1 的初始落盘方案。当前生效契约以 ADR-0032 为准：Memory 与 File 在保存可快照文件时都冻结为独立 `FileSnapshot`，读取时再次克隆；只有非 `Snapshottable` 的外部托管后端可以在 Memory 中保留同进程活跃句柄。运行期 subagent 仍共享活跃 `Files`，但已提交 checkpoint 不再共享可变文件内容。
 
 ## 背景
 
@@ -23,23 +25,23 @@ type FileStore interface {
 }
 ```
 
-它的设计意图（`vfs` 包注释、`State` 注释）是 deepagents 式的"大工具结果/中间产物外置"，随 run 的 State 一起被 checkpoint 捕获。但存在三处互相矛盾的事实：
+它的设计意图（`vfs` 包注释、`State` 注释）是 deepagents 式的"大工具结果/中间产物外置"，随 run 的 State 一起被 checkpoint 捕获。2026-09-29 修复前存在三处互相矛盾的事实：
 
 1. **文档在说谎。** `vfs/instate.go:16-17` 写："files live in memory and travel with the run State (**so they are captured by checkpoints**)"。可 `Files` 是 `json:"-"`（`state.go:13`）。`File` checkpointer 整个 `Checkpoint` 走 `json.Marshal`（`checkpoint/file.go:44`），`Files` 在序列化时被丢弃，读回（`Latest`/`Load`）后 `cp.State.Files == nil`。
 
-2. **只有"同进程 + 内存 checkpointer"侥幸能用。** `Memory.Save` 直接 append `*Checkpoint`（`memory.go:29`），`cloneState` 又按指针复制 `Files`（`checkpoint/branch.go:25-26`），所以单进程内 `Files` 因指针共享而存活。**这条侥幸掩盖了 1**，让人误以为契约成立。
+2. **修复前只有"同进程 + 内存 checkpointer"侥幸能用。** 当时 `Memory.Save` 直接 append `*Checkpoint`，`cloneState` 又按指针复制 `Files`，所以单进程内 `Files` 因指针共享而存活。**这条侥幸掩盖了 1**，让人误以为契约成立；当前 Memory 已按 ADR-0032 冻结可快照文件，不能再依赖这条指针共享行为。
 
-3. **resume 路径把丢掉的 Files 一律重置成空。** 两个续跑入口遇到 `Files == nil` 都新建空 `InState`：
+3. **修复前 resume 路径把丢掉的 Files 一律重置成空。** 两个续跑入口遇到 `Files == nil` 都新建空 `InState`：
    - `Agent.Stream` → `restore`（`agent/agent.go:133-143`，cloneState 后 Files 仍 nil）→ `agent/agent.go:117-122` `else if state.Files == nil { state.Files = vfs.NewInState() }`。
    - `Agent.Resume` → `agent/hitl.go:72-75` 同样的 nil 兜底。
 
-结论：**用 `File`（JSONL）checkpointer 做跨进程续跑（HITL 在另一进程批准、queue worker 崩溃重领——正是 ADR-0022/0024 强调的 durable 场景）时，暂停前写入工作区的所有文件在恢复后凭空消失，且没有任何报错。**
+当时的结论是：**用 `File`（JSONL）checkpointer 做跨进程续跑时，暂停前写入工作区的所有文件会在恢复后丢失。**P1 已修复该问题；ADR-0032 又补上保存输入、读取出口和 Fork 的不可变性，避免已持久化内容被活跃句柄反向改写。
 
-### 当前真实影响面（诚实评估）
+### 修复前真实影响面（历史评估）
 
 全仓目前**没有第一方工具写 `State.Files`**：`tool/file`（`tool/file/file.go:1-14`）绑的是真实磁盘 `*os.Root`，文件本就落盘、天然跨重启存活，与此问题无关。`State.Files` 唯一的活跃消费者是 subagent 共享父 `Files`（`agent/subagent.go:50-51`）与 run 作用域注入的种子复制（`agent/runtime.go:71,182`）。
 
-所以这不是"线上正在丢数据"的紧急故障，而是一个**契约与文档不一致的定时炸弹**：`WithRunFiles` 是公开 API（`agent/agent.go:98-99`），任何人传入自定义 `FileStore` 并依赖注释里"captured by checkpoints"的承诺，就会在 durable resume 时静默丢状态。
+所以当时这不是"线上正在丢数据"的紧急故障，而是一个**契约与文档不一致的风险**：`WithRunFiles` 是公开 API，调用方传入可快照 `FileStore` 时有理由依赖 durable resume。当前可快照后端已实现该承诺；不可快照后端仍按外部托管契约处理。
 
 > 命名澄清：`memory.FileStore`（`memory/filestore.go:31`）是**向量库**的磁盘实现，与本 ADR 的 `core.FileStore`（虚拟文件面）同名但无关，勿混淆。
 
@@ -58,13 +60,13 @@ type FileStore interface {
 - **文件索引（FileIndex）**：某次 checkpoint 的逻辑视图 `路径 → blob 哈希`，体积小、随该步落盘。
 - **外部托管（externally managed）**：后端不可快照时，持久化由调用方负责，resume 时用 `WithRunFiles` 重新注入。
 
-## 决策概览
+## 原始决策概览
 
 分三层，P0 是纯修正、P1 是真机制；核心取舍是把"如何序列化文件"与"谁来重建文件句柄"解耦，避免 `checkpoint` 包依赖 `vfs`。
 
 ### P0（必须，先做）：修正文档 + 钉住现状的回归测试
 
-- 把 `vfs/instate.go:16-17` 那句"captured by checkpoints"改成诚实描述：默认后端在**同进程内存 checkpointer** 下随 State 存活；**`File`（JSONL）checkpointer 当前不序列化 `Files`**，跨进程 resume 需要一个可快照后端（引出 P1），否则由调用方 `WithRunFiles` 重新注入。
+- 这一阶段先把 `vfs/instate.go` 的承诺改成修复前的真实行为：默认后端只在同进程 Memory 中随 State 存活，File 尚不序列化 `Files`。该过渡说明已被 P1 和 ADR-0032 的现行契约取代。
 - `checkpoint/file.go:14-21` 的 Caveat 注释保留并收紧措辞（已提及 Files 不序列化，这里补一句"恢复路径见 ADR-0026"）。
 - 加回归测试**锁定当前行为**（见测试锚点 T0），让 P1 的改动有对照、防"顺手改坏"。
 
@@ -93,7 +95,15 @@ type Restorable   interface{ Restore(files map[string][]byte) error }
 1. 若显式 `WithRunFiles` → 用它（调用方最高优先）。
 2. 否则若 `FileSnapshot != nil` → 建 `vfs.NewInState()`，`Restore(FileSnapshot)`。
 3. 否则 → 现状 `NewInState()`。
-`Memory` checkpointer 走指针共享已正确，可不动；但为一致性与被测，`restore` 逻辑统一按"有 FileSnapshot 用快照、否则指针"处理。
+初始 P1 只要求 File 完成落盘，曾认为 Memory 依赖指针共享即可。ADR-0032 已修正这一点：Memory 和 File 在保存 `Snapshottable` 后端时都冻结独立 `FileSnapshot`，所有读取出口再次克隆；只有非 `Snapshottable` 外部后端可在 Memory 中保留同进程活跃句柄。`restore` 仍遵循"显式 `WithRunFiles` 优先；否则非 nil `FileSnapshot` 还原独立视图；否则按外部托管规则处理"。
+
+### 当前文件快照契约（ADR-0032）
+
+- `core.CloneStateData` 保留活跃 `Files` 句柄，维持父运行与 subagent 的运行期协作面。
+- checkpoint 保存边界对 `core.Snapshottable` 获取独立快照，并清除冻结副本中的活跃句柄；Memory/File 行为一致。
+- nil `FileSnapshot` 表示没有便携快照；非 nil 空 map 表示明确的空文件视图。
+- `Load`、`Latest`、`History`、Fork 和 durable commit 均返回或保存独立文件字节，调用方修改不会污染历史。
+- 非 `Snapshottable` 后端的内容不由 File 持久化，跨进程 Resume 必须重新传 `WithRunFiles`；其外部内容不随时间旅行回滚。
 
 ### P2（可选，视需要）：`InState` 落盘后端
 
