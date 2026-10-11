@@ -307,19 +307,28 @@ go test ./checkpoint ./vfs -count=1
 
 **依赖：**SC-03。**交付：**Fork 的三个复现场景通过，错误可检查。
 
+**状态：**已完成（2026-10-12）。
+
 **文件：**修改 D:/codeproject/mygo/goagent/checkpoint/branch.go、D:/codeproject/mygo/goagent/checkpoint/memory_test.go；新增 D:/codeproject/mygo/goagent/checkpoint/fork_consistency_test.go。
 
-- [ ] 先按旧签名运行一个 File.Load→Fork→Save 红灯测试，确认当前父 1 文件/子 0 文件的结果；随后把测试迁移到 D3 的新签名。
-- [ ] Fork 验证 parent 非 nil、目标 ThreadID 合法且不同于源线程、newID 非空且不同于 parent.ID；错误不返回半成品、不修改 parent。
-- [ ] 通过 freezeCheckpoint 取得独立副本，设置新 ID/ThreadID/ParentID，Revision=0，Pending=nil，Pause=nil。文件数据保持为独立 FileSnapshot，交给 SC-03 的保存路径处理。
-- [ ] 添加 TestSnapshotConsistencyForkNested、TestSnapshotConsistencyForkFiles、TestSnapshotConsistencyForkInvalid、TestSnapshotConsistencyForkDropsPause；嵌套 KV、Message.Parts、Args/字节、FileSnapshot 修改均不得影响父节点。
-- [ ] rg 搜索所有调用者并一次更新；不能只改 memory_test.go。将旧签名迁移列入 SC-12。
+- [x] 先按旧签名运行一个 File.Load→Fork→Save 红灯测试，确认当前父 1 文件/子 0 文件的结果；随后把测试迁移到 D3 的新签名。
+- [x] Fork 验证 parent 非 nil、目标 ThreadID 合法且不同于源线程、newID 非空且不同于 parent.ID；错误不返回半成品、不修改 parent。
+- [x] 通过 freezeCheckpoint 取得独立副本，设置新 ID/ThreadID/ParentID，Revision=0，Pending=nil，Pause=nil。文件数据保持为独立 FileSnapshot，交给 SC-03 的保存路径处理。
+- [x] 添加 TestSnapshotConsistencyForkNested、TestSnapshotConsistencyForkFiles、TestSnapshotConsistencyForkInvalid、TestSnapshotConsistencyForkDropsPause；嵌套 KV、Message.Parts、Args/字节、FileSnapshot 修改均不得影响父节点。
+- [x] rg 搜索所有调用者并一次更新；不能只改 memory_test.go。将旧签名迁移列入 SC-12。
 
 ```powershell
 rg -n 'checkpoint\.Fork\(|\bFork\(' --glob '*.go' .
 go test ./checkpoint -run '^TestSnapshotConsistencyFork' -count=1
 go test ./checkpoint -count=1
 ```
+
+**实施记录（2026-10-12）：**
+
+- RED：旧签名下的 File.Load→Fork→Save 测试稳定复现 `forked files = map[]`；迁移测试到新签名后，所有调用点因返回值数量不匹配而按预期编译失败。
+- GREEN：Fork 先验证 parent、目标线程和新 checkpoint ID，再通过 freezeCheckpoint 克隆完整数据及文件视图；子节点保留 Step/ParentID，重置 Revision，并清除 Pending/Pause。
+- 覆盖：嵌套 KV、KV 字节、Message 图片字节、ToolCall Args、Todos、FileSnapshot 均与父节点隔离；活跃 Snapshottable 在 Fork 时冻结，File store 重开后父子各保留一个独立文件。
+- 验证：全仓搜索仅发现 checkpoint/memory_test.go 这一处旧签名调用；定向 Fork 契约测试、go test ./checkpoint -count=1 与 go vet ./checkpoint 均通过。源码迁移说明仍由 SC-12 交付。
 
 **验收：**父 1 文件/子 1 文件，子写入不影响父；分支不会继承父暂停审批；错误由返回值传播。
 
@@ -618,7 +627,7 @@ Windows 的 -race 需要可用的 cgo/C 编译工具链。若当前环境不支�
 - [x] SC-01：状态/消息深拷贝。
 - [x] SC-02：Memory 不可变快照。
 - [x] SC-03：文件冻结与保存。
-- [ ] SC-04：完整 Fork。
+- [x] SC-04：完整 Fork。
 - [ ] SC-05：Agent 恢复及内部数据隔离。
 - [ ] SC-06：Memory 协调与 CAS。
 - [ ] SC-07：File 持久化协调。

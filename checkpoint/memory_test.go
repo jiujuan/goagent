@@ -59,7 +59,10 @@ func TestForkIsolatesParent(t *testing.T) {
 		ID: "p", ThreadID: "t1", Step: 5,
 		State: core.State{KV: map[string]any{"k": "v"}, Todos: []core.Todo{{ID: "1"}}},
 	}
-	child := checkpoint.Fork(parent, "t2", "c")
+	child, err := checkpoint.Fork(parent, "t2", "c")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if child.ParentID != "p" || child.ThreadID != "t2" {
 		t.Fatalf("fork link wrong: %+v", child)
 	}
