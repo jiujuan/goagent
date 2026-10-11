@@ -409,18 +409,28 @@ go test ./checkpoint -count=1
 
 **依赖：**SC-03、SC-06。**交付：**多个 File 实例及进程使用同一租约和提交真相。
 
+**状态：**已完成（2026-10-12）。
+
 **文件：**新增 D:/codeproject/mygo/goagent/checkpoint/coordinator_file.go；修改 D:/codeproject/mygo/goagent/checkpoint/file.go、D:/codeproject/mygo/goagent/checkpoint/coordinator_contract_test.go、D:/codeproject/mygo/goagent/checkpoint/file_recovery_test.go。
 
-- [ ] 将 SC-06 的共享测试扩展到 File，每个测试使用独立 TempDir；不能只测一个 Memory 后假定 File 等价。
-- [ ] BeginRun/RenewClaim 必须经现有 withThread，在同一跨进程临界区内扫描、验证、追加 recordClaim 并 Sync；失败不能向调用者返回成功的 grant。
-- [ ] Commit 的 CAS 与 request_digest 检查也在 withThread 内完成，包含旧记录兼容路径。文件快照摘要基于冻结后的内容，不能因 map 顺序或 store 分配的 Revision 变化误判。
-- [ ] 复用 recordClaim/recordReleaseClaim/recordCommit 和既有 version，不新增与 journal 不一致的旁路锁表。重开 File 后恢复 fencing、claim、checkpoint head 和请求摘要。
-- [ ] 添加 TestSnapshotConsistencyFileTwoInstances、TestSnapshotConsistencyFileRestartClaim、TestSnapshotConsistencyFileClaimSyncFailure、TestSnapshotConsistencyFileCommitSyncRetry。通过现有 fileOps 注入写入和 Sync 失败；对已经写到 journal 但未获确认的结果，只允许安全的再次读取/确认，不能声称已物理回滚。
+- [x] 将 SC-06 的共享测试扩展到 File，每个测试使用独立 TempDir；不能只测一个 Memory 后假定 File 等价。
+- [x] BeginRun/RenewClaim 必须经现有 withThread，在同一跨进程临界区内扫描、验证、追加 recordClaim 并 Sync；失败不能向调用者返回成功的 grant。
+- [x] Commit 的 CAS 与 request_digest 检查也在 withThread 内完成，包含旧记录兼容路径。文件快照摘要基于冻结后的内容，不能因 map 顺序或 store 分配的 Revision 变化误判。
+- [x] 复用 recordClaim/recordReleaseClaim/recordCommit 和既有 version，不新增与 journal 不一致的旁路锁表。重开 File 后恢复 fencing、claim、checkpoint head 和请求摘要。
+- [x] 添加 TestSnapshotConsistencyFileTwoInstances、TestSnapshotConsistencyFileRestartClaim、TestSnapshotConsistencyFileClaimSyncFailure、TestSnapshotConsistencyFileCommitSyncRetry。通过现有 fileOps 注入写入和 Sync 失败；对已经写到 journal 但未获确认的结果，只允许安全的再次读取/确认，不能声称已物理回滚。
 
 ```powershell
 go test ./checkpoint -run '^TestSnapshotConsistency' -count=1
 go test ./checkpoint -run 'TestFile|TestExpiredOwner|TestInboxHistory' -count=1
 ```
+
+**实施记录（2026-10-12）：**
+
+- RED：将 SC-06 的七组契约同时运行在 Memory/File 后，File 因缺少 BeginRun、RenewClaim 与可控租约时钟而编译失败；四个 File 专项用例同时锁定跨实例竞争、重开恢复及 Sync 故障语义。
+- GREEN：File 的 BeginRun/RenewClaim 在 withThread 临界区内完成扫描、校验、recordClaim 追加与 Sync；同目录的不同 File 实例共享 journal 中的 claim 和 fencing 真相。
+- Commit：冻结 checkpoint 后计算请求摘要，在同一 withThread 内完成同 ID 摘要比对、ExpectedRevision CAS、追加和 Sync。request_digest 作为 version 1 commit 的可选字段持久化；旧 commit 会从 checkpoint、blob、ack、claim 与工具记录尝试重建，无法确认等价时保守返回 ErrCheckpointConflict。
+- 故障确认：claim/commit 的首次 Sync 错误不会返回成功；若完整记录已写入，后续扫描恢复它。等价 Commit 重试只重新 Sync 并返回原 Revision，不重复追加 commit、ack 或工具完成记录。
+- 验证：共享协调契约、File 专项故障用例、既有 File/ExpiredOwner/InboxHistory 测试、checkpoint 与全仓测试、定向 go test -race、go vet ./... 和 git diff --check 均通过。
 
 **验收：**两实例竞争只有一个 owner；重启不重置 fencing；Sync 故障不产生虚假成功、不重复 ack/工具执行登记；既有尾部修复测试通过。
 

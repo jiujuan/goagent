@@ -32,6 +32,7 @@ type File struct {
 	// source of truth and a failed write never changes this map.
 	known map[string]map[string]bool
 	ops   fileOps
+	now   func() time.Time
 }
 
 type fileOps struct {
@@ -48,7 +49,14 @@ func NewFile(dir string) (*File, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("checkpoint: create dir: %w", err)
 	}
-	return &File{dir: dir, known: map[string]map[string]bool{}, ops: defaultFileOps()}, nil
+	return &File{dir: dir, known: map[string]map[string]bool{}, ops: defaultFileOps(), now: time.Now}, nil
+}
+
+func (f *File) nowTime() time.Time {
+	if f.now == nil {
+		return time.Now()
+	}
+	return f.now()
 }
 
 // path resolves a thread id to its journal inside the store directory.
@@ -103,6 +111,7 @@ type journalRecord struct {
 	Decision       *core.ApprovalDecision `json:"decision,omitempty"`
 	ToolExecution  *ToolExecution         `json:"tool_execution,omitempty"`
 	ToolExecutions []ToolExecution        `json:"tool_executions,omitempty"`
+	RequestDigest  string                 `json:"request_digest,omitempty"`
 }
 
 type fileState struct {
@@ -118,6 +127,7 @@ func newFileState() *fileState {
 			inbox:      map[string]InboxMessage{},
 			decisions:  map[string]core.ApprovalDecision{},
 			executions: map[string]ToolExecution{},
+			commits:    map[string]memoryCommitRecord{},
 		},
 		checkpointIDs: map[string]*checkpointRecord{},
 		blobs:         map[string][]byte{},
@@ -194,20 +204,6 @@ func (f *File) Commit(ctx context.Context, req CommitRequest) (CommitReceipt, er
 }
 
 func (f *File) commitLocked(threadID string, st *fileState, req CommitRequest) (CommitReceipt, error) {
-	if req.Checkpoint.ID != "" {
-		if old, ok := st.checkpointIDs[req.Checkpoint.ID]; ok {
-			// A failed Sync leaves the caller without an acknowledgement even
-			// though the append may have reached the journal. Confirm the existing
-			// record with a fresh Sync before treating this idempotent retry as a
-			// success.
-			if err := f.syncJournalLocked(threadID); err != nil {
-				return CommitReceipt{}, err
-			}
-			f.setKnownLocked(threadID, st.blobs)
-			req.Checkpoint.Revision = old.Revision
-			return CommitReceipt{Revision: old.Revision, Claim: cloneClaim(st.claim)}, nil
-		}
-	}
 	for _, ex := range req.ToolExecutions {
 		if ex.InvocationID == "" {
 			return CommitReceipt{}, fmt.Errorf("checkpoint: tool execution requires invocation ID")
@@ -217,20 +213,52 @@ func (f *File) commitLocked(threadID string, st *fileState, req CommitRequest) (
 	if err != nil {
 		return CommitReceipt{}, err
 	}
-	if err := validateCommitClaim(&st.memoryDurableState, req.Claim, time.Now()); err != nil {
-		return CommitReceipt{}, err
-	}
-
 	stored, err := freezeCheckpoint(req.Checkpoint)
 	if err != nil {
 		return CommitReceipt{}, err
 	}
+	digest, err := commitRequestDigest(stored, req.AckMessageIDs, req.Claim, toolExecutions)
+	if err != nil {
+		return CommitReceipt{}, err
+	}
+
+	now := f.nowTime()
+	if req.Checkpoint.ID != "" {
+		if committed, ok := st.commits[req.Checkpoint.ID]; ok {
+			if committed.digest == "" || committed.digest != digest {
+				return CommitReceipt{}, ErrCheckpointConflict
+			}
+			// A failed Sync leaves the caller without an acknowledgement even
+			// though the append may have reached the journal. Confirm the existing
+			// record with a fresh Sync before treating this idempotent retry as a
+			// success.
+			if err := f.syncJournalLocked(threadID); err != nil {
+				return CommitReceipt{}, err
+			}
+			f.setKnownLocked(threadID, st.blobs)
+			req.Checkpoint.Revision = committed.revision
+			return CommitReceipt{
+				Revision: committed.revision,
+				Claim:    retryReceiptClaim(&st.memoryDurableState, req.Claim, now),
+			}, nil
+		}
+		if _, ok := st.checkpointIDs[req.Checkpoint.ID]; ok {
+			return CommitReceipt{}, ErrCheckpointConflict
+		}
+	}
+	if err := validateCommitClaim(&st.memoryDurableState, req.Claim, now); err != nil {
+		return CommitReceipt{}, err
+	}
+	if req.ExpectedRevision != nil && currentFileRevision(st) != *req.ExpectedRevision {
+		return CommitReceipt{}, ErrRevisionConflict
+	}
+
 	stored.Revision = st.revision + 1
 	checkpoint, blobRecords, newHashes, err := buildCheckpointRecord(stored, st.blobs)
 	if err != nil {
 		return CommitReceipt{}, err
 	}
-	claim := renewedClaim(&st.memoryDurableState, req, time.Now())
+	claim := renewedClaim(&st.memoryDurableState, req, now)
 	rec := journalRecord{
 		Version:        durableFormatVersion,
 		Kind:           recordCommit,
@@ -239,6 +267,7 @@ func (f *File) commitLocked(threadID string, st *fileState, req CommitRequest) (
 		Claim:          claim,
 		ReleaseClaim:   req.ReleaseClaim && req.Claim != nil,
 		ToolExecutions: toolExecutions,
+		RequestDigest:  digest,
 	}
 	if err := f.appendRecordLocked(threadID, st, blobRecords, rec); err != nil {
 		return CommitReceipt{}, err
@@ -265,7 +294,7 @@ func (f *File) Claim(ctx context.Context, req ClaimRequest) (Claim, error) {
 		if cp == nil || cp.Revision != req.Revision || EffectivePauseID(cp.Checkpoint) != req.PauseID {
 			return ErrClaimConflict
 		}
-		now := time.Now()
+		now := f.nowTime()
 		if st.claim != nil && !claimExpired(st.claim, now) {
 			if st.claim.Owner != req.Owner || st.claim.Revision != req.Revision || st.claim.PauseID != req.PauseID {
 				return ErrClaimConflict
@@ -359,7 +388,7 @@ func (f *File) ClaimTool(ctx context.Context, req ToolClaimRequest) (ToolExecuti
 	var result ToolExecution
 	var outcomeErr error
 	err := f.withThread(ctx, req.ThreadID, func(st *fileState) error {
-		if err := validateCommitClaim(&st.memoryDurableState, req.Claim, time.Now()); err != nil {
+		if err := validateCommitClaim(&st.memoryDurableState, req.Claim, f.nowTime()); err != nil {
 			return err
 		}
 		if old, ok := st.executions[req.InvocationID]; ok {
@@ -717,6 +746,15 @@ func applyJournalRecord(st *fileState, rec journalRecord) {
 		st.executions[rec.ToolExecution.InvocationID] = *rec.ToolExecution
 	case recordCommit:
 		applyCheckpoint(st, rec.Checkpoint)
+		if id := rec.Checkpoint.ID; id != "" {
+			if _, exists := st.commits[id]; !exists {
+				digest := rec.RequestDigest
+				if digest == "" {
+					digest, _ = legacyCommitRequestDigest(st, rec)
+				}
+				st.commits[id] = memoryCommitRecord{digest: digest, revision: rec.Checkpoint.Revision}
+			}
+		}
 		for _, id := range rec.AckMessageIDs {
 			delete(st.inbox, id)
 		}
@@ -762,6 +800,45 @@ func latestFileCheckpoint(st *fileState) *checkpointRecord {
 		return nil
 	}
 	return st.checkpoints[len(st.checkpoints)-1]
+}
+
+func currentFileRevision(st *fileState) uint64 {
+	head := latestFileCheckpoint(st)
+	if head == nil {
+		return 0
+	}
+	return head.Revision
+}
+
+func fileCheckpoint(rec *checkpointRecord, blobs map[string][]byte) (*Checkpoint, error) {
+	if rec == nil || rec.Checkpoint == nil {
+		return nil, nil
+	}
+	cp, err := cloneCheckpoint(rec.Checkpoint)
+	if err != nil {
+		return nil, err
+	}
+	if rec.Files == nil {
+		cp.FileSnapshot = nil
+		return cp, nil
+	}
+	cp.FileSnapshot = make(map[string][]byte, len(rec.Files))
+	for path, hash := range rec.Files {
+		data, ok := blobs[hash]
+		if !ok {
+			return nil, fmt.Errorf("checkpoint: %s references missing blob %s", rec.ThreadID, hash)
+		}
+		cp.FileSnapshot[path] = append([]byte(nil), data...)
+	}
+	return cp, nil
+}
+
+func legacyCommitRequestDigest(st *fileState, rec journalRecord) (string, error) {
+	cp, err := fileCheckpoint(rec.Checkpoint, st.blobs)
+	if err != nil {
+		return "", err
+	}
+	return commitRequestDigest(cp, rec.AckMessageIDs, rec.Claim, rec.ToolExecutions)
 }
 
 func buildCheckpointRecord(cp *Checkpoint, known map[string][]byte) (*checkpointRecord, []blobRecord, map[string][]byte, error) {

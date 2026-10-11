@@ -10,9 +10,13 @@ import (
 )
 
 func TestSnapshotConsistencyBeginRunEmpty(t *testing.T) {
+	eachCoordinatorBackend(t, testSnapshotConsistencyBeginRunEmpty)
+}
+
+func testSnapshotConsistencyBeginRunEmpty(t *testing.T, backend coordinatorTestBackend) {
 	ctx := context.Background()
 	now := time.Date(2026, time.October, 12, 9, 0, 0, 0, time.UTC)
-	store := newCoordinatorTestMemory(&now)
+	store := backend.open(t, &now)
 
 	first, err := store.BeginRun(ctx, BeginRunRequest{ThreadID: "thread", Owner: "owner-a", Lease: time.Minute})
 	if err != nil {
@@ -41,9 +45,13 @@ func TestSnapshotConsistencyBeginRunEmpty(t *testing.T) {
 }
 
 func TestSnapshotConsistencyBeginRunHead(t *testing.T) {
+	eachCoordinatorBackend(t, testSnapshotConsistencyBeginRunHead)
+}
+
+func testSnapshotConsistencyBeginRunHead(t *testing.T, backend coordinatorTestBackend) {
 	ctx := context.Background()
 	now := time.Date(2026, time.October, 12, 10, 0, 0, 0, time.UTC)
-	store := newCoordinatorTestMemory(&now)
+	store := backend.open(t, &now)
 	head := &Checkpoint{
 		ID: "head", ThreadID: "thread", Step: 3,
 		State:        core.State{KV: map[string]any{"nested": map[string]any{"value": "stored"}}},
@@ -73,23 +81,29 @@ func TestSnapshotConsistencyBeginRunHead(t *testing.T) {
 		t.Fatalf("mutating BeginRun result changed stored head: %+v", latest)
 	}
 
-	t.Run("clone failure leaves coordination unchanged", func(t *testing.T) {
-		broken := newCoordinatorTestMemory(&now)
-		broken.byThread["broken"] = []*Checkpoint{{
-			ID: "broken-head", ThreadID: "broken", Revision: 1,
-			State: core.State{KV: map[string]any{"bad": make(chan int)}},
-		}}
-		if _, err := broken.BeginRun(ctx, BeginRunRequest{ThreadID: "broken", Owner: "owner", Lease: time.Minute}); !errors.Is(err, core.ErrStateNotCloneable) {
-			t.Fatalf("BeginRun clone error = %v, want ErrStateNotCloneable", err)
-		}
-		st := broken.durable["broken"]
-		if st == nil || st.claim != nil || st.fencing != 0 {
-			t.Fatalf("clone failure changed coordination: %+v", st)
-		}
-	})
+	if backend.name == "memory" {
+		t.Run("clone failure leaves coordination unchanged", func(t *testing.T) {
+			broken := newCoordinatorTestMemory(&now)
+			broken.byThread["broken"] = []*Checkpoint{{
+				ID: "broken-head", ThreadID: "broken", Revision: 1,
+				State: core.State{KV: map[string]any{"bad": make(chan int)}},
+			}}
+			if _, err := broken.BeginRun(ctx, BeginRunRequest{ThreadID: "broken", Owner: "owner", Lease: time.Minute}); !errors.Is(err, core.ErrStateNotCloneable) {
+				t.Fatalf("BeginRun clone error = %v, want ErrStateNotCloneable", err)
+			}
+			st := broken.durable["broken"]
+			if st == nil || st.claim != nil || st.fencing != 0 {
+				t.Fatalf("clone failure changed coordination: %+v", st)
+			}
+		})
+	}
 }
 
 func TestSnapshotConsistencyBeginRunPaused(t *testing.T) {
+	eachCoordinatorBackend(t, testSnapshotConsistencyBeginRunPaused)
+}
+
+func testSnapshotConsistencyBeginRunPaused(t *testing.T, backend coordinatorTestBackend) {
 	ctx := context.Background()
 	now := time.Date(2026, time.October, 12, 11, 0, 0, 0, time.UTC)
 
@@ -103,7 +117,7 @@ func TestSnapshotConsistencyBeginRunPaused(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			store := newCoordinatorTestMemory(&now)
+			store := backend.open(t, &now)
 			paused := &Checkpoint{ID: "paused", ThreadID: "thread", State: core.State{}}
 			tc.edit(paused)
 			if err := store.Save(ctx, paused); err != nil {
@@ -129,9 +143,13 @@ func TestSnapshotConsistencyBeginRunPaused(t *testing.T) {
 }
 
 func TestSnapshotConsistencyRenewClaim(t *testing.T) {
+	eachCoordinatorBackend(t, testSnapshotConsistencyRenewClaim)
+}
+
+func testSnapshotConsistencyRenewClaim(t *testing.T, backend coordinatorTestBackend) {
 	ctx := context.Background()
 	now := time.Date(2026, time.October, 12, 12, 0, 0, 0, time.UTC)
-	store := newCoordinatorTestMemory(&now)
+	store := backend.open(t, &now)
 	started, err := store.BeginRun(ctx, BeginRunRequest{ThreadID: "thread", Owner: "owner-a", Lease: time.Minute})
 	if err != nil {
 		t.Fatal(err)
@@ -185,9 +203,13 @@ func TestSnapshotConsistencyRenewClaim(t *testing.T) {
 }
 
 func TestSnapshotConsistencyExpectedRevision(t *testing.T) {
+	eachCoordinatorBackend(t, testSnapshotConsistencyExpectedRevision)
+}
+
+func testSnapshotConsistencyExpectedRevision(t *testing.T, backend coordinatorTestBackend) {
 	ctx := context.Background()
 	now := time.Date(2026, time.October, 12, 13, 0, 0, 0, time.UTC)
-	store := newCoordinatorTestMemory(&now)
+	store := backend.open(t, &now)
 	base := &Checkpoint{ID: "base", ThreadID: "thread", State: core.State{}}
 	if err := store.Save(ctx, base); err != nil {
 		t.Fatal(err)
@@ -239,7 +261,7 @@ func TestSnapshotConsistencyExpectedRevision(t *testing.T) {
 		t.Fatalf("failed CAS renewed or released claim: %+v", current)
 	}
 
-	empty := newCoordinatorTestMemory(&now)
+	empty := backend.open(t, &now)
 	zero := uint64(0)
 	root := &Checkpoint{ID: "root", ThreadID: "empty", State: core.State{}}
 	if _, err := empty.Commit(ctx, CommitRequest{Checkpoint: root, ExpectedRevision: &zero}); err != nil {
@@ -253,9 +275,13 @@ func TestSnapshotConsistencyExpectedRevision(t *testing.T) {
 }
 
 func TestSnapshotConsistencyCommitRetry(t *testing.T) {
+	eachCoordinatorBackend(t, testSnapshotConsistencyCommitRetry)
+}
+
+func testSnapshotConsistencyCommitRetry(t *testing.T, backend coordinatorTestBackend) {
 	ctx := context.Background()
 	now := time.Date(2026, time.October, 12, 14, 0, 0, 0, time.UTC)
-	store := newCoordinatorTestMemory(&now)
+	store := backend.open(t, &now)
 	for _, id := range []string{"message-a", "message-b"} {
 		if _, err := store.Deliver(ctx, "thread", InboxMessage{ID: id, Message: core.UserText(id)}); err != nil {
 			t.Fatal(err)
@@ -395,7 +421,7 @@ func TestSnapshotConsistencyCommitRetry(t *testing.T) {
 	}
 
 	t.Run("duplicate invocation follows last visible result", func(t *testing.T) {
-		duplicateStore := newCoordinatorTestMemory(&now)
+		duplicateStore := backend.open(t, &now)
 		started, err := duplicateStore.BeginRun(ctx, BeginRunRequest{ThreadID: "duplicate", Owner: "owner", Lease: time.Minute})
 		if err != nil {
 			t.Fatal(err)
@@ -426,9 +452,13 @@ func TestSnapshotConsistencyCommitRetry(t *testing.T) {
 }
 
 func TestSnapshotConsistencyStaleWriter(t *testing.T) {
+	eachCoordinatorBackend(t, testSnapshotConsistencyStaleWriter)
+}
+
+func testSnapshotConsistencyStaleWriter(t *testing.T, backend coordinatorTestBackend) {
 	ctx := context.Background()
 	now := time.Date(2026, time.October, 12, 15, 0, 0, 0, time.UTC)
-	store := newCoordinatorTestMemory(&now)
+	store := backend.open(t, &now)
 	ownerA, err := store.BeginRun(ctx, BeginRunRequest{ThreadID: "thread", Owner: "owner-a", Lease: time.Minute})
 	if err != nil {
 		t.Fatal(err)
@@ -467,20 +497,75 @@ func TestSnapshotConsistencyStaleWriter(t *testing.T) {
 	}
 }
 
+type coordinatorTestBackend struct {
+	name string
+	open func(*testing.T, *time.Time) coordinatorTestStore
+}
+
+type coordinatorTestStore struct {
+	ThreadCoordinator
+	currentClaim func(string) *Claim
+}
+
+func eachCoordinatorBackend(t *testing.T, test func(*testing.T, coordinatorTestBackend)) {
+	t.Helper()
+	backends := []coordinatorTestBackend{
+		{
+			name: "memory",
+			open: func(t *testing.T, now *time.Time) coordinatorTestStore {
+				store := newCoordinatorTestMemory(now)
+				return coordinatorTestStore{
+					ThreadCoordinator: store,
+					currentClaim: func(threadID string) *Claim {
+						store.mu.RLock()
+						defer store.mu.RUnlock()
+						st := store.durable[threadID]
+						if st == nil {
+							return nil
+						}
+						return cloneClaim(st.claim)
+					},
+				}
+			},
+		},
+		{
+			name: "file",
+			open: func(t *testing.T, now *time.Time) coordinatorTestStore {
+				store, err := NewFile(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				store.now = func() time.Time { return *now }
+				return coordinatorTestStore{
+					ThreadCoordinator: store,
+					currentClaim: func(threadID string) *Claim {
+						var claim *Claim
+						if err := store.withThread(context.Background(), threadID, func(st *fileState) error {
+							claim = cloneClaim(st.claim)
+							return nil
+						}); err != nil {
+							t.Fatal(err)
+						}
+						return claim
+					},
+				}
+			},
+		},
+	}
+	for _, backend := range backends {
+		backend := backend
+		t.Run(backend.name, func(t *testing.T) { test(t, backend) })
+	}
+}
+
 func newCoordinatorTestMemory(now *time.Time) *Memory {
 	store := NewMemory()
 	store.now = func() time.Time { return *now }
 	return store
 }
 
-func coordinatorCurrentClaim(store *Memory, threadID string) *Claim {
-	store.mu.RLock()
-	defer store.mu.RUnlock()
-	st := store.durable[threadID]
-	if st == nil {
-		return nil
-	}
-	return cloneClaim(st.claim)
+func coordinatorCurrentClaim(store coordinatorTestStore, threadID string) *Claim {
+	return store.currentClaim(threadID)
 }
 
 func coordinatorMessagePtr(message core.Message) *core.Message { return &message }
