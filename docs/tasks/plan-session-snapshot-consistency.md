@@ -493,32 +493,34 @@ go test -race ./agent -run '^TestSnapshotConsistencyGuard' -count=1
 
 **依赖：**SC-05、SC-08。**交付：**修复普通同线程运行的上下文遗漏，保留可解释的兼容路径。
 
+**状态：**已完成（2026-10-12）。
+
 **文件：**新增 D:/codeproject/mygo/goagent/agent/run_prepare.go、D:/codeproject/mygo/goagent/agent/thread_consistency_test.go；修改 D:/codeproject/mygo/goagent/agent/agent.go、D:/codeproject/mygo/goagent/agent/run.go、D:/codeproject/mygo/goagent/agent/hitl.go、D:/codeproject/mygo/goagent/agent/options.go、D:/codeproject/mygo/goagent/agent/durable_runtime.go。
 
 本卡按下面三个小步骤顺序实施，不一次改完再定位失败：
 
 **09-A：准备执行与普通运行。**
 
-- [ ] 先加入本卡末尾的原始场景红灯测试；观察 request-A 丢失。
-- [ ] Stream 保存输入和配置，由 run_prepare.go 在 drive 中完成“BeginRun→恢复→覆盖 Files→追加输入”。只实现旧 store 的兼容路径也推迟到 drive 才 Latest，以修复提前创建句柄的顺序执行问题。
-- [ ] WithMessage 的消息/字节在创建句柄时复制，避免等待启动时调用者再改写输入。Steer、Deliver、动态工具等已有 run-scoped 队列保持在同一个 RunContext 上，不因替换状态而丢失。
-- [ ] 添加 WithThreadCoordinationRequired(bool)，Agent.New 对缺少能力的 store 做明确检查；使用 fmt.Errorf 包装时保留 errors.Is。
+- [x] 先加入本卡末尾的原始场景红灯测试；观察 request-A 丢失。
+- [x] Stream 保存输入和配置，由 run_prepare.go 在 drive 中完成“BeginRun→恢复→覆盖 Files→追加输入”。只实现旧 store 的兼容路径也推迟到 drive 才 Latest，以修复提前创建句柄的顺序执行问题。
+- [x] WithMessage 的消息/字节在创建句柄时复制，避免等待启动时调用者再改写输入。Steer、Deliver、动态工具等已有 run-scoped 队列保持在同一个 RunContext 上，不因替换状态而丢失。
+- [x] 添加 WithThreadCoordinationRequired(bool)，Agent.New 对缺少能力的 store 做明确检查；使用 fmt.Errorf 包装时保留 errors.Is。
 
 **09-B：提交及顶层生命周期。**
 
-- [ ] commitCheckpoint 有 guard 时走 guard.commit；ack/工具结果的采集与清理保持原子语义。多个子分支的 commit 不能从同一过期 headRevision 并行提交，也不能互相清掉未包含在本次提交中的 ack/result。
-- [ ] 只在顶层 drive 启动/结束 guard。嵌套上下文继续共享 durableRunState；子步骤的终态 checkpoint 不释放根 writer。
-- [ ] 将最终清理放到发布 RunDone/RunFailed/Interrupted 之前；FinishRun 仍只在现有规定的终态触发。清理失败加入最终错误，整个 Run 仍只发送一个终态事件。
-- [ ] 加入 TestSnapshotConsistencyThreadOverlap：A 的 mock 在屏障处停住，B 的 Iter/Wait 得 ErrClaimConflict，B 的模型和工具计数均为 0；释放 A 后新 C 可继续。
-- [ ] 加入 TestSnapshotConsistencyDifferentThreads：不同 Thread 的 mock 能同时进入屏障；不允许一个全局 agent mutex 串行所有会话。
+- [x] commitCheckpoint 有 guard 时走 guard.commit；ack/工具结果的采集与清理保持原子语义。多个子分支的 commit 不能从同一过期 headRevision 并行提交，也不能互相清掉未包含在本次提交中的 ack/result。
+- [x] 只在顶层 drive 启动/结束 guard。嵌套上下文继续共享 durableRunState；子步骤的终态 checkpoint 不释放根 writer。
+- [x] 将最终清理放到发布 RunDone/RunFailed/Interrupted 之前；FinishRun 仍只在现有规定的终态触发。清理失败加入最终错误，整个 Run 仍只发送一个终态事件。
+- [x] 加入 TestSnapshotConsistencyThreadOverlap：A 的 mock 在屏障处停住，B 的 Iter/Wait 得 ErrClaimConflict，B 的模型和工具计数均为 0；释放 A 后新 C 可继续。
+- [x] 加入 TestSnapshotConsistencyDifferentThreads：不同 Thread 的 mock 能同时进入屏障；不允许一个全局 agent mutex 串行所有会话。
 
 **09-C：Resume 与嵌套回归。**
 
-- [ ] Resume 保留现有同步 claim 和审批绑定；drive 时将该 claim 交给 guard，续租失败在 approved tool 之前退出。Cancel-before-drive 会释放 prepared claim，并保持与 drive 的竞争安全。
-- [ ] BeginRun 拒绝 pending/pause，覆盖 TestSnapshotConsistencyPausedThreadRequiresResume。
-- [ ] 添加 TestSnapshotConsistencyNestedOwnership，覆盖 Sequential、Parallel、Loop、Plan、AsTool/transfer。用后续阶段的屏障证明前一个子步骤结束后 root writer 仍被持有；整个 root 完成后立即可重新开始。
-- [ ] 添加 TestSnapshotConsistencyLazyCancel、TestSnapshotConsistencyResumeExpiredBeforeStart、TestSnapshotConsistencyLegacyStore、TestSnapshotConsistencyRequireCoordinator。
-- [ ] 更新确实需要模拟第一方能力的 store wrapper，使其转发新接口；保留明确只测旧 Checkpointer 的 wrapper，防止全部测试都意外绕过兼容路径。
+- [x] Resume 保留现有同步 claim 和审批绑定；drive 时将该 claim 交给 guard，续租失败在 approved tool 之前退出。Cancel-before-drive 会释放 prepared claim，并保持与 drive 的竞争安全。
+- [x] BeginRun 拒绝 pending/pause，覆盖 TestSnapshotConsistencyPausedThreadRequiresResume。
+- [x] 添加 TestSnapshotConsistencyNestedOwnership，覆盖 Sequential、Parallel、Loop、Plan、AsTool/transfer。用后续阶段的屏障证明前一个子步骤结束后 root writer 仍被持有；整个 root 完成后立即可重新开始。
+- [x] 添加 TestSnapshotConsistencyLazyCancel、TestSnapshotConsistencyResumeExpiredBeforeStart、TestSnapshotConsistencyLegacyStore、TestSnapshotConsistencyRequireCoordinator。
+- [x] 更新确实需要模拟第一方能力的 store wrapper，使其转发新接口；保留明确只测旧 Checkpointer 的 wrapper，防止全部测试都意外绕过兼容路径。
 
 ```go
 // D:/codeproject/mygo/goagent/agent/thread_consistency_test.go
@@ -570,6 +572,14 @@ go test ./agent -run '^TestSnapshotConsistency' -count=1
 go test ./agent ./checkpoint ./middleware -count=1
 go test -race ./agent ./checkpoint -run '^TestSnapshotConsistency' -count=1
 ```
+
+**实施记录（2026-10-12）：**
+
+- RED：原始惰性场景中，先创建的 request-A 句柄会在创建时恢复旧 head，request-B 随后从同一旧状态启动，最终历史为 `[seed request-B]`，丢失 request-A；并发运行也没有统一的顶层 writer 生命周期。
+- GREEN：Stream 只冻结输入和保存配置，首次 Iter/Wait 时再执行 BeginRun 或 legacy Latest；协调 store 在模型和工具副作用前取得 claim，commit、续租和 revision 推进由 guard 串行化，终态事件发布前完成释放。
+- Resume 与嵌套：Resume 同步绑定暂停 checkpoint、claim 和审批，drive 时先续租验证；Cancel-before-drive 同步释放 prepared claim。Sequential、Parallel、Loop、Plan、AsTool 和 transfer 的嵌套步骤共享根 durableRunState，只有顶层 drive 释放 writer。
+- 兼容与隔离：WithMessage 在句柄创建时深拷贝；WithThreadCoordinationRequired(true) 可拒绝不支持 ThreadCoordinator 的 store；legacy Checkpointer 仍在 drive 时恢复当前 head。提交成功后只清理本次实际提交且未被并发替换的工具执行记录。
+- 验证：`go test ./agent -run '^TestSnapshotConsistency' -count=1`、`go test ./agent -count=1`、`go test ./agent ./checkpoint ./middleware -count=1`、`go test -race ./agent ./checkpoint -run '^TestSnapshotConsistency' -count=1`、`go test ./... -count=1`、`go vet ./...` 和 `git diff --check` 均通过。
 
 **验收：**依次启动 A/B 可看到完整三条输入；真正重叠时拒绝第二 writer 且无模型/工具副作用；不同线程并发；暂停不被普通 Run 绕过；根生命周期和 legacy store 路径均通过。
 
@@ -670,7 +680,7 @@ Windows 的 -race 需要可用的 cgo/C 编译工具链。若当前环境不支�
 - [x] SC-06：Memory 协调与 CAS。
 - [x] SC-07：File 持久化协调。
 - [x] SC-08：writer guard 与续租。
-- [ ] SC-09：运行生命周期接入。
+- [x] SC-09：运行生命周期接入。
 - [ ] SC-10：模型/工具分发门禁。
 - [ ] SC-11：跨进程及故障回归。
 - [ ] SC-12：文档迁移与验收归档。

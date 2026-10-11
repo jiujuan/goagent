@@ -149,6 +149,9 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 	}
 	run := a.newRunHandle(ctx, threadID, &state)
 	run.rc.setDurableClaim(claim)
+	if claim != nil {
+		run.preparation = &runPreparation{claim: copyClaim(claim), headRevision: cp.Revision}
+	}
 	for _, decision := range durableDecisions {
 		run.rc.queueApprovalEvent(core.ApprovalDecided{Decision: decision})
 	}

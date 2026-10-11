@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"iter"
 	"sync"
 
@@ -20,13 +21,14 @@ type Run struct {
 	ID       string
 	ThreadID string
 
-	agent    *Agent
-	bus      *bus.Bus
-	topic    bus.Topic
-	rc       *RunContext
-	runnable Runnable
-	cancel   context.CancelFunc
-	startErr error
+	agent       *Agent
+	bus         *bus.Bus
+	topic       bus.Topic
+	rc          *RunContext
+	runnable    Runnable
+	cancel      context.CancelFunc
+	startErr    error
+	preparation *runPreparation
 
 	startOnce sync.Once
 	doneOnce  sync.Once
@@ -36,6 +38,10 @@ type Run struct {
 
 	mu        sync.Mutex
 	decisions []Approval
+
+	lifecycleMu  sync.Mutex
+	driveStarted bool
+	cancelErr    error
 }
 
 // Iter streams the run's events as a pull iterator. The run starts on first
@@ -91,8 +97,16 @@ func (r *Run) Wait() (core.Result, error) {
 // Steer injects a message to be delivered before the next model call.
 func (r *Run) Steer(msg core.Message) { r.rc.Steer(msg) }
 
-// Cancel aborts the run.
-func (r *Run) Cancel() { r.cancel() }
+// Cancel aborts the run. A Resume owns a durable claim before lazy execution
+// starts, so canceling that prepared handle releases the claim synchronously.
+func (r *Run) Cancel() {
+	r.lifecycleMu.Lock()
+	r.cancel()
+	if !r.driveStarted {
+		r.cancelErr = errors.Join(r.cancelErr, r.rc.releaseDurableClaim())
+	}
+	r.lifecycleMu.Unlock()
+}
 
 // drive launches the run exactly once. It owns the lifecycle events: RunStarted
 // before, and the single terminal event (RunDone/RunFailed/Interrupted) derived
@@ -100,24 +114,44 @@ func (r *Run) Cancel() { r.cancel() }
 // never publish lifecycle, so the shared topic carries exactly one of each.
 func (r *Run) drive() {
 	r.startOnce.Do(func() {
+		r.lifecycleMu.Lock()
+		r.driveStarted = true
+		r.lifecycleMu.Unlock()
 		go func() {
-			defer r.rc.releaseDurableClaim()
 			r.bus.Publish(r.topic, core.RunStarted{RunID: r.ID, ThreadID: r.ThreadID})
 			if r.startErr != nil {
-				r.bus.Publish(r.topic, core.RunFailed{Err: r.startErr})
-				r.finish(core.Result{}, r.startErr)
+				err := errors.Join(r.startErr, r.rc.releaseDurableClaim())
+				r.bus.Publish(r.topic, core.RunFailed{Err: err})
+				r.finish(core.Result{}, err)
+				return
+			}
+			if err := r.prepare(); err != nil {
+				r.lifecycleMu.Lock()
+				cancelErr := r.cancelErr
+				r.lifecycleMu.Unlock()
+				err = errors.Join(err, cancelErr, r.rc.releaseDurableClaim())
+				r.bus.Publish(r.topic, core.RunFailed{Err: err})
+				r.finish(core.Result{}, err)
 				return
 			}
 			for _, ev := range r.rc.drainApprovalEvents() {
 				r.bus.Publish(r.topic, ev)
 			}
 			out := r.runnable.run(r.rc)
+			cleanupErr := r.rc.releaseDurableClaim()
 			switch {
 			case out.Err != nil:
-				r.agent.finishRun(r.rc, core.Result{}, out.Err)
-				r.bus.Publish(r.topic, core.RunFailed{Err: out.Err})
-				r.finish(core.Result{}, out.Err)
+				err := errors.Join(out.Err, cleanupErr)
+				r.agent.finishRun(r.rc, core.Result{}, err)
+				r.bus.Publish(r.topic, core.RunFailed{Err: err})
+				r.finish(core.Result{}, err)
 			case out.Control.Kind == core.Interrupt:
+				if cleanupErr != nil {
+					r.agent.finishRun(r.rc, core.Result{}, cleanupErr)
+					r.bus.Publish(r.topic, core.RunFailed{Err: cleanupErr})
+					r.finish(core.Result{}, cleanupErr)
+					return
+				}
 				// Paused, not finished: run-end hooks wait for the eventual
 				// completion (or failure) after a resume.
 				r.bus.Publish(r.topic, core.Interrupted{
@@ -128,6 +162,12 @@ func (r *Run) drive() {
 				})
 				r.finish(core.Result{}, nil)
 			default:
+				if cleanupErr != nil {
+					r.agent.finishRun(r.rc, core.Result{}, cleanupErr)
+					r.bus.Publish(r.topic, core.RunFailed{Err: cleanupErr})
+					r.finish(core.Result{}, cleanupErr)
+					return
+				}
 				r.agent.finishRun(r.rc, out.Result, nil)
 				r.bus.Publish(r.topic, core.RunDone{Result: out.Result})
 				r.finish(out.Result, nil)

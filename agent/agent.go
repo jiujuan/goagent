@@ -47,6 +47,11 @@ func New(opts ...Option) (*Agent, error) {
 	if c.store == nil {
 		c.store = checkpoint.NewMemory()
 	}
+	if c.requireThreadCoordination {
+		if _, ok := c.store.(checkpoint.ThreadCoordinator); !ok {
+			return nil, fmt.Errorf("agent: checkpointer %T: %w", c.store, checkpoint.ErrCoordinationUnavailable)
+		}
+	}
 	a := &Agent{cfg: c, bus: c.bus, store: c.store}
 	a.loop = newLoop(c)
 	a.runnable = &llmRunner{agent: a, loop: a.loop}
@@ -133,25 +138,16 @@ func (a *Agent) Stream(ctx context.Context, input string, opts ...RunOption) *Ru
 	for _, o := range opts {
 		o(&rc)
 	}
-	// An id that cannot name a file fails the run here, so the caller sees the
-	// contract instead of a store error from an arbitrary backend.
-	var state *core.State
-	var err error
-	if err = core.CheckThreadID(rc.ThreadID); err == nil {
-		state, err = a.restore(ctx, rc.ThreadID, rc.Files)
-	} else {
-		state = &core.State{}
+	// Validation and message freezing happen at handle creation. Store access is
+	// deferred until drive so lazily-created runs restore the current head.
+	err := core.CheckThreadID(rc.ThreadID)
+	message := core.Message{}
+	if err == nil {
+		message, err = core.CloneMessage(rc.Message)
 	}
-	if rc.Files != nil {
-		state.Files = rc.Files
-	} else if state.Files == nil {
-		state.Files = vfs.NewInState()
-	}
-	if rc.Message.Role != "" {
-		state.Messages = append(state.Messages, rc.Message)
-	}
-	run := a.newRunHandle(ctx, rc.ThreadID, state)
+	run := a.newRunHandle(ctx, rc.ThreadID, &core.State{})
 	run.startErr = err
+	run.preparation = &runPreparation{message: message, files: rc.Files, restoreCurrent: true}
 	return run
 }
 
@@ -164,6 +160,10 @@ func (a *Agent) restore(ctx context.Context, threadID string, runFiles core.File
 	if err != nil {
 		return &core.State{}, err
 	}
+	return restoreCheckpoint(cp, runFiles)
+}
+
+func restoreCheckpoint(cp *checkpoint.Checkpoint, runFiles core.FileStore) (*core.State, error) {
 	if cp == nil {
 		return &core.State{Files: runFiles}, nil
 	}

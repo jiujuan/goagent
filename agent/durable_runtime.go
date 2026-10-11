@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"reflect"
 	"sort"
 	"sync"
 
@@ -91,6 +92,13 @@ func (rc *RunContext) setDurableClaim(claim *checkpoint.Claim) {
 	d.mu.Unlock()
 }
 
+func (rc *RunContext) setDurableGuard(guard *writeGuard) {
+	d := rc.ensureDurableState()
+	d.mu.Lock()
+	d.guard = guard
+	d.mu.Unlock()
+}
+
 func (rc *RunContext) queueApprovalEvent(ev core.ApprovalDecided) {
 	d := rc.ensureDurableState()
 	d.mu.Lock()
@@ -123,6 +131,7 @@ func (rc *RunContext) commitCheckpoint(cp *checkpoint.Checkpoint, releaseClaim b
 	d.mu.Lock()
 	acks := append([]string(nil), d.ackMessageIDs...)
 	claim := copyClaim(d.claim)
+	guard := d.guard
 	executions := make(map[string]checkpoint.ToolExecution, len(d.executions)+len(extra))
 	for id, ex := range d.executions {
 		executions[id] = ex
@@ -147,14 +156,23 @@ func (rc *RunContext) commitCheckpoint(cp *checkpoint.Checkpoint, releaseClaim b
 	if ctx == nil || ctx.Err() != nil {
 		ctx = context.Background()
 	}
-	receipt, err := durable.Commit(ctx, checkpoint.CommitRequest{
+	req := checkpoint.CommitRequest{
 		Checkpoint:     cp,
 		AckMessageIDs:  acks,
 		Claim:          claim,
 		Lease:          checkpoint.DefaultLease,
 		ReleaseClaim:   releaseClaim,
 		ToolExecutions: committed,
-	})
+	}
+	var (
+		receipt checkpoint.CommitReceipt
+		err     error
+	)
+	if guard != nil {
+		receipt, err = guard.commit(ctx, req)
+	} else {
+		receipt, err = durable.Commit(ctx, req)
+	}
 	if err != nil {
 		return err
 	}
@@ -174,9 +192,15 @@ func (rc *RunContext) commitCheckpoint(cp *checkpoint.Checkpoint, releaseClaim b
 		d.ackMessageIDs = remaining
 	}
 	for _, id := range ids {
-		delete(d.executions, id)
+		if current, ok := d.executions[id]; ok && reflect.DeepEqual(current, executions[id]) {
+			delete(d.executions, id)
+		}
 	}
-	if releaseClaim {
+	if guard != nil {
+		if receipt.Claim != nil {
+			d.claim = copyClaim(receipt.Claim)
+		}
+	} else if releaseClaim {
 		d.claim = nil
 	} else {
 		d.claim = copyClaim(receipt.Claim)
@@ -185,22 +209,40 @@ func (rc *RunContext) commitCheckpoint(cp *checkpoint.Checkpoint, releaseClaim b
 	return nil
 }
 
-func (rc *RunContext) releaseDurableClaim() {
+func (rc *RunContext) releaseDurableClaim() error {
 	durable, ok := rc.durableStore()
 	if !ok {
-		return
+		return nil
+	}
+	d := rc.ensureDurableState()
+	d.mu.Lock()
+	guard := d.guard
+	d.mu.Unlock()
+	if guard != nil {
+		err := guard.stopAndRelease(rc.Context)
+		if err == nil {
+			d.mu.Lock()
+			if d.guard == guard {
+				d.guard = nil
+				d.claim = nil
+			}
+			d.mu.Unlock()
+		}
+		return err
 	}
 	claim := rc.durableClaim()
 	if claim == nil {
-		return
+		return nil
 	}
 	ctx := rc.Context
 	if ctx == nil || ctx.Err() != nil {
 		ctx = context.Background()
 	}
-	if err := durable.ReleaseClaim(ctx, *claim); err == nil {
-		rc.setDurableClaim(nil)
+	if err := durable.ReleaseClaim(ctx, *claim); err != nil {
+		return err
 	}
+	rc.setDurableClaim(nil)
+	return nil
 }
 
 func copyClaim(in *checkpoint.Claim) *checkpoint.Claim {

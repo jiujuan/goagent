@@ -14,19 +14,20 @@ import (
 // construct it directly; they pass With* Options to New. It is the former Spec,
 // turned into functional-options form.
 type config struct {
-	name        string
-	description string
-	instruction string
-	prompt      *prompt.Builder
-	model       llm.Model
-	tools       []tool.Tool
-	middleware  []Middleware
-	subAgents   []*Agent
-	maxTurns    int
-	toolExec    ToolExecMode
-	toolTimeout time.Duration
-	modelOpts   []llm.Option
-	outputKey   string
+	name                      string
+	description               string
+	instruction               string
+	prompt                    *prompt.Builder
+	model                     llm.Model
+	tools                     []tool.Tool
+	middleware                []Middleware
+	subAgents                 []*Agent
+	maxTurns                  int
+	toolExec                  ToolExecMode
+	toolTimeout               time.Duration
+	modelOpts                 []llm.Option
+	outputKey                 string
+	requireThreadCoordination bool
 
 	// delegation toggles (see transfer.go)
 	noTransfer       bool
@@ -120,6 +121,12 @@ func WithBus(b *bus.Bus) Option { return func(c *config) { c.bus = b } }
 // WithCheckpointer injects a shared checkpointer (default: in-memory).
 func WithCheckpointer(s checkpoint.Checkpointer) Option {
 	return func(c *config) { c.store = s }
+}
+
+// WithThreadCoordinationRequired rejects checkpointers that cannot serialize
+// writers for one thread. The default remains compatible with legacy stores.
+func WithThreadCoordinationRequired(required bool) Option {
+	return func(c *config) { c.requireThreadCoordination = required }
 }
 
 // ToolExecMode selects how a step's tool calls are executed.
