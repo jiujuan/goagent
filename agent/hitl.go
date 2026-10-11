@@ -262,6 +262,9 @@ func (l *AgentLoop) runResumed(rb *resumeBatch, lc *LoopContext) resumedBatchOut
 		approved = append(approved, rb.calls[i])
 	}
 	results, dirs, rejects, execErr := l.execTools(rc, lc, approved)
+	if execErr != nil && len(results) != len(approved) {
+		return resumedBatchOutcome{rejects: rejects, err: execErr}
+	}
 
 	parts := make([]core.Part, 0, len(rb.calls))
 	next := 0

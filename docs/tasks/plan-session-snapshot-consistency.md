@@ -587,7 +587,7 @@ go test -race ./agent ./checkpoint -run '^TestSnapshotConsistency' -count=1
 
 **依赖：**SC-09。**交付：**续租失败的根 context 不会继续启动新的模型/工具调用；不依赖第三方模型或工具自觉检查 context。
 
-**文件：**新增 D:/codeproject/mygo/goagent/agent/dispatch_guard.go、D:/codeproject/mygo/goagent/agent/dispatch_guard_test.go；修改 D:/codeproject/mygo/goagent/agent/loop.go、D:/codeproject/mygo/goagent/agent/exectools.go。
+**文件：**新增 D:/codeproject/mygo/goagent/agent/dispatch_guard.go、D:/codeproject/mygo/goagent/agent/dispatch_guard_test.go；修改 D:/codeproject/mygo/goagent/agent/loop.go、D:/codeproject/mygo/goagent/agent/exectools.go、D:/codeproject/mygo/goagent/agent/hitl.go。
 
 **内部签名：**
 
@@ -595,11 +595,11 @@ go test -race ./agent ./checkpoint -run '^TestSnapshotConsistency' -count=1
 func (rc *RunContext) checkWriteAccess() error
 ```
 
-- [ ] checkWriteAccess 检查根 context、guard 首个错误和当前已知租约到期时间；没有 guard 的旧 store 仍检查 context。检查只持短时状态锁，不在模型/工具调用期间持有 guard 操作锁。
-- [ ] 在 streamModel 调用 provider.Generate 前检查；失败直接返回该错误，不调用 provider。工具批次的每个实际分发入口以及 callOne 中真正调用 handler 前检查，覆盖串行、并行和 Resume approved batch。
-- [ ] 工具已取得 ClaimTool 却在 handler 前发现失去所有权时，不执行 handler，也不伪造完成结果；沿用保守的 unknown outcome/未完成账本语义，不在旧 token 下修补结果。
-- [ ] 验证租约失败发生在两个串行工具之间、模型返回与工具启动之间、并行批次尚未分发的调用之间，后续调用计数不再增加。已通过门禁并进入执行的调用视为 in-flight，不能承诺强制停止或回滚外部副作用。
-- [ ] 添加 TestSnapshotConsistencyDispatchAfterLeaseLoss、TestSnapshotConsistencyDispatchAfterCancel、TestSnapshotConsistencyResumeDispatchGuard；使用故意忽略 context 的 mock/handler，证明拒绝由框架实施，错误通过 errors.Is 保留。
+- [x] checkWriteAccess 检查根 context、guard 首个错误和当前已知租约到期时间；没有 guard 的旧 store 仍检查 context。检查只持短时状态锁，不在模型/工具调用期间持有 guard 操作锁。
+- [x] 在 streamModel 调用 provider.Generate 前检查；失败直接返回该错误，不调用 provider。工具批次的每个实际分发入口以及 callOne 中真正调用 handler 前检查，覆盖串行、并行和 Resume approved batch。
+- [x] 工具已取得 ClaimTool 却在 handler 前发现失去所有权时，不执行 handler，也不伪造完成结果；沿用保守的 unknown outcome/未完成账本语义，不在旧 token 下修补结果。
+- [x] 验证租约失败发生在两个串行工具之间、模型返回与工具启动之间、并行批次尚未分发的调用之间，后续调用计数不再增加。已通过门禁并进入执行的调用视为 in-flight，不能承诺强制停止或回滚外部副作用。
+- [x] 添加 TestSnapshotConsistencyDispatchAfterLeaseLoss、TestSnapshotConsistencyDispatchAfterCancel、TestSnapshotConsistencyResumeDispatchGuard；使用故意忽略 context 的 mock/handler，证明拒绝由框架实施，错误通过 errors.Is 保留。
 
 ```powershell
 go test ./agent -run '^TestSnapshotConsistency(Dispatch|ResumeDispatch)' -count=1
@@ -607,14 +607,22 @@ go test -race ./agent -run '^TestSnapshotConsistency(Dispatch|ResumeDispatch)' -
 go test ./agent -count=1
 ```
 
+**实施记录（2026-10-12）：**
+
+- RED：续租错误发生在两个串行工具之间时第二个 handler 仍会执行；BeforeModel/BeforeTool 取消根 context 后，故意忽略 context 的 provider/tool 仍会被调用；Resume 中 ClaimTool 成功后制造租约错误，handler、AfterTool 和完成账本仍会继续。
+- GREEN：新增 `RunContext.checkWriteAccess`，短时读取根 context、guard 首错、停止状态和租约到期时间；所有权错误优先于其触发的 context 取消返回，保持 `errors.Is` 可辨识。模型 Generate 前、工具批次入口、每次 launcher/worker 分发以及 ClaimTool 前后均执行门禁。
+- 工具结果：所有权失败使用 `noResult`，跳过 State、AfterTool、ToolDone 和 ToolCompleted；并行及 Resume 测试确认已 claim 的调用保留 `ToolClaimed` 且 Result 为空。纯用户取消仍生成既有 cancellation ToolDone，但不会启动尚未进入的 handler，保持原有取消观察契约。
+- 结果列表只返回实际报告的工具结果；普通 loop 不追加空 Tool message。额外修改 `hitl.go`，因为 Resume 原先假设 approved 调用与结果长度恒等，门禁失败后需要在有错误且结果不完整时直接退出，避免索引越界。
+- 验证：`go test ./agent -run '^TestSnapshotConsistency(Dispatch|ResumeDispatch)' -count=1`、`go test -race ./agent -run '^TestSnapshotConsistency(Dispatch|ResumeDispatch)' -count=1`、`go test ./agent -count=1`、`go test ./agent ./checkpoint ./middleware -count=1`、`go test ./... -count=1`、`go vet ./...` 和 `git diff --check` 均通过；取消措辞回归连续 100 次、SC-10 定向用例连续 50 次及 race 连续 5 次通过。
+
 **验收：**已知租约失效、租约已到期或根 context 取消后，没有新的模型/工具分发；正在执行的工具继续遵守既有取消和 unknown outcome 契约。
 
 **检查点 B：**
 
-- [ ] SC-06～10 验证了同一个协议的 Memory、File、Agent 三层行为。
-- [ ] 默认第一方 store 不需要额外选项即可得到线程协调保证。
-- [ ] 独立续租不会因模型/工具执行超过 30 秒而自然停止，失去租约也不会被重新申请掩盖。
-- [ ] Wait 返回后不会因旧运行尚未释放而产生无意义的 claim 冲突。
+- [x] SC-06～10 验证了同一个协议的 Memory、File、Agent 三层行为。
+- [x] 默认第一方 store 不需要额外选项即可得到线程协调保证。
+- [x] 独立续租不会因模型/工具执行超过 30 秒而自然停止，失去租约也不会被重新申请掩盖。
+- [x] Wait 返回后不会因旧运行尚未释放而产生无意义的 claim 冲突。
 
 ### TASK-SC-11：跨进程与故障注入验收
 
@@ -681,7 +689,7 @@ Windows 的 -race 需要可用的 cgo/C 编译工具链。若当前环境不支�
 - [x] SC-07：File 持久化协调。
 - [x] SC-08：writer guard 与续租。
 - [x] SC-09：运行生命周期接入。
-- [ ] SC-10：模型/工具分发门禁。
+- [x] SC-10：模型/工具分发门禁。
 - [ ] SC-11：跨进程及故障回归。
 - [ ] SC-12：文档迁移与验收归档。
 

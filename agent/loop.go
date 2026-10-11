@@ -318,7 +318,9 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 
 		results, dirs, rejects, execErr := l.execTools(rc, lc, calls)
 		l.mw.ToolReject(lc, rejects)
-		history = append(history, core.Message{Role: core.RoleTool, Parts: results})
+		if len(results) > 0 {
+			history = append(history, core.Message{Role: core.RoleTool, Parts: results})
+		}
 		if execErr != nil {
 			return l.fail(rc, step, history, execErr)
 		}
@@ -349,6 +351,9 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 // rc remains the run environment for publishing and state. It returns the final
 // *llm.Response (carrying Usage and StopReason) so AfterModel can observe them.
 func (l *AgentLoop) streamModel(genCtx context.Context, rc *RunContext, lc *LoopContext, req *llm.Request) (*llm.Response, bool, error) {
+	if err := rc.checkWriteAccess(); err != nil {
+		return nil, false, err
+	}
 	final := &llm.Response{}
 	for resp, err := range l.model.Generate(genCtx, req) {
 		if err != nil {

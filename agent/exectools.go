@@ -37,7 +37,11 @@ import (
 // batch has settled, so completed results are still available for the failure
 // checkpoint instead of silently disappearing with the hook error.
 func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.ToolCall) ([]core.Part, []core.Directive, []ToolRejection, error) {
+	if err := rc.checkWriteAccess(); err != nil {
+		return nil, nil, nil, err
+	}
 	results := make([]core.Part, len(calls))
+	reported := make([]bool, len(calls))
 	dirs := make([]core.Directive, len(calls))
 	var stateMu sync.Mutex
 	var rejects []ToolRejection
@@ -46,32 +50,49 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 	var afterErrMu sync.Mutex
 	var runErrs []error
 	var runErrMu sync.Mutex
+	recordRunErr := func(err error) {
+		if err == nil {
+			return
+		}
+		runErrMu.Lock()
+		runErrs = append(runErrs, err)
+		runErrMu.Unlock()
+	}
 
 	run := func(i int, c core.ToolCall) {
-		callCtx, cancel := l.toolCallCtx(lc, &c)
-		defer cancel()
-
-		// The handler runs on its own goroutine so the loop can stop waiting on
-		// it: Go cannot interrupt a function that is already running, so an
-		// uncooperative tool would otherwise hold the batch — and the run —
-		// forever. The channel is buffered by one, which is what lets an
-		// abandoned worker write its result and exit rather than blocking on a
-		// reader that has moved on.
-		ch := make(chan toolOutcome, 1)
-		go func() { ch <- l.callOne(lc, callCtx, c) }()
-
-		start := time.Now()
 		var out toolOutcome
-		select {
-		case out = <-ch:
-		case <-callCtx.Done():
-			out = awaitAbandoned(ch, callCtx, c, start)
+		if err := rc.checkWriteAccess(); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				recordRunErr(err)
+				return
+			}
+			out = toolOutcome{tr: cancelledResult(c), err: err}
+		} else {
+			callCtx, cancel := l.toolCallCtx(lc, &c)
+			defer cancel()
+
+			// The handler runs on its own goroutine so the loop can stop waiting on
+			// it: Go cannot interrupt a function that is already running, so an
+			// uncooperative tool would otherwise hold the batch — and the run —
+			// forever. The channel is buffered by one, which is what lets an
+			// abandoned worker write its result and exit rather than blocking on a
+			// reader that has moved on.
+			ch := make(chan toolOutcome, 1)
+			go func() { ch <- l.callOne(lc, callCtx, c) }()
+
+			start := time.Now()
+			select {
+			case out = <-ch:
+			case <-callCtx.Done():
+				out = awaitAbandoned(ch, callCtx, c, start)
+			}
 		}
 		tr := out.tr
 		if out.err != nil {
-			runErrMu.Lock()
-			runErrs = append(runErrs, out.err)
-			runErrMu.Unlock()
+			recordRunErr(out.err)
+		}
+		if out.noResult {
+			return
 		}
 
 		// Anything the abandoned handler returns afterwards reaches nobody: the
@@ -109,6 +130,7 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 		// eval ToolGuard marking a bad result IsError) is what the model sees in
 		// history — consistent with the ToolDone event published below.
 		results[i] = tr
+		reported[i] = true
 		dirs[i] = core.Resolve(ds...)
 		if out.rejection != nil {
 			rejectMu.Lock()
@@ -133,14 +155,22 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 	}
 	if needSeq {
 		for i := range calls {
+			if err := rc.checkWriteAccess(); err != nil {
+				recordRunErr(err)
+				break
+			}
 			rc.publish(core.ToolStarted{Call: calls[i]})
 			run(i, calls[i])
 		}
-		return results, dirs, rejects, errors.Join(append(afterErrs, runErrs...)...)
+		return reportedToolResults(results, reported), dirs, rejects, errors.Join(append(afterErrs, runErrs...)...)
 	}
 
 	var wg sync.WaitGroup
 	for i := range calls {
+		if err := rc.checkWriteAccess(); err != nil {
+			recordRunErr(err)
+			break
+		}
 		rc.publish(core.ToolStarted{Call: calls[i]})
 		wg.Add(1)
 		go func(i int, c core.ToolCall) {
@@ -149,7 +179,17 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 		}(i, calls[i])
 	}
 	wg.Wait()
-	return results, dirs, rejects, errors.Join(append(afterErrs, runErrs...)...)
+	return reportedToolResults(results, reported), dirs, rejects, errors.Join(append(afterErrs, runErrs...)...)
+}
+
+func reportedToolResults(results []core.Part, reported []bool) []core.Part {
+	out := make([]core.Part, 0, len(results))
+	for i := range results {
+		if reported[i] {
+			out = append(out, results[i])
+		}
+	}
+	return out
 }
 
 // abandonGrace bounds how long the loop still listens to a call whose context has
@@ -226,6 +266,7 @@ type toolOutcome struct {
 	ops       []core.StateOp
 	rejection *ToolRejection
 	err       error
+	noResult  bool
 
 	// skipAfter is used for a result restored from the durable journal. It has
 	// already passed AfterTool in the run that first completed it, and replaying
@@ -284,6 +325,15 @@ func (l *AgentLoop) callOne(lc *LoopContext, callCtx context.Context, c core.Too
 	if err := tool.Validate(t.Schema(), raw); err != nil {
 		return rejected(c, RejectSchemaInvalid, "invalid arguments: "+err.Error())
 	}
+	if err := lc.RunContext.checkWriteAccess(); err != nil {
+		out := toolOutcome{err: fmt.Errorf("tool %q dispatch: %w", c.Name, err)}
+		if errors.Is(err, context.Canceled) {
+			out.tr = cancelledResult(c)
+		} else {
+			out.noResult = true
+		}
+		return out
+	}
 
 	invocationID, idempotencyKey := toolInvocation(lc.ThreadID, lc.Step, c)
 	var execution *checkpoint.ToolExecution
@@ -316,6 +366,16 @@ func (l *AgentLoop) callOne(lc *LoopContext, callCtx context.Context, c core.Too
 		default:
 			execution = &ex
 		}
+	}
+	if err := lc.RunContext.checkWriteAccess(); err != nil {
+		out := toolOutcome{err: fmt.Errorf("tool %q dispatch: %w", c.Name, err)}
+		if errors.Is(err, context.Canceled) {
+			out.tr = cancelledResult(c)
+			out.execution = execution
+		} else {
+			out.noResult = true
+		}
+		return out
 	}
 
 	tctx := &tool.Context{
