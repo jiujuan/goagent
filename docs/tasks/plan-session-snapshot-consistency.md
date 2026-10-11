@@ -278,19 +278,28 @@ go test ./checkpoint ./agent ./middleware -count=1
 
 **依赖：**SC-02。**交付：**Memory/File 都能保存冻结文件视图，FileSnapshot 重新保存不丢文件。
 
-**文件：**修改 D:/codeproject/mygo/goagent/checkpoint/snapshot.go、D:/codeproject/mygo/goagent/checkpoint/file.go；新增 D:/codeproject/mygo/goagent/checkpoint/snapshot_files_contract_test.go；修订 D:/codeproject/mygo/goagent/vfs/instate.go 的持久化说明。
+**状态：**已完成（2026-10-12）。
 
-- [ ] 写 TestSnapshotConsistencyFreezeFiles，保存 InState 后改写原 InState，再读取旧 checkpoint，旧内容保持。
-- [ ] 写 TestSnapshotConsistencyResaveFileSnapshot：File.Load 返回 State.Files=nil、FileSnapshot 非空，直接改 ID/ThreadID 后保存，重开 store 后仍可读取文件。先单独验证此路径，避免只修改 Fork 掩盖保存缺口。
-- [ ] 定义 freezeCheckpoint 的来源优先级：存在可快照的活跃 State.Files 时捕获它；否则采用传入的非 nil FileSnapshot；两者都无则不制造文件内容。可快照句柄捕获后从快照 State 中清除；对外部管理句柄按 D1 处理。
-- [ ] buildCheckpointRecord 以已冻结的 FileSnapshot 构建路径→hash 索引并写 blob，不再仅依赖 State.Files。保持 blob 内容去重、短写恢复、Sync 失败后的重试规则。
-- [ ] 保留空 map 与 nil 的语义：checkpointRecord.Files 区分缺失索引与显式空索引；若现有 omitempty 会抹平差异，修改该字段编码使新记录的空索引可往返。旧记录未携带索引继续按 nil 读取。
-- [ ] 添加 TestSnapshotConsistencyEmptyFiles、TestSnapshotConsistencyFileReadOwnership、TestSnapshotConsistencyExternalFiles；验证字节切片读取隔离以及外部文件不被伪装为已持久化。
+**文件：**修改 D:/codeproject/mygo/goagent/checkpoint/snapshot.go、D:/codeproject/mygo/goagent/checkpoint/file.go、D:/codeproject/mygo/goagent/checkpoint/checkpoint.go；新增 D:/codeproject/mygo/goagent/checkpoint/snapshot_files_contract_test.go；修订 D:/codeproject/mygo/goagent/vfs/instate.go 的持久化说明。
+
+- [x] 写 TestSnapshotConsistencyFreezeFiles，保存 InState 后改写原 InState，再读取旧 checkpoint，旧内容保持。
+- [x] 写 TestSnapshotConsistencyResaveFileSnapshot：File.Load 返回 State.Files=nil、FileSnapshot 非空，直接改 ID/ThreadID 后保存，重开 store 后仍可读取文件。先单独验证此路径，避免只修改 Fork 掩盖保存缺口。
+- [x] 定义 freezeCheckpoint 的来源优先级：存在可快照的活跃 State.Files 时捕获它；否则采用传入的非 nil FileSnapshot；两者都无则不制造文件内容。可快照句柄捕获后从快照 State 中清除；对外部管理句柄按 D1 处理。
+- [x] buildCheckpointRecord 以已冻结的 FileSnapshot 构建路径→hash 索引并写 blob，不再仅依赖 State.Files。保持 blob 内容去重、短写恢复、Sync 失败后的重试规则。
+- [x] 保留空 map 与 nil 的语义：checkpointRecord.Files 区分缺失索引与显式空索引；若现有 omitempty 会抹平差异，修改该字段编码使新记录的空索引可往返。旧记录未携带索引继续按 nil 读取。
+- [x] 添加 TestSnapshotConsistencyEmptyFiles、TestSnapshotConsistencyFileReadOwnership、TestSnapshotConsistencyExternalFiles；验证字节切片读取隔离以及外部文件不被伪装为已持久化。
 
 ```powershell
 go test ./checkpoint -run '^TestSnapshotConsistency(FreezeFiles|ResaveFileSnapshot|EmptyFiles|FileReadOwnership|ExternalFiles)' -count=1
 go test ./checkpoint ./vfs -count=1
 ```
+
+**实施记录（2026-10-12）：**
+
+- RED：定向测试复现三处缺口：Memory 保存后仍返回活跃 InState；FileSnapshot 改 ID/ThreadID 重存后文件为空；Memory/File 都把显式空文件视图读成 nil。
+- GREEN：freezeCheckpoint 优先捕获活跃 Snapshottable，否则保留传入的 FileSnapshot；File 仅从冻结后的 FileSnapshot 构建 blob 索引；checkpointRecord.Files 不再使用 omitempty，rebuild 按 nil 判断是否缺失索引。
+- 验证：定向契约测试、go test ./checkpoint ./vfs -count=1、go test ./agent ./middleware -count=1、go vet ./checkpoint ./vfs 与全仓 go test ./... -count=1 均通过。
+- 语义：Snapshottable 文件保存后与活跃句柄隔离；Memory 继续保留非 Snapshottable 的外部句柄，File 不把外部句柄伪装成可移植快照；非 nil 空 map 可跨 File 重开往返。
 
 **验收：**FileSnapshot→Save 可往返；修改原文件句柄或读取的字节不会污染旧快照；既有 blob 去重、legacy JSON、truncated tail 与 Sync 故障测试通过。
 
@@ -607,8 +616,8 @@ Windows 的 -race 需要可用的 cgo/C 编译工具链。若当前环境不支�
 ## 六、最终交付清单
 
 - [x] SC-01：状态/消息深拷贝。
-- [ ] SC-02：Memory 不可变快照。
-- [ ] SC-03：文件冻结与保存。
+- [x] SC-02：Memory 不可变快照。
+- [x] SC-03：文件冻结与保存。
 - [ ] SC-04：完整 Fork。
 - [ ] SC-05：Agent 恢复及内部数据隔离。
 - [ ] SC-06：Memory 协调与 CAS。

@@ -15,10 +15,10 @@ import (
 
 // InState is the default backend: an in-memory path→bytes map. It is durable
 // with a checkpointer because it implements core.Snapshottable/core.Restorable
-// (ADR-0026): the File checkpointer persists its contents as content-addressed
-// blob records, and a resumed run rebuilds them into a fresh InState. Within
-// one process the Memory checkpointer simply shares the live handle. Safe for
-// concurrent use.
+// (ADR-0026): checkpointers freeze its contents with each checkpoint. The File
+// backend persists that snapshot as content-addressed blob records, while the
+// Memory backend keeps an isolated in-memory snapshot. A resumed run rebuilds
+// the bytes into a fresh InState. Safe for concurrent use.
 type InState struct {
 	mu    sync.RWMutex
 	files map[string][]byte

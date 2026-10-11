@@ -6,11 +6,20 @@ import (
 	"github.com/jiujuan/goagent/core"
 )
 
-// freezeCheckpoint takes ownership of a checkpoint's serializable data before
-// it becomes visible in a store. Active Files handles remain shared until the
-// checkpoint layer captures them as file snapshots.
+// freezeCheckpoint takes ownership of a checkpoint's snapshot data before it
+// becomes visible in a store. A snapshottable active file handle is the source
+// of truth; otherwise an existing FileSnapshot is retained. Externally managed
+// file handles remain shared because their contents cannot be captured.
 func freezeCheckpoint(cp *Checkpoint) (*Checkpoint, error) {
-	return cloneCheckpoint(cp)
+	out, err := cloneCheckpoint(cp)
+	if err != nil || cp == nil {
+		return out, err
+	}
+	if files, ok := cp.State.Files.(core.Snapshottable); ok {
+		out.FileSnapshot = cloneFileSnapshot(files.Snapshot())
+		out.State.Files = nil
+	}
+	return out, nil
 }
 
 // cloneCheckpoint returns a checkpoint whose mutable snapshot data is

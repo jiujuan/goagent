@@ -46,8 +46,8 @@ type Checkpoint struct {
 	// (ADR-0026). It is deliberately not serialized inline here — State.Files
 	// stays json:"-" so each checkpoint line carries only a small path→hash
 	// index — and is the in-memory handoff the agent layer feeds into a
-	// core.Restorable backend. nil means the backend was not snapshottable
-	// (externally managed) or there was nothing to persist.
+	// core.Restorable backend. nil means no portable file snapshot was supplied;
+	// a non-nil empty map is an explicit empty file view.
 	FileSnapshot map[string][]byte `json:"-"`
 }
 

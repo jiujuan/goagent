@@ -70,7 +70,7 @@ func (f *File) lockPath(threadID string) (string, error) {
 // readable so pre-durable histories retain their resume and time-travel data.
 type checkpointRecord struct {
 	*Checkpoint
-	Files map[string]string `json:"files,omitempty"`
+	Files map[string]string `json:"files"`
 }
 
 type blobRecord struct {
@@ -221,9 +221,12 @@ func (f *File) commitLocked(threadID string, st *fileState, req CommitRequest) (
 		return CommitReceipt{}, err
 	}
 
-	stored := *req.Checkpoint
+	stored, err := freezeCheckpoint(req.Checkpoint)
+	if err != nil {
+		return CommitReceipt{}, err
+	}
 	stored.Revision = st.revision + 1
-	checkpoint, blobRecords, newHashes, err := buildCheckpointRecord(&stored, st.blobs)
+	checkpoint, blobRecords, newHashes, err := buildCheckpointRecord(stored, st.blobs)
 	if err != nil {
 		return CommitReceipt{}, err
 	}
@@ -765,18 +768,16 @@ func buildCheckpointRecord(cp *Checkpoint, known map[string][]byte) (*checkpoint
 	var blobs []blobRecord
 	added := map[string][]byte{}
 	var index map[string]string
-	if ss, ok := cp.State.Files.(core.Snapshottable); ok {
-		if snap := ss.Snapshot(); len(snap) > 0 {
-			index = make(map[string]string, len(snap))
-			for path, data := range snap {
-				h := hashOf(data)
-				index[path] = h
-				if _, exists := known[h]; !exists {
-					if _, staged := added[h]; !staged {
-						copyData := append([]byte(nil), data...)
-						added[h] = copyData
-						blobs = append(blobs, blobRecord{Blob: h, Data: copyData})
-					}
+	if cp.FileSnapshot != nil {
+		index = make(map[string]string, len(cp.FileSnapshot))
+		for path, data := range cp.FileSnapshot {
+			h := hashOf(data)
+			index[path] = h
+			if _, exists := known[h]; !exists {
+				if _, staged := added[h]; !staged {
+					copyData := append([]byte(nil), data...)
+					added[h] = copyData
+					blobs = append(blobs, blobRecord{Blob: h, Data: copyData})
 				}
 			}
 		}
@@ -854,7 +855,8 @@ func (f *File) writeLine(fh *os.File, line []byte) error {
 
 func rebuild(cps []*checkpointRecord, blobs map[string][]byte) error {
 	for _, rec := range cps {
-		if len(rec.Files) == 0 {
+		if rec.Files == nil {
+			rec.FileSnapshot = nil
 			continue
 		}
 		snap := make(map[string][]byte, len(rec.Files))
