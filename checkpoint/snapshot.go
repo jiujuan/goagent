@@ -1,0 +1,105 @@
+package checkpoint
+
+import (
+	"encoding/json"
+
+	"github.com/jiujuan/goagent/core"
+)
+
+// freezeCheckpoint takes ownership of a checkpoint's serializable data before
+// it becomes visible in a store. Active Files handles remain shared until the
+// checkpoint layer captures them as file snapshots.
+func freezeCheckpoint(cp *Checkpoint) (*Checkpoint, error) {
+	return cloneCheckpoint(cp)
+}
+
+// cloneCheckpoint returns a checkpoint whose mutable snapshot data is
+// independent from cp.
+func cloneCheckpoint(cp *Checkpoint) (*Checkpoint, error) {
+	if cp == nil {
+		return nil, nil
+	}
+
+	out := *cp
+	state, err := core.CloneStateData(cp.State)
+	if err != nil {
+		return nil, err
+	}
+	out.State = state
+	out.Pending = clonePending(cp.Pending)
+	out.Pause = clonePause(cp.Pause)
+	out.FileSnapshot = cloneFileSnapshot(cp.FileSnapshot)
+	return &out, nil
+}
+
+func clonePending(in *PendingHITL) *PendingHITL {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	if in.Pending == nil {
+		return &out
+	}
+	out.Pending = make([]core.ToolCall, len(in.Pending))
+	for i, call := range in.Pending {
+		call.Args = json.RawMessage(cloneSnapshotBytes(call.Args))
+		out.Pending[i] = call
+	}
+	return &out
+}
+
+func clonePause(in *Pause) *Pause {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+func cloneFileSnapshot(in map[string][]byte) map[string][]byte {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string][]byte, len(in))
+	for path, data := range in {
+		out[path] = cloneSnapshotBytes(data)
+	}
+	return out
+}
+
+func cloneSnapshotBytes(in []byte) []byte {
+	if in == nil {
+		return nil
+	}
+	out := make([]byte, len(in))
+	copy(out, in)
+	return out
+}
+
+func cloneToolExecution(in ToolExecution) (ToolExecution, error) {
+	out := in
+	if in.Result == nil {
+		return out, nil
+	}
+	result, err := core.CloneMessage(*in.Result)
+	if err != nil {
+		return ToolExecution{}, err
+	}
+	out.Result = &result
+	return out, nil
+}
+
+func cloneToolExecutions(in []ToolExecution) ([]ToolExecution, error) {
+	if in == nil {
+		return nil, nil
+	}
+	out := make([]ToolExecution, len(in))
+	for i, execution := range in {
+		cloned, err := cloneToolExecution(execution)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = cloned
+	}
+	return out, nil
+}

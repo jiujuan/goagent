@@ -96,10 +96,9 @@ func (m *Memory) Commit(_ context.Context, req CommitRequest) (CommitReceipt, er
 
 func (m *Memory) commitLocked(req CommitRequest) (CommitReceipt, error) {
 	cp := req.Checkpoint
-	st := m.durableLocked(cp.ThreadID)
-
 	for _, old := range m.byThread[cp.ThreadID] {
 		if cp.ID != "" && old.ID == cp.ID {
+			st := m.durableLocked(cp.ThreadID)
 			return CommitReceipt{Revision: old.Revision, Claim: cloneClaim(st.claim)}, nil
 		}
 	}
@@ -108,19 +107,30 @@ func (m *Memory) commitLocked(req CommitRequest) (CommitReceipt, error) {
 			return CommitReceipt{}, fmt.Errorf("checkpoint: tool execution requires invocation ID")
 		}
 	}
+	stored, err := freezeCheckpoint(cp)
+	if err != nil {
+		return CommitReceipt{}, err
+	}
+	executions, err := cloneToolExecutions(req.ToolExecutions)
+	if err != nil {
+		return CommitReceipt{}, err
+	}
+
+	st := m.durableLocked(cp.ThreadID)
 	now := time.Now()
 	if err := validateCommitClaim(st, req.Claim, now); err != nil {
 		return CommitReceipt{}, err
 	}
 
-	cp.Revision = st.revision + 1
-	st.revision = cp.Revision
-	m.byThread[cp.ThreadID] = append(m.byThread[cp.ThreadID], cp)
+	revision := st.revision + 1
+	stored.Revision = revision
+	st.revision = revision
+	m.byThread[cp.ThreadID] = append(m.byThread[cp.ThreadID], stored)
 	for _, id := range req.AckMessageIDs {
 		delete(st.inbox, id)
 	}
-	for _, ex := range req.ToolExecutions {
-		st.executions[ex.InvocationID] = cloneExecution(ex)
+	for _, ex := range executions {
+		st.executions[ex.InvocationID] = ex
 	}
 
 	claim := renewedClaim(st, req, now)
@@ -128,7 +138,8 @@ func (m *Memory) commitLocked(req CommitRequest) (CommitReceipt, error) {
 		st.claim = nil
 		claim = nil
 	}
-	return CommitReceipt{Revision: cp.Revision, Claim: claim}, nil
+	cp.Revision = revision
+	return CommitReceipt{Revision: revision, Claim: claim}, nil
 }
 
 func (m *Memory) Claim(_ context.Context, req ClaimRequest) (Claim, error) {
@@ -220,22 +231,36 @@ func (m *Memory) ClaimTool(_ context.Context, req ToolClaimRequest) (ToolExecuti
 	if old, ok := st.executions[req.InvocationID]; ok {
 		switch old.State {
 		case ToolCompleted:
-			return cloneExecution(old), nil
+			return cloneToolExecution(old)
 		case ToolClaimed:
-			old.State = ToolUnknown
-			old.Result = nil
-			st.executions[req.InvocationID] = old
-			return cloneExecution(old), ErrToolOutcomeUnknown
-		case ToolUnknown:
-			return cloneExecution(old), ErrToolOutcomeUnknown
-		case ToolPending:
-			old.Attempt++
-			old.State = ToolClaimed
-			if old.IdempotencyKey == "" {
-				old.IdempotencyKey = req.IdempotencyKey
+			next := old
+			next.State = ToolUnknown
+			next.Result = nil
+			result, err := cloneToolExecution(next)
+			if err != nil {
+				return ToolExecution{}, err
 			}
-			st.executions[req.InvocationID] = old
-			return cloneExecution(old), nil
+			st.executions[req.InvocationID] = next
+			return result, ErrToolOutcomeUnknown
+		case ToolUnknown:
+			result, err := cloneToolExecution(old)
+			if err != nil {
+				return ToolExecution{}, err
+			}
+			return result, ErrToolOutcomeUnknown
+		case ToolPending:
+			next := old
+			next.Attempt++
+			next.State = ToolClaimed
+			if next.IdempotencyKey == "" {
+				next.IdempotencyKey = req.IdempotencyKey
+			}
+			result, err := cloneToolExecution(next)
+			if err != nil {
+				return ToolExecution{}, err
+			}
+			st.executions[req.InvocationID] = next
+			return result, nil
 		}
 	}
 	ex := ToolExecution{
@@ -246,15 +271,23 @@ func (m *Memory) ClaimTool(_ context.Context, req ToolClaimRequest) (ToolExecuti
 		Attempt:        1,
 		State:          ToolClaimed,
 	}
+	result, err := cloneToolExecution(ex)
+	if err != nil {
+		return ToolExecution{}, err
+	}
 	st.executions[req.InvocationID] = ex
-	return ex, nil
+	return result, nil
 }
 
 func (m *Memory) ToolExecution(_ context.Context, threadID, invocationID string) (ToolExecution, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ex, ok := m.durableLocked(threadID).executions[invocationID]
-	return cloneExecution(ex), ok, nil
+	if !ok {
+		return ToolExecution{}, false, nil
+	}
+	cloned, err := cloneToolExecution(ex)
+	return cloned, true, err
 }
 
 func validateCommitClaim(st *memoryDurableState, got *Claim, now time.Time) error {
@@ -328,15 +361,6 @@ func sameInboxMessage(a, b InboxMessage) (bool, error) {
 		return false, err
 	}
 	return string(aa) == string(bb), nil
-}
-
-func cloneExecution(in ToolExecution) ToolExecution {
-	out := in
-	if in.Result != nil {
-		m := *in.Result
-		out.Result = &m
-	}
-	return out
 }
 
 var _ Durable = (*Memory)(nil)

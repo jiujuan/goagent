@@ -202,7 +202,9 @@ go test ./core -count=1
 
 **依赖：**SC-01。**交付：**Memory 的数据快照不再泄漏内部引用。
 
-**文件：**新增 D:/codeproject/mygo/goagent/checkpoint/snapshot.go、D:/codeproject/mygo/goagent/checkpoint/snapshot_contract_test.go；修改 D:/codeproject/mygo/goagent/checkpoint/memory.go、D:/codeproject/mygo/goagent/checkpoint/durable_memory.go。
+**状态：**已完成（2026-10-11）。
+
+**文件：**新增 D:/codeproject/mygo/goagent/checkpoint/snapshot.go、D:/codeproject/mygo/goagent/checkpoint/snapshot_contract_test.go；修改 D:/codeproject/mygo/goagent/checkpoint/memory.go、D:/codeproject/mygo/goagent/checkpoint/durable_memory.go、D:/codeproject/mygo/goagent/checkpoint/file.go。file.go 仅适配共享工具结果深拷贝及错误传播。
 
 **内部函数：**
 
@@ -212,13 +214,13 @@ func cloneCheckpoint(cp *Checkpoint) (*Checkpoint, error)
 func cloneToolExecution(ex ToolExecution) (ToolExecution, error)
 ```
 
-- [ ] 先落下本卡末尾的完整红灯测试。它只使用当前 API，当前 Memory 必须失败。
-- [ ] freezeCheckpoint 使用 CloneStateData，另拷贝 Pending 的调用及 Args、Pause、FileSnapshot 内每个 []byte；SC-03 再加入活跃 Files 捕获规则。
-- [ ] commitLocked 在推进 revision、ack inbox、登记工具完成结果之前完成所有可能失败的验证和克隆。存入独立 checkpoint；保留现有 Save/Commit 向调用者回填 Revision 的行为。
-- [ ] Load/Latest/History 为每个返回节点提供独立 clone，History 不能只复制 []*Checkpoint 的外层 slice。
-- [ ] 在同一提交内保存的 ToolExecution.Result 使用 CloneMessage；修正现有 cloneExecution 的浅层结果引用，并调整其错误传播。失败的工具结果复制不能留下半个 checkpoint/ack。
-- [ ] 添加 TestSnapshotConsistencyMemoryReads、TestSnapshotConsistencyPendingPause、TestSnapshotConsistencyCommitCloneFailureAtomic、TestSnapshotConsistencyToolResultOwnership，分别覆盖读取出口、审批数据、原子失败和工具结果别名。
-- [ ] 验证后形成独立提交建议：fix(checkpoint): isolate in-memory snapshot data。只有任务全部通过才记录该任务完成。
+- [x] 先落下本卡末尾的完整红灯测试。它只使用当前 API，当前 Memory 必须失败。
+- [x] freezeCheckpoint 使用 CloneStateData，另拷贝 Pending 的调用及 Args、Pause、FileSnapshot 内每个 []byte；SC-03 再加入活跃 Files 捕获规则。
+- [x] commitLocked 在推进 revision、ack inbox、登记工具完成结果之前完成所有可能失败的验证和克隆。存入独立 checkpoint；保留现有 Save/Commit 向调用者回填 Revision 的行为。
+- [x] Load/Latest/History 为每个返回节点提供独立 clone，History 不能只复制 []*Checkpoint 的外层 slice。
+- [x] 在同一提交内保存的 ToolExecution.Result 使用 CloneMessage；修正现有 cloneExecution 的浅层结果引用，并调整其错误传播。失败的工具结果复制不能留下半个 checkpoint/ack。
+- [x] 添加 TestSnapshotConsistencyMemoryReads、TestSnapshotConsistencyPendingPause、TestSnapshotConsistencyCommitCloneFailureAtomic、TestSnapshotConsistencyToolResultOwnership，分别覆盖读取出口、审批数据、原子失败和工具结果别名。
+- [x] 验证后形成独立提交建议：fix(checkpoint): isolate in-memory snapshot data。只有任务全部通过才记录该任务完成。
 
 ```go
 // D:/codeproject/mygo/goagent/checkpoint/snapshot_contract_test.go
@@ -263,6 +265,12 @@ func TestSnapshotConsistencyMemorySave(t *testing.T) {
 go test ./checkpoint -run '^TestSnapshotConsistency(Memory|Pending|CommitClone|ToolResult)' -count=1
 go test ./checkpoint ./agent ./middleware -count=1
 ```
+
+**实施记录（2026-10-11）：**
+
+- RED：新增的五组定向契约测试全部失败，分别复现写入别名、读取别名、Pending/Pause 别名、克隆失败后仍提交、工具结果别名。
+- GREEN：定向契约测试与 checkpoint/agent/middleware 回归测试通过；额外执行全仓 go test ./... -count=1 与 go vet ./checkpoint，均通过。
+- 范围：Memory 保存现有 FileSnapshot 时会复制 map 与每个 []byte；State.Files 活跃句柄仍按 CloneStateData 约定保留，文件内容捕获留给 SC-03。
 
 **验收：**写入后改 input、读取后改 output 都不能更改 store；错误不影响 revision、inbox、tool ledger；尚未接入文件捕获前不宣称 Files 已隔离。
 

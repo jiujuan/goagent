@@ -40,7 +40,7 @@ func (m *Memory) Load(_ context.Context, threadID, checkpointID string) (*Checkp
 	defer m.mu.RUnlock()
 	for _, cp := range m.byThread[threadID] {
 		if cp.ID == checkpointID {
-			return cp, nil
+			return cloneCheckpoint(cp)
 		}
 	}
 	return nil, fmt.Errorf("checkpoint: %s/%s not found", threadID, checkpointID)
@@ -54,7 +54,7 @@ func (m *Memory) Latest(_ context.Context, threadID string) (*Checkpoint, error)
 	if len(hist) == 0 {
 		return nil, nil
 	}
-	return hist[len(hist)-1], nil
+	return cloneCheckpoint(hist[len(hist)-1])
 }
 
 // History lists a thread's checkpoints oldest-first.
@@ -63,7 +63,13 @@ func (m *Memory) History(_ context.Context, threadID string) ([]*Checkpoint, err
 	defer m.mu.RUnlock()
 	hist := m.byThread[threadID]
 	out := make([]*Checkpoint, len(hist))
-	copy(out, hist)
+	for i, cp := range hist {
+		cloned, err := cloneCheckpoint(cp)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = cloned
+	}
 	return out, nil
 }
 

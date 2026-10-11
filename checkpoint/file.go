@@ -213,6 +213,10 @@ func (f *File) commitLocked(threadID string, st *fileState, req CommitRequest) (
 			return CommitReceipt{}, fmt.Errorf("checkpoint: tool execution requires invocation ID")
 		}
 	}
+	toolExecutions, err := cloneToolExecutions(req.ToolExecutions)
+	if err != nil {
+		return CommitReceipt{}, err
+	}
 	if err := validateCommitClaim(&st.memoryDurableState, req.Claim, time.Now()); err != nil {
 		return CommitReceipt{}, err
 	}
@@ -231,7 +235,7 @@ func (f *File) commitLocked(threadID string, st *fileState, req CommitRequest) (
 		AckMessageIDs:  append([]string(nil), req.AckMessageIDs...),
 		Claim:          claim,
 		ReleaseClaim:   req.ReleaseClaim && req.Claim != nil,
-		ToolExecutions: cloneExecutions(req.ToolExecutions),
+		ToolExecutions: toolExecutions,
 	}
 	if err := f.appendRecordLocked(threadID, st, blobRecords, rec); err != nil {
 		return CommitReceipt{}, err
@@ -358,28 +362,45 @@ func (f *File) ClaimTool(ctx context.Context, req ToolClaimRequest) (ToolExecuti
 		if old, ok := st.executions[req.InvocationID]; ok {
 			switch old.State {
 			case ToolCompleted:
-				result = cloneExecution(old)
-				return nil
+				var err error
+				result, err = cloneToolExecution(old)
+				return err
 			case ToolUnknown:
-				result, outcomeErr = cloneExecution(old), ErrToolOutcomeUnknown
+				var err error
+				result, err = cloneToolExecution(old)
+				if err != nil {
+					return err
+				}
+				outcomeErr = ErrToolOutcomeUnknown
 				return nil
 			case ToolClaimed:
-				old.State, old.Result = ToolUnknown, nil
-				result, outcomeErr = cloneExecution(old), ErrToolOutcomeUnknown
-				rec := journalRecord{Version: durableFormatVersion, Kind: recordTool, ToolExecution: &old}
+				next := old
+				next.State, next.Result = ToolUnknown, nil
+				var err error
+				result, err = cloneToolExecution(next)
+				if err != nil {
+					return err
+				}
+				outcomeErr = ErrToolOutcomeUnknown
+				rec := journalRecord{Version: durableFormatVersion, Kind: recordTool, ToolExecution: &next}
 				if err := f.appendRecordLocked(req.ThreadID, st, nil, rec); err != nil {
 					return err
 				}
 				applyJournalRecord(st, rec)
 				return nil
 			case ToolPending:
-				old.Attempt++
-				old.State = ToolClaimed
-				if old.IdempotencyKey == "" {
-					old.IdempotencyKey = req.IdempotencyKey
+				next := old
+				next.Attempt++
+				next.State = ToolClaimed
+				if next.IdempotencyKey == "" {
+					next.IdempotencyKey = req.IdempotencyKey
 				}
-				result = cloneExecution(old)
-				rec := journalRecord{Version: durableFormatVersion, Kind: recordTool, ToolExecution: &old}
+				var err error
+				result, err = cloneToolExecution(next)
+				if err != nil {
+					return err
+				}
+				rec := journalRecord{Version: durableFormatVersion, Kind: recordTool, ToolExecution: &next}
 				if err := f.appendRecordLocked(req.ThreadID, st, nil, rec); err != nil {
 					return err
 				}
@@ -388,7 +409,11 @@ func (f *File) ClaimTool(ctx context.Context, req ToolClaimRequest) (ToolExecuti
 			}
 		}
 		ex := ToolExecution{InvocationID: req.InvocationID, CallID: req.CallID, Tool: req.Tool, IdempotencyKey: req.IdempotencyKey, Attempt: 1, State: ToolClaimed}
-		result = cloneExecution(ex)
+		var err error
+		result, err = cloneToolExecution(ex)
+		if err != nil {
+			return err
+		}
 		rec := journalRecord{Version: durableFormatVersion, Kind: recordTool, ToolExecution: &ex}
 		if err := f.appendRecordLocked(req.ThreadID, st, nil, rec); err != nil {
 			return err
@@ -407,8 +432,12 @@ func (f *File) ToolExecution(ctx context.Context, threadID, invocationID string)
 	var ok bool
 	err := f.withThread(ctx, threadID, func(st *fileState) error {
 		result, ok = st.executions[invocationID]
-		result = cloneExecution(result)
-		return nil
+		if !ok {
+			return nil
+		}
+		var err error
+		result, err = cloneToolExecution(result)
+		return err
 	})
 	return result, ok, err
 }
@@ -682,14 +711,14 @@ func applyJournalRecord(st *fileState, rec journalRecord) {
 			st.decisions[rec.Decision.DecisionID] = *rec.Decision
 		}
 	case recordTool:
-		st.executions[rec.ToolExecution.InvocationID] = cloneExecution(*rec.ToolExecution)
+		st.executions[rec.ToolExecution.InvocationID] = *rec.ToolExecution
 	case recordCommit:
 		applyCheckpoint(st, rec.Checkpoint)
 		for _, id := range rec.AckMessageIDs {
 			delete(st.inbox, id)
 		}
 		for _, ex := range rec.ToolExecutions {
-			st.executions[ex.InvocationID] = cloneExecution(ex)
+			st.executions[ex.InvocationID] = ex
 		}
 		if rec.Claim != nil {
 			c := *rec.Claim
@@ -847,17 +876,6 @@ func (f *File) setKnownLocked(threadID string, blobs map[string][]byte) {
 		known[h] = true
 	}
 	f.known[threadID] = known
-}
-
-func cloneExecutions(in []ToolExecution) []ToolExecution {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]ToolExecution, len(in))
-	for i := range in {
-		out[i] = cloneExecution(in[i])
-	}
-	return out
 }
 
 func hashOf(data []byte) string {
