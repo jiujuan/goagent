@@ -630,13 +630,13 @@ go test ./agent -count=1
 
 **文件：**新增 D:/codeproject/mygo/goagent/checkpoint/coordinator_process_test.go、D:/codeproject/mygo/goagent/agent/thread_recovery_test.go；扩展 D:/codeproject/mygo/goagent/checkpoint/snapshot_contract_test.go、D:/codeproject/mygo/goagent/checkpoint/file_recovery_test.go。
 
-- [ ] TestSnapshotConsistencyFileCrossProcess：使用 os.Executable、exec.CommandContext 和测试 helper 子进程。父子通过 stdin/stdout 管道或明确屏障文件协调，不用任意 sleep 判断是否已拿锁；一个进程持有 claim 时另一个冲突。
-- [ ] TestSnapshotConsistencyFileOwnerCrash：helper 已确认拿到 lease 后终止该 helper；确认租约到期才能接管，fencing 增加，旧 token 不能提交。测试只结束自己创建的子进程，所有数据位于 t.TempDir。
-- [ ] TestSnapshotConsistencyResumeLongCall：受控 provider/tool 调用期间跨过多个短租期，guard 有续租记录，最终只执行一次并成功提交；另测续租失败后不会开始下一次调用。
-- [ ] TestSnapshotConsistencyClaimedToolOnLeaseLoss：工具开始后租约失效，恢复不能默认重复调用；沿用现有 unknown outcome 行为，并断言调用计数。
-- [ ] 对 clone 失败、CAS 冲突、Claim/Renew 写失败、短写、Sync 失败逐项检查 checkpoint head、inbox、工具执行记录、owner/fencing；持久化返回不确定的情况以重开 journal 读取结果为准。
-- [ ] 为 Memory/File 运行相同的内容隔离、文件 Fork 和 CAS 测试；File 额外重开实例及子进程读回，不能只验证同一个对象。
-- [ ] 运行分层检查；全仓已有失败单独记录基线和归属，不能通过关闭测试来达成验收，也不顺手改动不相关模块。
+- [x] TestSnapshotConsistencyFileCrossProcess：使用 os.Executable、exec.CommandContext 和测试 helper 子进程。父子通过 stdin/stdout 管道或明确屏障文件协调，不用任意 sleep 判断是否已拿锁；一个进程持有 claim 时另一个冲突。
+- [x] TestSnapshotConsistencyFileOwnerCrash：helper 已确认拿到 lease 后终止该 helper；确认租约到期才能接管，fencing 增加，旧 token 不能提交。测试只结束自己创建的子进程，所有数据位于 t.TempDir。
+- [x] TestSnapshotConsistencyResumeLongCall：受控 provider/tool 调用期间跨过多个短租期，guard 有续租记录，最终只执行一次并成功提交；另测续租失败后不会开始下一次调用。
+- [x] TestSnapshotConsistencyClaimedToolOnLeaseLoss：工具开始后租约失效，恢复不能默认重复调用；沿用现有 unknown outcome 行为，并断言调用计数。
+- [x] 对 clone 失败、CAS 冲突、Claim/Renew 写失败、短写、Sync 失败逐项检查 checkpoint head、inbox、工具执行记录、owner/fencing；持久化返回不确定的情况以重开 journal 读取结果为准。
+- [x] 为 Memory/File 运行相同的内容隔离、文件 Fork 和 CAS 测试；File 额外重开实例及子进程读回，不能只验证同一个对象。
+- [x] 运行分层检查；全仓已有失败单独记录基线和归属，不能通过关闭测试来达成验收，也不顺手改动不相关模块。
 
 ```powershell
 go test ./core ./checkpoint ./agent ./vfs ./middleware -count=1
@@ -645,6 +645,16 @@ go test ./... -count=1
 ```
 
 Windows 的 -race 需要可用的 cgo/C 编译工具链。若当前环境不支持，记录真实错误，并在支持的 CI/Linux 环境执行同一 race 检查；不得把“未运行”写为通过。
+
+**实施记录（2026-10-12）：**
+
+- 新增真实子进程验收：父进程通过 `os.Executable` 和 `exec.CommandContext` 启动测试 helper，helper 获取 File claim、重开并校验完整 checkpoint 后，通过 stdout JSON 发送 ready；父进程仅在收到 ready 后检查竞争冲突或终止该 helper，不以任意 sleep 判断是否已持有租约。
+- 崩溃恢复用例在 helper 被终止后等待已返回 claim 的明确到期时间，再由新 owner 接管；断言 fencing token 单调增加，并验证旧 token 返回 `ErrStaleFencingToken`，不能提交新 owner 下的状态。
+- Resume 长调用用受控 ticker 和阻塞 provider/tool 跨过多次续租，工具与模型各执行一次并提交到 revision 2；续租失败会取消根 context，阻止后续模型调用。工具产生外部副作用但结果尚未持久化时保留 `ToolClaimed`，新 owner 接管后转换为 `ToolUnknown`，恢复只向模型报告 unknown outcome，不重复执行工具。
+- 扩展 Memory/File 共用契约：内容隔离、Pending/Pause、clone 失败原子性和工具结果所有权均在两个 backend 上运行；File 每次读取使用重开实例。现有 Memory/File CAS 契约和文件 Fork 契约继续纳入分层/全量回归，子进程 helper 额外完成 File checkpoint 跨进程读回。
+- 增加 File Claim/Renew 写失败、Commit 短写、Claim Sync 失败和 Commit Sync 不确定结果重试注入；每项检查 head、inbox、工具账本及 owner/fencing。Sync 返回错误后以重开 journal 的结果为准，等价 Commit 重试只确认既有记录，不重复追加；不同内容重试仍冲突。
+- 稳定性验证：跨进程/崩溃用例连续 10 次、checkpoint 故障与隔离用例连续 20 次、Agent 恢复用例连续 50 次通过；相关 checkpoint race 定向用例 1 次及 Agent race 定向用例连续 5 次通过。
+- 验收命令：`go test ./core ./checkpoint ./agent ./vfs ./middleware -count=1`、`go test -race ./core ./checkpoint ./agent ./vfs -count=1`、`go test ./... -count=1`、`go vet ./...` 和 `git diff --check` 均通过。当前 Windows 环境的 race 工具链可用，本卡没有生产代码变更。
 
 **验收：**跨进程所有权、崩溃接管、长调用续租和副作用不确定性均有测试；所有本次相关失败解决后才能完成本卡。
 
@@ -690,7 +700,7 @@ Windows 的 -race 需要可用的 cgo/C 编译工具链。若当前环境不支�
 - [x] SC-08：writer guard 与续租。
 - [x] SC-09：运行生命周期接入。
 - [x] SC-10：模型/工具分发门禁。
-- [ ] SC-11：跨进程及故障回归。
+- [x] SC-11：跨进程及故障回归。
 - [ ] SC-12：文档迁移与验收归档。
 
 执行者完成本批时，应能回答并用测试证明：保存后改 input 会不会改历史、读取后改 output 会不会改历史、Fork 是否带回文件、提前创建的两个句柄是否看见正确 head、真正并发是否在副作用前冲突、长调用是否持续持有租约、旧 writer 是否永远不能提交新 owner 的状态。

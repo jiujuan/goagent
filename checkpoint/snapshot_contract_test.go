@@ -11,45 +11,286 @@ import (
 )
 
 func TestSnapshotConsistencyMemorySave(t *testing.T) {
-	ctx := context.Background()
-	store := checkpoint.NewMemory()
-	input := &checkpoint.Checkpoint{
-		ID: "cp1", ThreadID: "thread1",
-		State: core.State{KV: map[string]any{
-			"nested": map[string]any{"value": "before"},
-		}},
-	}
-	if err := store.Save(ctx, input); err != nil {
-		t.Fatal(err)
-	}
-	input.State.KV["nested"].(map[string]any)["value"] = "changed"
-	first, err := store.Latest(ctx, "thread1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first == nil {
-		t.Fatal("missing checkpoint")
-	}
-	if got := first.State.KV["nested"].(map[string]any)["value"]; got != "before" {
-		t.Fatalf("saved snapshot changed through input: %v", got)
-	}
-	first.State.KV["nested"].(map[string]any)["value"] = "changed-via-read"
-	second, err := store.Latest(ctx, "thread1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if second == nil {
-		t.Fatal("missing checkpoint on second read")
-	}
-	if got := second.State.KV["nested"].(map[string]any)["value"]; got != "before" {
-		t.Fatalf("saved snapshot changed through read: %v", got)
+	for _, backend := range []string{"memory", "file"} {
+		t.Run(backend, func(t *testing.T) {
+			ctx := context.Background()
+			store, reopen := newSnapshotContractStore(t, backend)
+			input := snapshotContractCheckpoint()
+			if err := store.Save(ctx, input); err != nil {
+				t.Fatal(err)
+			}
+			mutateCheckpointData(input)
+
+			first, err := reopen().Latest(ctx, "thread1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertCheckpointDataUnchanged(t, first)
+			mutateCheckpointData(first)
+
+			second, err := reopen().Latest(ctx, "thread1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertCheckpointDataUnchanged(t, second)
+		})
 	}
 }
 
 func TestSnapshotConsistencyMemoryReads(t *testing.T) {
-	ctx := context.Background()
-	store := checkpoint.NewMemory()
-	cp := &checkpoint.Checkpoint{
+	for _, backend := range []string{"memory", "file"} {
+		t.Run(backend, func(t *testing.T) {
+			ctx := context.Background()
+			store, reopen := newSnapshotContractStore(t, backend)
+			if err := store.Save(ctx, snapshotContractCheckpoint()); err != nil {
+				t.Fatal(err)
+			}
+
+			loaded, err := reopen().Load(ctx, "thread1", "cp1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertCheckpointDataUnchanged(t, loaded)
+			mutateCheckpointData(loaded)
+
+			latest, err := reopen().Latest(ctx, "thread1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertCheckpointDataUnchanged(t, latest)
+			mutateCheckpointData(latest)
+
+			history, err := reopen().History(ctx, "thread1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(history) != 1 {
+				t.Fatalf("history length = %d, want 1", len(history))
+			}
+			assertCheckpointDataUnchanged(t, history[0])
+			mutateCheckpointData(history[0])
+
+			again, err := reopen().History(ctx, "thread1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(again) != 1 {
+				t.Fatalf("second history length = %d, want 1", len(again))
+			}
+			assertCheckpointDataUnchanged(t, again[0])
+		})
+	}
+}
+
+func TestSnapshotConsistencyPendingPause(t *testing.T) {
+	for _, backend := range []string{"memory", "file"} {
+		t.Run(backend, func(t *testing.T) {
+			ctx := context.Background()
+			store, reopen := newSnapshotContractStore(t, backend)
+			cp := &checkpoint.Checkpoint{
+				ID:       "paused",
+				ThreadID: "thread1",
+				State:    core.State{},
+				Pending: &checkpoint.PendingHITL{
+					Step: 3,
+					Pending: []core.ToolCall{{
+						ID: "call1", Name: "danger", Args: json.RawMessage("{\"approved\":false}"),
+					}},
+				},
+				Pause: &checkpoint.Pause{
+					ID: "pause1", Phase: "before_tool", Reason: "approval required", Recovery: checkpoint.RecoveryResumeTools,
+				},
+			}
+			if err := store.Save(ctx, cp); err != nil {
+				t.Fatal(err)
+			}
+
+			cp.Pending.Step = 99
+			cp.Pending.Pending[0].Args[0] = 'X'
+			cp.Pause.Reason = "changed"
+			first, err := reopen().Latest(ctx, "thread1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertPendingPauseUnchanged(t, first)
+
+			first.Pending.Step = 100
+			first.Pending.Pending[0].Args[0] = 'Y'
+			first.Pause.Reason = "changed-via-read"
+			second, err := reopen().Latest(ctx, "thread1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertPendingPauseUnchanged(t, second)
+		})
+	}
+}
+
+func TestSnapshotConsistencyCommitCloneFailureAtomic(t *testing.T) {
+	for _, backend := range []string{"memory", "file"} {
+		t.Run(backend, func(t *testing.T) {
+			ctx := context.Background()
+			storeRaw, reopen := newSnapshotContractStore(t, backend)
+			store := storeRaw.(checkpoint.ThreadCoordinator)
+			base := &checkpoint.Checkpoint{ID: "base", ThreadID: "thread1", State: core.State{}}
+			if err := store.Save(ctx, base); err != nil {
+				t.Fatal(err)
+			}
+			msg := checkpoint.InboxMessage{ID: "message1", Message: core.UserText("keep me")}
+			if _, err := store.Deliver(ctx, "thread1", msg); err != nil {
+				t.Fatal(err)
+			}
+			begun, err := store.BeginRun(ctx, checkpoint.BeginRunRequest{ThreadID: "thread1", Owner: "owner-a"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			claimed, err := store.ClaimTool(ctx, checkpoint.ToolClaimRequest{
+				ThreadID: "thread1", InvocationID: "invocation1", CallID: "call1", Tool: "danger", Claim: &begun.Claim,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if claimed.State != checkpoint.ToolClaimed {
+				t.Fatalf("initial tool state = %q, want %q", claimed.State, checkpoint.ToolClaimed)
+			}
+
+			bad := &checkpoint.Checkpoint{
+				ID:       "bad",
+				ThreadID: "thread1",
+				State:    core.State{KV: map[string]any{"not_cloneable": make(chan int)}},
+			}
+			_, err = store.Commit(ctx, checkpoint.CommitRequest{
+				Checkpoint:    bad,
+				Claim:         &begun.Claim,
+				AckMessageIDs: []string{msg.ID},
+				ToolExecutions: []checkpoint.ToolExecution{{
+					InvocationID: "invocation1",
+					CallID:       "call1",
+					Tool:         "danger",
+					Attempt:      1,
+					State:        checkpoint.ToolCompleted,
+					Result:       messagePtr(core.AssistantText("completed")),
+				}},
+			})
+			if !errors.Is(err, core.ErrStateNotCloneable) {
+				t.Fatalf("Commit error = %v, want ErrStateNotCloneable", err)
+			}
+			if bad.Revision != 0 {
+				t.Fatalf("failed Commit changed caller revision to %d", bad.Revision)
+			}
+
+			reopened := reopen().(checkpoint.ThreadCoordinator)
+			latest, err := reopened.Latest(ctx, "thread1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if latest == nil || latest.ID != "base" || latest.Revision != 1 {
+				t.Fatalf("failed Commit changed history: latest=%+v", latest)
+			}
+			inbox, err := reopened.Inbox(ctx, "thread1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(inbox) != 1 || inbox[0].ID != msg.ID {
+				t.Fatalf("failed Commit acknowledged inbox: %+v", inbox)
+			}
+			execution, ok, err := reopened.ToolExecution(ctx, "thread1", "invocation1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok || execution.State != checkpoint.ToolClaimed || execution.Result != nil {
+				t.Fatalf("failed Commit changed tool execution: ok=%v execution=%+v", ok, execution)
+			}
+			if _, err := reopened.BeginRun(ctx, checkpoint.BeginRunRequest{ThreadID: "thread1", Owner: "owner-b"}); !errors.Is(err, checkpoint.ErrClaimConflict) {
+				t.Fatalf("competing owner error = %v, want ErrClaimConflict", err)
+			}
+			confirmed, err := reopened.BeginRun(ctx, checkpoint.BeginRunRequest{ThreadID: "thread1", Owner: "owner-a"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if confirmed.Claim.FencingToken != begun.Claim.FencingToken {
+				t.Fatalf("failed Commit advanced fencing from %d to %d", begun.Claim.FencingToken, confirmed.Claim.FencingToken)
+			}
+
+			next := &checkpoint.Checkpoint{ID: "next", ThreadID: "thread1", State: core.State{}}
+			receipt, err := reopened.Commit(ctx, checkpoint.CommitRequest{
+				Checkpoint:    next,
+				Claim:         &confirmed.Claim,
+				ReleaseClaim:  true,
+				AckMessageIDs: []string{msg.ID},
+				ToolExecutions: []checkpoint.ToolExecution{{
+					InvocationID: "invocation1", CallID: "call1", Tool: "danger", Attempt: 1,
+					State: checkpoint.ToolCompleted, Result: messagePtr(core.AssistantText("completed")),
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if receipt.Revision != 2 || next.Revision != 2 {
+				t.Fatalf("revision after failed Commit: receipt=%d checkpoint=%d, want 2", receipt.Revision, next.Revision)
+			}
+		})
+	}
+}
+
+func TestSnapshotConsistencyToolResultOwnership(t *testing.T) {
+	for _, backend := range []string{"memory", "file"} {
+		t.Run(backend, func(t *testing.T) {
+			ctx := context.Background()
+			storeRaw, reopen := newSnapshotContractStore(t, backend)
+			store := storeRaw.(checkpoint.ThreadCoordinator)
+			result := core.Message{
+				Role: core.RoleTool,
+				Parts: []core.Part{
+					core.Image{MIME: "image/png", Data: []byte("image")},
+					core.ToolResult{
+						CallID: "call1",
+						Name:   "lookup",
+						Content: []core.Part{
+							core.ToolCall{ID: "nested", Name: "inspect", Args: json.RawMessage("{\"value\":\"before\"}")},
+						},
+					},
+				},
+			}
+			if _, err := store.Commit(ctx, checkpoint.CommitRequest{
+				Checkpoint: &checkpoint.Checkpoint{ID: "cp1", ThreadID: "thread1", State: core.State{}},
+				ToolExecutions: []checkpoint.ToolExecution{{
+					InvocationID: "invocation1",
+					CallID:       "call1",
+					Tool:         "lookup",
+					Attempt:      1,
+					State:        checkpoint.ToolCompleted,
+					Result:       &result,
+				}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			mutateToolResultMessage(&result)
+			first, ok, err := reopen().(checkpoint.ThreadCoordinator).ToolExecution(ctx, "thread1", "invocation1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok || first.Result == nil {
+				t.Fatalf("missing tool execution: ok=%v execution=%+v", ok, first)
+			}
+			assertToolResultMessageUnchanged(t, first.Result)
+
+			mutateToolResultMessage(first.Result)
+			second, ok, err := reopen().(checkpoint.ThreadCoordinator).ToolExecution(ctx, "thread1", "invocation1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok || second.Result == nil {
+				t.Fatalf("missing tool execution on second read: ok=%v execution=%+v", ok, second)
+			}
+			assertToolResultMessageUnchanged(t, second.Result)
+		})
+	}
+}
+
+func snapshotContractCheckpoint() *checkpoint.Checkpoint {
+	return &checkpoint.Checkpoint{
 		ID:       "cp1",
 		ThreadID: "thread1",
 		State: core.State{
@@ -64,215 +305,6 @@ func TestSnapshotConsistencyMemoryReads(t *testing.T) {
 		},
 		FileSnapshot: map[string][]byte{"note.txt": []byte("file")},
 	}
-	if err := store.Save(ctx, cp); err != nil {
-		t.Fatal(err)
-	}
-
-	loaded, err := store.Load(ctx, "thread1", "cp1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	mutateCheckpointData(loaded)
-
-	latest, err := store.Latest(ctx, "thread1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertCheckpointDataUnchanged(t, latest)
-	mutateCheckpointData(latest)
-
-	history, err := store.History(ctx, "thread1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(history) != 1 {
-		t.Fatalf("history length = %d, want 1", len(history))
-	}
-	assertCheckpointDataUnchanged(t, history[0])
-	mutateCheckpointData(history[0])
-
-	again, err := store.History(ctx, "thread1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(again) != 1 {
-		t.Fatalf("second history length = %d, want 1", len(again))
-	}
-	assertCheckpointDataUnchanged(t, again[0])
-}
-
-func TestSnapshotConsistencyPendingPause(t *testing.T) {
-	ctx := context.Background()
-	store := checkpoint.NewMemory()
-	cp := &checkpoint.Checkpoint{
-		ID:       "paused",
-		ThreadID: "thread1",
-		State:    core.State{},
-		Pending: &checkpoint.PendingHITL{
-			Step: 3,
-			Pending: []core.ToolCall{{
-				ID: "call1", Name: "danger", Args: json.RawMessage("{\"approved\":false}"),
-			}},
-		},
-		Pause: &checkpoint.Pause{
-			ID: "pause1", Phase: "before_tool", Reason: "approval required", Recovery: checkpoint.RecoveryResumeTools,
-		},
-	}
-	if err := store.Save(ctx, cp); err != nil {
-		t.Fatal(err)
-	}
-
-	cp.Pending.Step = 99
-	cp.Pending.Pending[0].Args[0] = 'X'
-	cp.Pause.Reason = "changed"
-	first, err := store.Latest(ctx, "thread1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertPendingPauseUnchanged(t, first)
-
-	first.Pending.Step = 100
-	first.Pending.Pending[0].Args[0] = 'Y'
-	first.Pause.Reason = "changed-via-read"
-	second, err := store.Latest(ctx, "thread1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertPendingPauseUnchanged(t, second)
-}
-
-func TestSnapshotConsistencyCommitCloneFailureAtomic(t *testing.T) {
-	ctx := context.Background()
-	store := checkpoint.NewMemory()
-	base := &checkpoint.Checkpoint{ID: "base", ThreadID: "thread1", State: core.State{}}
-	if err := store.Save(ctx, base); err != nil {
-		t.Fatal(err)
-	}
-	msg := checkpoint.InboxMessage{ID: "message1", Message: core.UserText("keep me")}
-	if _, err := store.Deliver(ctx, "thread1", msg); err != nil {
-		t.Fatal(err)
-	}
-	claimed, err := store.ClaimTool(ctx, checkpoint.ToolClaimRequest{
-		ThreadID: "thread1", InvocationID: "invocation1", CallID: "call1", Tool: "danger",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if claimed.State != checkpoint.ToolClaimed {
-		t.Fatalf("initial tool state = %q, want %q", claimed.State, checkpoint.ToolClaimed)
-	}
-
-	bad := &checkpoint.Checkpoint{
-		ID:       "bad",
-		ThreadID: "thread1",
-		State:    core.State{KV: map[string]any{"not_cloneable": make(chan int)}},
-	}
-	_, err = store.Commit(ctx, checkpoint.CommitRequest{
-		Checkpoint:    bad,
-		AckMessageIDs: []string{msg.ID},
-		ToolExecutions: []checkpoint.ToolExecution{{
-			InvocationID: "invocation1",
-			CallID:       "call1",
-			Tool:         "danger",
-			Attempt:      1,
-			State:        checkpoint.ToolCompleted,
-			Result:       messagePtr(core.AssistantText("completed")),
-		}},
-	})
-	if !errors.Is(err, core.ErrStateNotCloneable) {
-		t.Fatalf("Commit error = %v, want ErrStateNotCloneable", err)
-	}
-	if bad.Revision != 0 {
-		t.Fatalf("failed Commit changed caller revision to %d", bad.Revision)
-	}
-
-	latest, err := store.Latest(ctx, "thread1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if latest == nil || latest.ID != "base" || latest.Revision != 1 {
-		t.Fatalf("failed Commit changed history: latest=%+v", latest)
-	}
-	history, err := store.History(ctx, "thread1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(history) != 1 {
-		t.Fatalf("failed Commit changed history length to %d", len(history))
-	}
-	inbox, err := store.Inbox(ctx, "thread1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(inbox) != 1 || inbox[0].ID != msg.ID {
-		t.Fatalf("failed Commit acknowledged inbox: %+v", inbox)
-	}
-	execution, ok, err := store.ToolExecution(ctx, "thread1", "invocation1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok || execution.State != checkpoint.ToolClaimed || execution.Result != nil {
-		t.Fatalf("failed Commit changed tool execution: ok=%v execution=%+v", ok, execution)
-	}
-
-	next := &checkpoint.Checkpoint{ID: "next", ThreadID: "thread1", State: core.State{}}
-	if err := store.Save(ctx, next); err != nil {
-		t.Fatal(err)
-	}
-	if next.Revision != 2 {
-		t.Fatalf("revision after failed Commit = %d, want 2", next.Revision)
-	}
-}
-
-func TestSnapshotConsistencyToolResultOwnership(t *testing.T) {
-	ctx := context.Background()
-	store := checkpoint.NewMemory()
-	result := core.Message{
-		Role: core.RoleTool,
-		Parts: []core.Part{
-			core.Image{MIME: "image/png", Data: []byte("image")},
-			core.ToolResult{
-				CallID: "call1",
-				Name:   "lookup",
-				Content: []core.Part{
-					core.ToolCall{ID: "nested", Name: "inspect", Args: json.RawMessage("{\"value\":\"before\"}")},
-				},
-			},
-		},
-	}
-	if _, err := store.Commit(ctx, checkpoint.CommitRequest{
-		Checkpoint: &checkpoint.Checkpoint{ID: "cp1", ThreadID: "thread1", State: core.State{}},
-		ToolExecutions: []checkpoint.ToolExecution{{
-			InvocationID: "invocation1",
-			CallID:       "call1",
-			Tool:         "lookup",
-			Attempt:      1,
-			State:        checkpoint.ToolCompleted,
-			Result:       &result,
-		}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	mutateToolResultMessage(&result)
-	first, ok, err := store.ToolExecution(ctx, "thread1", "invocation1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok || first.Result == nil {
-		t.Fatalf("missing tool execution: ok=%v execution=%+v", ok, first)
-	}
-	assertToolResultMessageUnchanged(t, first.Result)
-
-	mutateToolResultMessage(first.Result)
-	second, ok, err := store.ToolExecution(ctx, "thread1", "invocation1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok || second.Result == nil {
-		t.Fatalf("missing tool execution on second read: ok=%v execution=%+v", ok, second)
-	}
-	assertToolResultMessageUnchanged(t, second.Result)
 }
 
 func mutateCheckpointData(cp *checkpoint.Checkpoint) {

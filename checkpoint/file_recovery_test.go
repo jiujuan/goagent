@@ -1,6 +1,7 @@
 package checkpoint
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -237,16 +238,187 @@ func TestSnapshotConsistencyFileRestartClaim(t *testing.T) {
 	}
 }
 
+func TestSnapshotConsistencyFileClaimWriteFailure(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	now := time.Date(2026, time.October, 12, 17, 30, 0, 0, time.UTC)
+	store := newFileRecoveryStore(t, dir, now)
+	base := seedFileRecoveryThread(t, store, "thread", "message")
+	claimed := fileRecoveryExecution(ToolClaimed)
+	seed := &Checkpoint{ID: "seed", ThreadID: "thread", State: core.State{KV: map[string]any{"value": "seed"}}}
+	if _, err := store.Commit(ctx, CommitRequest{
+		Checkpoint: seed, ExpectedRevision: revisionPtr(base.Revision), ToolExecutions: []ToolExecution{claimed},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	injectedErr := errors.New("injected claim write failure")
+	store.ops.write = func(*os.File, []byte) (int, error) { return 0, injectedErr }
+	result, err := store.BeginRun(ctx, BeginRunRequest{ThreadID: "thread", Owner: "owner-a", Lease: time.Minute})
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("BeginRun error = %v, want injected write failure", err)
+	}
+	if result.Claim.FencingToken != 0 || result.Checkpoint != nil {
+		t.Fatalf("failed BeginRun returned state: %+v", result)
+	}
+
+	reopened := newFileRecoveryStore(t, dir, now)
+	assertFileRecoveryContents(t, reopened, "thread", "seed", 2, []string{"message"}, claimed)
+	if err := reopened.withThread(ctx, "thread", func(st *fileState) error {
+		if st.claim != nil || st.fencing != 0 {
+			t.Fatalf("failed claim changed owner state: claim=%+v fencing=%d", st.claim, st.fencing)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	winner, err := reopened.BeginRun(ctx, BeginRunRequest{ThreadID: "thread", Owner: "owner-b", Lease: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if winner.Claim.FencingToken != 1 || winner.Checkpoint == nil || winner.Checkpoint.ID != "seed" {
+		t.Fatalf("claim after write failure = %+v", winner)
+	}
+}
+
+func TestSnapshotConsistencyFileRenewWriteFailure(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	now := time.Date(2026, time.October, 12, 17, 40, 0, 0, time.UTC)
+	store := newFileRecoveryStore(t, dir, now)
+	base := seedFileRecoveryThread(t, store, "thread", "message")
+	started, err := store.BeginRun(ctx, BeginRunRequest{ThreadID: "thread", Owner: "owner-a", Lease: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimTool(ctx, ToolClaimRequest{
+		ThreadID: "thread", InvocationID: "invocation", CallID: "call", Tool: "tool", Claim: &started.Claim,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	injectedErr := errors.New("injected renew write failure")
+	store.ops.write = func(*os.File, []byte) (int, error) { return 0, injectedErr }
+	if _, err := store.RenewClaim(ctx, started.Claim, 2*time.Minute); !errors.Is(err, injectedErr) {
+		t.Fatalf("RenewClaim error = %v, want injected write failure", err)
+	}
+
+	reopened := newFileRecoveryStore(t, dir, now)
+	assertFileRecoveryContents(t, reopened, "thread", base.ID, base.Revision, []string{"message"}, claimed)
+	if err := reopened.withThread(ctx, "thread", func(st *fileState) error {
+		if st.claim == nil || !sameClaim(*st.claim, started.Claim) || !st.claim.ExpiresAt.Equal(started.Claim.ExpiresAt) {
+			t.Fatalf("claim after failed renewal = %+v, want %+v", st.claim, started.Claim)
+		}
+		if st.fencing != started.Claim.FencingToken {
+			t.Fatalf("fencing after failed renewal = %d, want %d", st.fencing, started.Claim.FencingToken)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.BeginRun(ctx, BeginRunRequest{ThreadID: "thread", Owner: "owner-b", Lease: time.Minute}); !errors.Is(err, ErrClaimConflict) {
+		t.Fatalf("competing owner after failed renewal error = %v, want ErrClaimConflict", err)
+	}
+	renewed, err := reopened.RenewClaim(ctx, started.Claim, 2*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renewed.FencingToken != started.Claim.FencingToken || !renewed.ExpiresAt.Equal(now.Add(2*time.Minute)) {
+		t.Fatalf("renewed claim = %+v", renewed)
+	}
+}
+
+func TestSnapshotConsistencyFileCommitShortWrite(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	now := time.Date(2026, time.October, 12, 17, 50, 0, 0, time.UTC)
+	normal := defaultFileOps()
+	store := newFileRecoveryStore(t, dir, now)
+	base := seedFileRecoveryThread(t, store, "thread", "message")
+	started, err := store.BeginRun(ctx, BeginRunRequest{ThreadID: "thread", Owner: "owner", Lease: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimTool(ctx, ToolClaimRequest{
+		ThreadID: "thread", InvocationID: "invocation", CallID: "call", Tool: "tool", Claim: &started.Claim,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := fileRecoveryExecution(ToolCompleted)
+	completed.Result = coordinatorMessagePtr(core.AssistantText("done"))
+	target := &Checkpoint{
+		ID: "short-commit", ThreadID: "thread", State: core.State{KV: map[string]any{"value": "committed"}},
+		FileSnapshot: map[string][]byte{"result.txt": []byte("durable result")},
+	}
+	shorted := false
+	store.ops.write = func(fh *os.File, data []byte) (int, error) {
+		if !shorted && bytes.Contains(data, []byte(`"kind":"commit"`)) && bytes.Contains(data, []byte(target.ID)) {
+			shorted = true
+			n, writeErr := normal.write(fh, data[:len(data)/2])
+			if writeErr != nil {
+				return n, writeErr
+			}
+			return n, io.ErrShortWrite
+		}
+		return normal.write(fh, data)
+	}
+	_, err = store.Commit(ctx, CommitRequest{
+		Checkpoint: target, ExpectedRevision: revisionPtr(base.Revision), Claim: &started.Claim,
+		AckMessageIDs: []string{"message"}, ToolExecutions: []ToolExecution{completed},
+	})
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("Commit error = %v, want io.ErrShortWrite", err)
+	}
+	if target.Revision != 0 || !shorted {
+		t.Fatalf("failed Commit revision=%d shorted=%v", target.Revision, shorted)
+	}
+
+	reopened := newFileRecoveryStore(t, dir, now)
+	assertFileRecoveryContents(t, reopened, "thread", base.ID, base.Revision, []string{"message"}, claimed)
+	if err := reopened.withThread(ctx, "thread", func(st *fileState) error {
+		if st.claim == nil || !sameClaim(*st.claim, started.Claim) || st.fencing != started.Claim.FencingToken {
+			t.Fatalf("claim after short commit = %+v fencing=%d", st.claim, st.fencing)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	retry := &Checkpoint{
+		ID: target.ID, ThreadID: target.ThreadID, State: core.State{KV: map[string]any{"value": "committed"}},
+		FileSnapshot: map[string][]byte{"result.txt": []byte("durable result")},
+	}
+	receipt, err := reopened.Commit(ctx, CommitRequest{
+		Checkpoint: retry, ExpectedRevision: revisionPtr(base.Revision), Claim: &started.Claim,
+		AckMessageIDs: []string{"message"}, ToolExecutions: []ToolExecution{completed},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Revision != 2 || retry.Revision != 2 {
+		t.Fatalf("retry receipt=%+v checkpoint revision=%d", receipt, retry.Revision)
+	}
+	if got := journalCommitIDCount(t, filepath.Join(dir, "thread.jsonl"), target.ID); got != 1 {
+		t.Fatalf("complete commits for %q = %d, want 1", target.ID, got)
+	}
+}
+
 func TestSnapshotConsistencyFileClaimSyncFailure(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	now := time.Date(2026, time.October, 12, 18, 0, 0, 0, time.UTC)
 	normal := defaultFileOps()
-	store, err := NewFile(dir)
-	if err != nil {
+	store := newFileRecoveryStore(t, dir, now)
+	base := seedFileRecoveryThread(t, store, "thread", "message")
+	claimed := fileRecoveryExecution(ToolClaimed)
+	seed := &Checkpoint{ID: "claim-sync-seed", ThreadID: "thread", State: core.State{KV: map[string]any{"value": "seed"}}}
+	if _, err := store.Commit(ctx, CommitRequest{
+		Checkpoint: seed, ExpectedRevision: revisionPtr(base.Revision), ToolExecutions: []ToolExecution{claimed},
+	}); err != nil {
 		t.Fatal(err)
 	}
-	store.now = func() time.Time { return now }
 	store.ops = fileOps{
 		write: normal.write,
 		sync:  func(*os.File) error { return errors.New("injected claim sync failure") },
@@ -263,11 +435,16 @@ func TestSnapshotConsistencyFileClaimSyncFailure(t *testing.T) {
 		t.Fatalf("claim records after failed Sync = %d, want 1", got)
 	}
 
-	reopened, err := NewFile(dir)
-	if err != nil {
+	reopened := newFileRecoveryStore(t, dir, now)
+	assertFileRecoveryContents(t, reopened, "thread", seed.ID, seed.Revision, []string{"message"}, claimed)
+	if err := reopened.withThread(ctx, "thread", func(st *fileState) error {
+		if st.claim == nil || st.claim.Owner != "owner-a" || st.claim.FencingToken != 1 || st.fencing != 1 {
+			t.Fatalf("claim after failed Sync = %+v fencing=%d", st.claim, st.fencing)
+		}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
-	reopened.now = func() time.Time { return now }
 	if _, err := reopened.BeginRun(ctx, BeginRunRequest{ThreadID: "thread", Owner: "owner-b", Lease: time.Minute}); !errors.Is(err, ErrClaimConflict) {
 		t.Fatalf("competing owner after failed Sync error = %v, want ErrClaimConflict", err)
 	}
@@ -275,7 +452,7 @@ func TestSnapshotConsistencyFileClaimSyncFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if confirmed.Claim.FencingToken != 1 {
+	if confirmed.Claim.FencingToken != 1 || confirmed.Checkpoint == nil || confirmed.Checkpoint.ID != seed.ID {
 		t.Fatalf("confirmed claim = %+v", confirmed.Claim)
 	}
 }
@@ -285,11 +462,11 @@ func TestSnapshotConsistencyFileCommitSyncRetry(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, time.October, 12, 19, 0, 0, 0, time.UTC)
 	normal := defaultFileOps()
-	store, err := NewFile(dir)
-	if err != nil {
+	store := newFileRecoveryStore(t, dir, now)
+	base := &Checkpoint{ID: "base", ThreadID: "thread", State: core.State{KV: map[string]any{"value": "base"}}}
+	if err := store.Save(ctx, base); err != nil {
 		t.Fatal(err)
 	}
-	store.now = func() time.Time { return now }
 	for _, id := range []string{"message-a", "message-b"} {
 		if _, err := store.Deliver(ctx, "thread", InboxMessage{ID: id, Message: core.UserText(id)}); err != nil {
 			t.Fatal(err)
@@ -304,6 +481,14 @@ func TestSnapshotConsistencyFileCommitSyncRetry(t *testing.T) {
 		{InvocationID: "invocation-a", CallID: "call-a", Tool: "tool", Attempt: 1, State: ToolCompleted, Result: coordinatorMessagePtr(core.AssistantText("a"))},
 		{InvocationID: "invocation-b", CallID: "call-b", Tool: "tool", Attempt: 1, State: ToolCompleted, Result: coordinatorMessagePtr(core.AssistantText("b"))},
 	}
+	for _, execution := range executions {
+		claimed, err := store.ClaimTool(ctx, ToolClaimRequest{
+			ThreadID: "thread", InvocationID: execution.InvocationID, CallID: execution.CallID, Tool: execution.Tool, Claim: &started.Claim,
+		})
+		if err != nil || claimed.State != ToolClaimed {
+			t.Fatalf("ClaimTool %s = %+v err=%v", execution.InvocationID, claimed, err)
+		}
+	}
 	checkpointRequest := func(reverse bool) *Checkpoint {
 		files := map[string][]byte{}
 		if reverse {
@@ -315,7 +500,6 @@ func TestSnapshotConsistencyFileCommitSyncRetry(t *testing.T) {
 		}
 		return &Checkpoint{ID: "checkpoint", ThreadID: "thread", State: core.State{KV: map[string]any{"value": "same"}}, FileSnapshot: files}
 	}
-	zero := uint64(0)
 	syncs := 0
 	store.ops = fileOps{
 		write: normal.write,
@@ -326,7 +510,7 @@ func TestSnapshotConsistencyFileCommitSyncRetry(t *testing.T) {
 	}
 	firstCheckpoint := checkpointRequest(false)
 	_, err = store.Commit(ctx, CommitRequest{
-		Checkpoint: firstCheckpoint, ExpectedRevision: &zero,
+		Checkpoint: firstCheckpoint, ExpectedRevision: revisionPtr(base.Revision),
 		AckMessageIDs: []string{"message-a", "message-b"}, Claim: &started.Claim, Lease: 2 * time.Minute,
 		ToolExecutions: executions,
 	})
@@ -336,18 +520,26 @@ func TestSnapshotConsistencyFileCommitSyncRetry(t *testing.T) {
 	if firstCheckpoint.Revision != 0 {
 		t.Fatalf("failed Commit changed caller revision to %d", firstCheckpoint.Revision)
 	}
-	if got := journalKindCount(t, filepath.Join(dir, "thread.jsonl"), recordCommit); got != 1 {
-		t.Fatalf("commit records after failed Sync = %d, want 1", got)
+	if got := journalCommitIDCount(t, filepath.Join(dir, "thread.jsonl"), "checkpoint"); got != 1 {
+		t.Fatalf("checkpoint commit records after failed Sync = %d, want 1", got)
 	}
 	if digest := journalCommitDigest(t, filepath.Join(dir, "thread.jsonl"), "checkpoint"); digest == "" {
 		t.Fatal("commit record did not persist request_digest")
 	}
 
-	retryStore, err := NewFile(dir)
-	if err != nil {
+	retryStore := newFileRecoveryStore(t, dir, now)
+	assertFileRecoveryContents(t, retryStore, "thread", "checkpoint", 2, nil, executions[0], executions[1])
+	if err := retryStore.withThread(ctx, "thread", func(st *fileState) error {
+		if st.claim == nil || !sameClaim(*st.claim, started.Claim) || st.fencing != started.Claim.FencingToken {
+			t.Fatalf("claim after failed commit Sync = %+v fencing=%d", st.claim, st.fencing)
+		}
+		if !st.claim.ExpiresAt.Equal(now.Add(2 * time.Minute)) {
+			t.Fatalf("claim expiry after failed commit Sync = %v", st.claim.ExpiresAt)
+		}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
-	retryStore.now = func() time.Time { return now }
 	retryStore.ops = fileOps{
 		write: normal.write,
 		sync: func(fh *os.File) error {
@@ -366,14 +558,14 @@ func TestSnapshotConsistencyFileCommitSyncRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if syncs != 2 || receipt.Revision != 1 || retryCheckpoint.Revision != 1 || receipt.Claim == nil {
+	if syncs != 2 || receipt.Revision != 2 || retryCheckpoint.Revision != 2 || receipt.Claim == nil {
 		t.Fatalf("retry receipt=%+v checkpoint revision=%d syncs=%d", receipt, retryCheckpoint.Revision, syncs)
 	}
-	if got := journalKindCount(t, filepath.Join(dir, "thread.jsonl"), recordCommit); got != 1 {
+	if got := journalCommitIDCount(t, filepath.Join(dir, "thread.jsonl"), "checkpoint"); got != 1 {
 		t.Fatalf("retry appended %d commit records, want 1", got)
 	}
 	history, err := retryStore.History(ctx, "thread")
-	if err != nil || len(history) != 1 || history[0].ID != "checkpoint" {
+	if err != nil || len(history) != 2 || history[0].ID != "base" || history[1].ID != "checkpoint" {
 		t.Fatalf("history=%+v err=%v", history, err)
 	}
 	inbox, err := retryStore.Inbox(ctx, "thread")
@@ -458,6 +650,80 @@ func TestSnapshotConsistencyFileLegacyCommitDigest(t *testing.T) {
 	}
 }
 
+func newFileRecoveryStore(t *testing.T, dir string, now time.Time) *File {
+	t.Helper()
+	store, err := NewFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.now = func() time.Time { return now }
+	return store
+}
+
+func seedFileRecoveryThread(t *testing.T, store *File, threadID, messageID string) *Checkpoint {
+	t.Helper()
+	ctx := context.Background()
+	cp := &Checkpoint{ID: "base", ThreadID: threadID, State: core.State{KV: map[string]any{"value": "base"}}}
+	if err := store.Save(ctx, cp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Deliver(ctx, threadID, InboxMessage{ID: messageID, Message: core.UserText(messageID)}); err != nil {
+		t.Fatal(err)
+	}
+	return cp
+}
+
+func fileRecoveryExecution(state ToolExecutionState) ToolExecution {
+	return ToolExecution{InvocationID: "invocation", CallID: "call", Tool: "tool", Attempt: 1, State: state}
+}
+
+func revisionPtr(revision uint64) *uint64 { return &revision }
+
+func assertFileRecoveryContents(
+	t *testing.T,
+	store *File,
+	threadID, checkpointID string,
+	revision uint64,
+	inboxIDs []string,
+	executions ...ToolExecution,
+) {
+	t.Helper()
+	ctx := context.Background()
+	head, err := store.Latest(ctx, threadID)
+	if err != nil || head == nil || head.ID != checkpointID || head.Revision != revision {
+		t.Fatalf("head=%+v err=%v, want id=%q revision=%d", head, err, checkpointID, revision)
+	}
+	inbox, err := store.Inbox(ctx, threadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inbox) != len(inboxIDs) {
+		t.Fatalf("inbox=%+v, want IDs %v", inbox, inboxIDs)
+	}
+	for i, id := range inboxIDs {
+		if inbox[i].ID != id {
+			t.Fatalf("inbox=%+v, want IDs %v", inbox, inboxIDs)
+		}
+	}
+	for _, want := range executions {
+		got, ok, err := store.ToolExecution(ctx, threadID, want.InvocationID)
+		if err != nil || !ok {
+			t.Fatalf("tool execution %q=%+v ok=%v err=%v", want.InvocationID, got, ok, err)
+		}
+		if got.InvocationID != want.InvocationID || got.CallID != want.CallID || got.Tool != want.Tool ||
+			got.Attempt != want.Attempt || got.State != want.State {
+			t.Fatalf("tool execution %q=%+v, want %+v", want.InvocationID, got, want)
+		}
+		if want.Result == nil {
+			if got.Result != nil {
+				t.Fatalf("tool execution %q result=%+v, want nil", want.InvocationID, got.Result)
+			}
+		} else if got.Result == nil || got.Result.Text() != want.Result.Text() {
+			t.Fatalf("tool execution %q result=%+v, want %+v", want.InvocationID, got.Result, want.Result)
+		}
+	}
+}
+
 func mustReadFile(t *testing.T, path string) []byte {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -479,6 +745,22 @@ func journalKindCount(t *testing.T, path, kind string) int {
 			t.Fatal(err)
 		}
 		if probe.Kind == kind {
+			count++
+		}
+	}
+	return count
+}
+
+func journalCommitIDCount(t *testing.T, path, checkpointID string) int {
+	t.Helper()
+	data := mustReadFile(t, path)
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var rec journalRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatal(err)
+		}
+		if rec.Kind == recordCommit && rec.Checkpoint != nil && rec.Checkpoint.ID == checkpointID {
 			count++
 		}
 	}
