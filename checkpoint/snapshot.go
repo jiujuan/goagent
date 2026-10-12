@@ -37,6 +37,10 @@ func cloneCheckpoint(cp *Checkpoint) (*Checkpoint, error) {
 	out.State = state
 	out.Pending = clonePending(cp.Pending)
 	out.Pause = clonePause(cp.Pause)
+	out.Completion, err = cloneCompletion(cp.Completion)
+	if err != nil {
+		return nil, err
+	}
 	out.FileSnapshot = cloneFileSnapshot(cp.FileSnapshot)
 	return &out, nil
 }
@@ -63,6 +67,25 @@ func clonePause(in *Pause) *Pause {
 	}
 	out := *in
 	return &out
+}
+
+// cloneCompletion copies a terminal record. The result message is deep-copied
+// because its parts carry mutable byte payloads; Err and Kind are strings, so the
+// record itself stays shallow.
+func cloneCompletion(in *Completion) (*Completion, error) {
+	if in == nil {
+		return nil, nil
+	}
+	out := *in
+	if in.Result == nil {
+		return &out, nil
+	}
+	result, err := core.CloneMessage(in.Result.Message)
+	if err != nil {
+		return nil, err
+	}
+	out.Result = &core.Result{Message: result}
+	return &out, nil
 }
 
 func cloneFileSnapshot(in map[string][]byte) map[string][]byte {

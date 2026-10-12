@@ -40,5 +40,8 @@ func Fork(parent *Checkpoint, newThreadID, newID string) (*Checkpoint, error) {
 	child.Revision = 0
 	child.Pending = nil
 	child.Pause = nil
+	// A branch is a new continuation, not a finished run, so it never inherits
+	// the parent's terminal record (ADR-0033 D4). The file snapshot keeps copying.
+	child.Completion = nil
 	return child, nil
 }

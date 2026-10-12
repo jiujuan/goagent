@@ -41,6 +41,13 @@ type Checkpoint struct {
 	// RecoveryReplayModel and deliberately contain no model reply to continue.
 	Pause *Pause `json:"pause,omitempty"`
 
+	// Completion records the terminal outcome of one finished run on this
+	// snapshot: which run ended, whether it completed or failed, and the frozen
+	// result. Nothing writes it automatically — the agent layer records it on
+	// request (ADR-0033 D4) — so checkpoints written before it existed, and runs
+	// that never recorded a terminal state, read back nil.
+	Completion *Completion `json:"completion,omitempty"`
+
 	// FileSnapshot carries the run's file state, reconstructed at read time
 	// from the content-addressed blob records the File checkpointer persists
 	// (ADR-0026). It is deliberately not serialized inline here — State.Files
@@ -92,6 +99,30 @@ const (
 	// RecoveryReplayModel restarts at the saved model-request boundary.
 	RecoveryReplayModel = "replay_model"
 )
+
+const (
+	// CompletionCompleted marks a run that finished and produced a result.
+	CompletionCompleted = "completed"
+	// CompletionFailed marks a run that ended in an error.
+	CompletionFailed = "failed"
+)
+
+// Completion is the terminal record of one finished run, attached to the
+// checkpoint boundary that run last committed. It is written by an explicit
+// record call, never by the ordinary save path, and it is immutable once
+// stored: a later run on the same thread gets its own record instead of
+// overwriting this snapshot (ADR-0033 D4).
+type Completion struct {
+	// RunID is the run this record belongs to; identity checks rely on it so a
+	// stale result cannot be attached to another run's boundary.
+	RunID string `json:"run_id"`
+	// Kind is CompletionCompleted or CompletionFailed.
+	Kind string `json:"kind"`
+	// Result is the run's frozen final message. It is nil for a failed run.
+	Result *core.Result `json:"result,omitempty"`
+	// Err is the failure text for Kind == CompletionFailed, empty otherwise.
+	Err string `json:"err,omitempty"`
+}
 
 // Checkpointer persists and retrieves checkpoints.
 type Checkpointer interface {
