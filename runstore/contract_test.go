@@ -185,6 +185,43 @@ func TestRunTransitions(t *testing.T) {
 	}
 }
 
+// TestRunStatusTableIsClosed 钉住状态表本身：七个状态都有行，终态行没有出路，
+// 非终态才有自环。存储层的终态闸门之外，这张表是第二道保险。
+func TestRunStatusTableIsClosed(t *testing.T) {
+	all := []Status{
+		StatusQueued, StatusRunning, StatusCancelling,
+		StatusPaused, StatusSucceeded, StatusFailed, StatusCancelled,
+	}
+	for _, s := range all {
+		row, ok := allowedTransitions[s]
+		if !ok {
+			t.Fatalf("状态 %q 在状态表里没有行", s)
+		}
+		if s.Terminal() {
+			if len(row) != 0 {
+				t.Fatalf("终态 %q 还有出路: %v", s, row)
+			}
+			continue
+		}
+		if !row[s] {
+			t.Fatalf("非终态 %q 少了自环（心跳与入队重放都要用）", s)
+		}
+		for target := range row {
+			if !validStatus(target) {
+				t.Fatalf("%q 的出路里有未知状态 %q", s, target)
+			}
+		}
+	}
+	for _, s := range []Status{Status("exploded"), Status("")} {
+		if validStatus(s) {
+			t.Fatalf("%q 被当成了合法状态", s)
+		}
+	}
+	if len(allowedTransitions) != len(all) {
+		t.Fatalf("状态表有 %d 行，与已知状态数 %d 不符", len(allowedTransitions), len(all))
+	}
+}
+
 // TestRunTerminalRetryWithDifferentOutcome 证明终态幂等只认同一结局，换个答案就是改写。
 func TestRunTerminalRetryWithDifferentOutcome(t *testing.T) {
 	for _, f := range storeFactories() {
@@ -311,32 +348,39 @@ func TestRunStoreCASConflict(t *testing.T) {
 			ctx := context.Background()
 			store := f.make(t)
 			created := mustCreate(t, store, recordIn("cas", StatusQueued, testBase()))
+			toRunning := recordIn("cas", StatusRunning, testBase())
 
 			// 未知 RunID：CAS 不创建。
-			if _, err := store.CompareAndSwap(ctx, "missing", 1, RunRecord{Status: StatusRunning}); !errors.Is(err, ErrNotFound) {
+			if _, err := store.CompareAndSwap(ctx, "missing", 1, recordIn("missing", StatusRunning, testBase())); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("未知 RunID = %v, want ErrNotFound", err)
 			}
-			// expectedVersion 为 0 表示调用方根本没读过记录。
-			if _, err := store.CompareAndSwap(ctx, "cas", 0, RunRecord{Status: StatusRunning}); !errors.Is(err, ErrConflict) {
+			// expectedVersion 为 0：版本从 1 起，没读过记录的调用方同样只能拿到冲突。
+			if _, err := store.CompareAndSwap(ctx, "cas", 0, toRunning); !errors.Is(err, ErrConflict) {
 				t.Fatalf("版本 0 = %v, want ErrConflict", err)
 			}
-			// 过期版本。
-			if _, err := store.CompareAndSwap(ctx, "cas", created.Version+5, RunRecord{Status: StatusRunning}); !errors.Is(err, ErrConflict) {
-				t.Fatalf("过期版本 = %v, want ErrConflict", err)
+			// 版本比存储新也不行：冲突只按相等判断。
+			if _, err := store.CompareAndSwap(ctx, "cas", created.Version+5, toRunning); !errors.Is(err, ErrConflict) {
+				t.Fatalf("超前版本 = %v, want ErrConflict", err)
 			}
 			// CAS 里的 RunID 与目标不一致。
-			if _, err := store.CompareAndSwap(ctx, "cas", created.Version, RunRecord{RunID: "other", Status: StatusRunning}); !errors.Is(err, ErrInvalidRecord) {
+			mismatched := toRunning
+			mismatched.RunID = "other"
+			if _, err := store.CompareAndSwap(ctx, "cas", created.Version, mismatched); !errors.Is(err, ErrInvalidRecord) {
 				t.Fatalf("RunID 不一致 = %v, want ErrInvalidRecord", err)
 			}
-			// 空 RunID 既不能创建也不能比较。
+			// 空 RunID 不能创建。
 			if _, err := store.Create(ctx, RunRecord{ThreadID: "t", Status: StatusQueued}); !errors.Is(err, ErrInvalidRecord) {
 				t.Fatalf("空 RunID Create = %v, want ErrInvalidRecord", err)
 			}
-			// 状态机拒绝的写不改变 Version。
+			// 抢在他人之后再用旧版本写一次：内容合法，只有版本不对，所以必须冲突。
 			running, err := cas(t, store, "cas", created.Version, func(r *RunRecord) { r.Status = StatusRunning })
 			if err != nil {
 				t.Fatalf("queued→running 应允许: %v", err)
 			}
+			if _, err := store.CompareAndSwap(ctx, "cas", created.Version, toRunning); !errors.Is(err, ErrConflict) {
+				t.Fatalf("旧版本重放 = %v, want ErrConflict", err)
+			}
+			// 状态机拒绝的写不改变 Version。
 			if _, err := cas(t, store, "cas", running.Version, func(r *RunRecord) { r.Status = StatusQueued }); !errors.Is(err, ErrInvalidTransition) {
 				t.Fatalf("running→queued 应 ErrInvalidTransition, got %v", err)
 			}
@@ -661,10 +705,11 @@ func TestRunConcurrentSameVersionOnlyOneWins(t *testing.T) {
 				wg.Add(1)
 				go func(i int) {
 					defer wg.Done()
+					// 每个竞争者都提交同样合法的领取：内容不出错，输赢只由版本决定。
 					attempt := created
 					attempt.Status = StatusRunning
-					attempt.WorkerID = "w"
-					attempt.WorkerEpoch = uint64(i + 1)
+					attempt.WorkerID = "w1"
+					attempt.WorkerEpoch = 1
 					<-start
 					_, err := store.CompareAndSwap(ctx, "contend", created.Version, attempt)
 					results[i] = err
@@ -677,8 +722,8 @@ func TestRunConcurrentSameVersionOnlyOneWins(t *testing.T) {
 			for _, err := range results {
 				if err == nil {
 					winners++
-				} else if !errors.Is(err, ErrConflict) && !errors.Is(err, ErrOwnershipLost) {
-					t.Fatalf("竞争失败方应只报冲突或失所有权: %v", err)
+				} else if !errors.Is(err, ErrConflict) {
+					t.Fatalf("竞争失败方应只报版本冲突: %v", err)
 				}
 			}
 			if winners != 1 {
