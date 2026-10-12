@@ -21,6 +21,13 @@ type durableRunState struct {
 	claim          *checkpoint.Claim
 	guard          *writeGuard
 	approvalEvents []core.ApprovalDecided
+
+	// boundary is the last checkpoint this run committed successfully, with the
+	// revision the store assigned it. A failed commit never touches it, so the
+	// pair always identifies a visible state of THIS run (ADR-0033 D4).
+	boundaryID       string
+	boundaryRevision uint64
+	boundarySet      bool
 }
 
 func newDurableRunState() *durableRunState {
@@ -83,6 +90,25 @@ func (rc *RunContext) durableClaim() *checkpoint.Claim {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return copyClaim(d.claim)
+}
+
+// noteCommittedBoundary records the checkpoint the store just made visible and
+// the revision it assigned. Only a successful durable commit reaches this.
+func (rc *RunContext) noteCommittedBoundary(id string, revision uint64) {
+	d := rc.ensureDurableState()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.boundaryID, d.boundaryRevision, d.boundarySet = id, revision, true
+}
+
+// committedBoundary returns the last durable commit this run made — inherited
+// head checkpoints are not part of it, so a run that never committed anything
+// reports no boundary instead of pretending one.
+func (rc *RunContext) committedBoundary() (id string, revision uint64, ok bool) {
+	d := rc.ensureDurableState()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.boundaryID, d.boundaryRevision, d.boundarySet
 }
 
 func (rc *RunContext) setDurableClaim(claim *checkpoint.Claim) {
@@ -176,6 +202,7 @@ func (rc *RunContext) commitCheckpoint(cp *checkpoint.Checkpoint, releaseClaim b
 	if err != nil {
 		return err
 	}
+	rc.noteCommittedBoundary(cp.ID, receipt.Revision)
 
 	d.mu.Lock()
 	ackSet := make(map[string]struct{}, len(acks))
