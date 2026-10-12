@@ -219,8 +219,14 @@ func applyFileSnapshot(st *core.State, snap map[string][]byte) error {
 // newRunHandle builds the per-run execution environment (RunContext) and its
 // Run handle. Shared by Stream and Resume.
 func (a *Agent) newRunHandle(ctx context.Context, threadID string, state *core.State) *Run {
+	return a.newRunHandleWithID(ctx, core.NewID("run"), threadID, state)
+}
+
+// newRunHandleWithID is newRunHandle with a caller-assigned run id, used by the managed
+// entry point so the identity a queue recorded is the identity the run executes under.
+// The id is fixed here and never regenerated or reassigned.
+func (a *Agent) newRunHandleWithID(ctx context.Context, runID, threadID string, state *core.State) *Run {
 	runCtx, cancel := context.WithCancel(ctx)
-	runID := core.NewID("run")
 	topic := bus.Topic(runID)
 	rc := &RunContext{
 		Context:  runCtx,

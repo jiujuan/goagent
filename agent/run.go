@@ -82,10 +82,12 @@ type Run struct {
 	boundaryOK       bool
 
 	// recordMu serializes building and committing this run's terminal record;
-	// recorded keeps the exact content so a retry is an identical commit.
-	recordMu   sync.Mutex
-	terminalID string
-	recorded   *checkpoint.Checkpoint
+	// recorded keeps the exact content so a retry is an identical commit, and
+	// recordedSet says a commit of it actually succeeded.
+	recordMu    sync.Mutex
+	terminalID  string
+	recorded    *checkpoint.Checkpoint
+	recordedSet bool
 }
 
 // Iter streams the run's events as a pull iterator. The run starts on first

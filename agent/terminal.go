@@ -135,7 +135,20 @@ func (a *Agent) RecordCompletion(ctx context.Context, run *Run) error {
 	}); err != nil {
 		return fmt.Errorf("agent: record completion: commit at revision %d: %w", boundaryRevision, err)
 	}
+	run.recordedSet = true
 	return nil
+}
+
+// RecordedBoundary reports the terminal checkpoint record this run committed. It is
+// only available after a successful RecordCompletion, and the reference is the record
+// this agent built — not the thread's current head, which a later run can move.
+func (r *Run) RecordedBoundary() (*checkpoint.Ref, bool) {
+	r.recordMu.Lock()
+	defer r.recordMu.Unlock()
+	if !r.recordedSet || r.recorded == nil {
+		return nil, false
+	}
+	return &checkpoint.Ref{ThreadID: r.recorded.ThreadID, CheckpointID: r.recorded.ID}, true
 }
 
 // buildTerminalRecord reads the frozen boundary back and copies it into an
