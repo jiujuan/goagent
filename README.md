@@ -32,7 +32,7 @@
 | 安全执行与外部工具 | 提供受策略约束的命令沙箱（`sandbox`）、MCP 客户端（`tool/mcp`）以及网页搜索/抓取工具（`tool/web`）。 |
 | 多模型与多模态 | `llm` 抽象与厂商解耦，含 Anthropic、OpenAI 兼容接口、Agnes 适配与 Mock；`llm/agnes` 客户端另提供图像生成与可轮询/恢复的视频任务。 |
 | 韧性与可观测性 | `llm` 韧性层支持多供应商回退与熔断；`obs/otel` 接入 OpenTelemetry 追踪；`logger` 基于 zerolog；`config` 基于 viper；`eval` 提供打分/评测。 |
-| 异步任务与事件总线 | `queue` 支持内存队列与 Redis Stream，由 Worker 池后台处理；`bus` 提供进程内 pub/sub，Redis 后端可跨进程发送进度事件。 |
+| 异步任务与事件总线 | `queue` 支持内存队列与 Redis Stream，由 Worker 池后台处理；`bus` 只有进程内 pub/sub，跨进程发送进度事件用 `queue` 的 Redis 后端（`queue.NewBus(queue.WithRedis(url))`，实现见 `queue/redis_pubsub.go`，持久化队列见 `queue/redis_stream.go`）。 |
 
 ## 架构设计
 
@@ -244,6 +244,7 @@ go run ./examples/quickstart
 | --- | --- | --- |
 | `persistent` | `go run ./examples/persistent` | 基于文件检查点的跨进程持久化运行；多次运行可见历史增长。 |
 | `background` | `go run ./examples/background` | 队列驱动的后台执行：入队任务由 Worker 处理。 |
+| `background-status` | `go run ./examples/background-status` | 后台运行的落盘与查询：`Handle.WaitRecorded` 确认终态记录、`Agent.RunStatus` 从文件存储读回状态与文件。 |
 | `redis` | `go run ./examples/redis` | 基于 Redis 的持久化后台队列（需先启动 Redis）。 |
 | `resilience` | `go run ./examples/resilience` | LLM 韧性层：多供应商回退与熔断。 |
 | `config` | `go run ./examples/config` | 配置系统（基于 viper）的完整用法。 |
@@ -278,6 +279,18 @@ go run ./examples/quickstart
 - Memory/File 默认实现线程协调。第三方 checkpointer 只有显式实现 `checkpoint.ThreadCoordinator` 才有同等跨实例保证；可用 `agent.WithThreadCoordinationRequired(true)` 在 `agent.New` 时强制检查。
 - `vfs.InState` 等 `core.Snapshottable` 后端会进入快照。真实目录或远端等外部托管后端需要在每个恢复进程重新传 `agent.WithRunFiles`，其内容不随时间旅行回滚。
 - `checkpoint.Fork` 现在返回 `(*checkpoint.Checkpoint, error)`，且只构造未保存的分支快照；调用方必须检查错误并显式 `Save`。完整迁移方式和并发边界见 [ADR-0032](docs/adr/ADR-0032-session-snapshot-consistency.md)。
+
+### 后台运行的终态与状态查询
+
+- 归属：入队成功后运行归队列所有。取消传给 `EnqueueAgent` 的 context 只结束提交这一侧；`Pool` 的 context 取消只是停止取新任务并等待在途任务。要中止一次已经跑起来的后台运行，用 `Handle.Cancel`（同时中止运行并释放队列持有的执行 context）。
+- 两个终点：`Handle.Wait` 只说"运行结束了"；`Handle.WaitRecorded` 还要等 worker 把这次运行的终态记录写进存储，返回 `errors.Join(运行错误, 记录错误)`。completed 且错误为 nil 才是"记录已确认"；暂停的运行没有终态可记，返回结果与 nil 记录错误。没有任何 worker 消费的任务，`WaitRecorded` 会一直等下去——它是等 worker，不自己驱动运行。
+- 谁写终态：只有 `Agent.RecordCompletion(ctx, run)`（队列在运行结束后调用它）。默认前台 `Run`/`Stream`/`Resume` 不写终态记录。它拒绝：`nil` 运行（`agent.ErrNoRun`）、别的 Agent 的运行（`agent.ErrRunNotOwned`）、未结束（`agent.ErrRunNotFinished`）、暂停（`agent.ErrRunPaused`）、这次运行没有自己的成功提交边界（`agent.ErrNoCommittedBoundary`）、存储不支持原子追加（`checkpoint.ErrDurableUnavailable`，不会退回普通 `Save`）。
+- 怎么写：从冻结的提交边界 `Load` 并核对线程/ID/revision，克隆状态与文件快照，用 `ExpectedRevision` 追加一条带 `Completion` 的快照。head 已被别的运行推进 → `checkpoint.ErrRevisionConflict`；线程被别人占着 → `checkpoint.ErrClaimConflict`；本次租约过期 → `checkpoint.ErrStaleFencingToken`。框架不会读新 head 再把旧终态改写一遍——遇到冲突就接受冲突，用 `RunStatus` 看当前事实，要不要再记录由那一轮自己决定。
+- 崩溃窗口：进程在记录写完之前退出，这次运行就没有终态记录；存储里的 head 是运行中间提交的那一条，可以直接恢复继续跑，但不要把它当"本次运行的结果"。无人等待 `WaitRecorded` 时，框架不会主动通知记录失败。
+- 三条时间线各管一件事：记录写入用 `context.WithoutCancel` 派生的 30 秒期限，只约束这次 I/O 的合作式等待（存储自己不看 context 就拦不住）；整次运行的挂钟归 `middleware.RunBudget.MaxDuration`，到点是"撤下工具、要一句最终回答"的正常收尾，不是打断在途调用；单个工具调用归 `agent.WithToolTimeout`，它才是能放弃不回应的工具的那条线。
+- `Agent.RunStatus(ctx, threadID)` 是纯读：不写、不取 claim、不续租。未知线程不是错误（`Exists=false`、`Latest=nil`），存储错误原样返回，非法线程 ID 在触达存储之前被拒。`Paused` 只说明 head 上有暂停或待办元数据，不保证 `Resume` 一定成功（审批、租约、恢复类型仍要过）。head 上的 `Completion` 属于写下它的那次运行：新一轮可能已经开始但还没提交任何东西，此时读到的还是上一轮的终态——不能读成"当前没有在跑"。
+
+保持不做：公开 detach API、事件重放、跨进程 agent job、"正在运行"登记表、整次运行的硬期限、前台路径自动写终态记录。
 
 ## 目录概览
 
