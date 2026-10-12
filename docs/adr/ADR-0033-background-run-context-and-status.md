@@ -151,4 +151,4 @@ freezeCheckpoint/cloneCheckpoint 必须深拷贝 Completion，Result.Message 使
 
 ## 实施结果
 
-由 BC-06 回填实际命令、结果与偏离。2026-10-12：D1/D2 的队列 context 归属与释放已由 BC-01 落地（`queue/agent_bridge.go`，V1 由 `queue/agent_bridge_test.go` 覆盖并通过，含 `-race ./queue`），执行记录与三条偏离见 `docs/tasks/plan-background-run-context-and-status.md` 的 BC-01 卡。D3–D5 与 V2–V9 尚未实施。
+由 BC-06 回填实际命令、结果与偏离。2026-10-12：D1/D2 的队列 context 归属与释放已由 BC-01 落地（`queue/agent_bridge.go`，V1 由 `queue/agent_bridge_test.go` 覆盖并通过，含 `-race ./queue`）；D4 的数据形状由 BC-02 落地（`checkpoint.Completion` 与 `CompletionCompleted`/`CompletionFailed`、`Checkpoint.completion,omitempty` 的 Memory/File 往返、深拷贝与 Fork 清除，V3 由 `checkpoint/completion_contract_test.go` 覆盖并通过）。执行记录与偏离见 `docs/tasks/plan-background-run-context-and-status.md` 的 BC-01、BC-02 卡。`Agent.RecordCompletion`、`Run.Paused`、`Handle.WaitRecorded`、`Agent.RunStatus` 仍未实施，V2、V4–V9 尚未执行。

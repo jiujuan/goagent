@@ -2,7 +2,7 @@
 
 > 执行者说明：按 executing-plans 技能串行执行 BC-01 至 BC-06，先写对应失败测试，再做最小实现，检查通过后勾选。本文接口与测试均为待实施设计，不能描述为当前已有能力。使用符号名定位代码，不依赖旧稿行号。
 
-- 日期：2026-10-12；状态：BC-01 已完成（见该卡执行记录），BC-02 至 BC-06 未开工。
+- 日期：2026-10-12；状态：BC-01、BC-02 已完成（见各卡执行记录），BC-03 至 BC-06 未开工。
 - 依据：[ADR-0033](../adr/ADR-0033-background-run-context-and-status.md) 的审核修订版 D1–D6、V1–V9。
 - 工作目录：D:/codeproject/mygo/goagent。下文文件路径均相对此目录。
 - 未开工的卡片所写接口与测试仍是设计，不能描述为当前已有能力；已落地范围以各卡执行记录为准。
@@ -121,16 +121,37 @@ BC-01 与 BC-04 同改 queue/agent_bridge.go；BC-03 会修改 agent/run.go、ag
 
 ### BC-02：Completion 与快照数据边界
 
-**状态：** 待实施。**文件：** 修改 checkpoint/checkpoint.go、checkpoint/snapshot.go、checkpoint/branch.go；新增 checkpoint/completion_contract_test.go。
+**状态：** 已完成（2026-10-12）。**文件：** 修改 checkpoint/checkpoint.go、checkpoint/snapshot.go、checkpoint/branch.go；新增 checkpoint/completion_contract_test.go。
 
-- [ ] 增 Completion 可选字段、JSON 标签和 completed/failed 常量；先写 Memory/File 往返失败测试。
-- [ ] TestCompletionFrozenAcrossStores：覆盖输入与 Load/Latest/History 返回对象修改，含 Result.Message 内部可变数据，历史不受影响。
-- [ ] TestCompletionLegacyReadable：使用现有 JSONL 格式夹具覆盖不含 completion 的旧记录，加入新记录并重开可读。
-- [ ] TestCompletionForkClearsTerminal：从终态 Fork 清除 Completion，文件内容保持；覆盖 FileSnapshot nil 与非 nil 空映射。
-- [ ] freezeCheckpoint/cloneCheckpoint 深拷贝新增字段，传播 CloneMessage 错误；本卡不增加生产者。
-- [ ] 运行 go test ./checkpoint -count=1；go vet ./checkpoint；记录结果。
+- [x] 增 Completion 可选字段、JSON 标签和 completed/failed 常量；先写 Memory/File 往返失败测试。
+- [x] TestCompletionFrozenAcrossStores：覆盖输入与 Load/Latest/History 返回对象修改，含 Result.Message 内部可变数据，历史不受影响。
+- [x] TestCompletionLegacyReadable：使用现有 JSONL 格式夹具覆盖不含 completion 的旧记录，加入新记录并重开可读。
+- [x] TestCompletionForkClearsTerminal：从终态 Fork 清除 Completion，文件内容保持；覆盖 FileSnapshot nil 与非 nil 空映射。
+- [x] freezeCheckpoint/cloneCheckpoint 深拷贝新增字段，传播 CloneMessage 错误；本卡不增加生产者。
+- [x] 运行 go test ./checkpoint -count=1；go vet ./checkpoint；记录结果。
 
 **验收：** V3，现有快照不可变性契约不退化。
+
+**执行记录（2026-10-12）：**
+
+实现形状：`checkpoint.Completion{RunID,Kind,Result,Err}` + `CompletionCompleted`/`CompletionFailed` 常量 + `Checkpoint.Completion *Completion \`json:"completion,omitempty"\``；`cloneCheckpoint` 经 `cloneCompletion` 深拷贝（结果走 `core.CloneMessage`，错误原样传播），`Fork` 置 `child.Completion = nil`。File 后端无需改格式：`checkpointRecord` 内嵌 `*Checkpoint`，字段随快照行自动写出与读回。
+
+| 命令 | 结果 |
+| --- | --- |
+| 实现前先跑测试 | `go vet ./checkpoint` 报 `undefined: checkpoint.Completion`（红） |
+| `go test ./checkpoint -count=1` | ok（1.5s，含既有快照一致性契约用例） |
+| `go vet ./checkpoint`、`go vet ./...` | 退出 0 |
+| `go test -race ./checkpoint ./agent ./queue -count=1` | 三个包 ok |
+| `go build ./...`、`go test ./... -count=1` | 退出 0，无 FAIL |
+
+测试：`TestCompletionRoundTripAcrossStores`（卡上"往返失败测试"的具名用例，memory/file 各一轮，file 走 reopen）、`TestCompletionJSONShape`（空终态不写 `completion` 键；有终态时 `run_id`/`kind`/`result` 齐备、空 `err` 不序列化）、`TestCompletionFrozenAcrossStores`、`TestCompletionLegacyReadable`、`TestCompletionForkClearsTerminal`（三种文件快照：nil / 非 nil 空 / 有内容）。
+
+变异检查（每次只改一处实现，确认对应测试会失败）：`cloneCheckpoint` 不拷 Completion → Frozen 失败；`cloneCompletion` 改浅拷贝共享 Result 指针 → Frozen 报"工具参数未深拷贝"；`Fork` 不清 Completion → ForkClearsTerminal 三个子用例全失败；去掉 `omitempty` → JSONShape 与 LegacyReadable 都失败（旧记录夹具断言里也当场暴露多余键）。
+
+**本卡的两点登记：**
+
+1. `cloneCompletion` 的 CloneMessage 错误分支没有专门用例：`core.Part` 带非导出标记方法 `isPart()`，包外测试无法构造"不可克隆的 part"，而 `core` 的 6 个导出 part（Text/Thinking/Image/Video/ToolCall/ToolResult）都可克隆。代码仍按契约返回错误，与 `cloneToolExecution` 同一条 `core.CloneMessage` 路径；不为此在 `core` 开测试后门。
+2. 交给 BC-03 决策：提交摘要 `commitRequestDigest` 覆盖 ID/ThreadID/ParentID/Step/State/Pending/Pause/FileSnapshot，不含 Completion（`checkpoint/coordinator.go`）。两个 ID 相同、仅终态内容不同的提交因此摘要一致，会被 store 当作幂等重复而返回成功并保留先写入的内容。ADR D4 只要求"同 ID 同内容"幂等成功，调用方缓存不可变记录也保证了重试内容一致，但如果希望"同 ID 不同终态"能报冲突，需要在 BC-03 把 Completion 纳入摘要。本卡未动摘要，避免与并发契约混在一起。
 
 ### BC-03：结束凭据与 RecordCompletion
 
