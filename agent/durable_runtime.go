@@ -22,9 +22,10 @@ type durableRunState struct {
 	guard          *writeGuard
 	approvalEvents []core.ApprovalDecided
 
-	// boundary is the last checkpoint this run committed successfully, with the
-	// revision the store assigned it. A failed commit never touches it, so the
-	// pair always identifies a visible state of THIS run (ADR-0033 D4).
+	// boundary is the highest-revision checkpoint this run committed
+	// successfully, with the revision the store assigned it. A failed commit
+	// never touches it, so the pair always identifies a visible state of THIS
+	// run (ADR-0033 D4).
 	boundaryID       string
 	boundaryRevision uint64
 	boundarySet      bool
@@ -94,16 +95,24 @@ func (rc *RunContext) durableClaim() *checkpoint.Claim {
 
 // noteCommittedBoundary records the checkpoint the store just made visible and
 // the revision it assigned. Only a successful durable commit reaches this.
+// Parallel branches share one durable state and commit concurrently, so a
+// receipt can arrive after a later commit has already been recorded: the
+// boundary only moves forward to a higher revision, and the ID and revision are
+// replaced together so no reader can pair one commit's ID with another's
+// revision.
 func (rc *RunContext) noteCommittedBoundary(id string, revision uint64) {
 	d := rc.ensureDurableState()
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.boundarySet && revision <= d.boundaryRevision {
+		return
+	}
 	d.boundaryID, d.boundaryRevision, d.boundarySet = id, revision, true
 }
 
-// committedBoundary returns the last durable commit this run made — inherited
-// head checkpoints are not part of it, so a run that never committed anything
-// reports no boundary instead of pretending one.
+// committedBoundary returns the highest-revision durable commit this run made —
+// inherited head checkpoints are not part of it, so a run that never committed
+// anything reports no boundary instead of pretending one.
 func (rc *RunContext) committedBoundary() (id string, revision uint64, ok bool) {
 	d := rc.ensureDurableState()
 	d.mu.Lock()
