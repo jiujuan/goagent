@@ -7,10 +7,6 @@ import (
 	"github.com/jiujuan/goagent/core"
 )
 
-// lineageNow is the clock a newly constructed record uses for its creation time.
-// Tests replace it so a retried construction stays deterministic.
-var lineageNow = func() time.Time { return time.Now().UTC() }
-
 // Fork creates a new checkpoint that branches off parent onto a new thread. It
 // copies parent's snapshot and links back via ParentID, so the snapshot tree
 // records "the same history point, a different continuation" — the basis for
@@ -52,9 +48,12 @@ func Fork(parent *Checkpoint, newThreadID, newID string) (*Checkpoint, error) {
 	// the parent's terminal record (ADR-0033 D4). The file snapshot keeps copying.
 	child.Completion = nil
 	// Nor does it inherit which run or turn produced the parent: the branch's own
-	// first input opens a new turn, and its creation time is its own.
+	// first input opens a new turn. The creation time is left unassigned so the
+	// commit that first makes the branch visible stamps it — rebuilding the same
+	// Fork request therefore stays byte-identical and retries as an idempotent
+	// confirmation instead of a conflict (ADR-0034 D2).
 	child.RunID = ""
 	child.TurnID = ""
-	child.CreatedAt = lineageNow()
+	child.CreatedAt = time.Time{}
 	return child, nil
 }

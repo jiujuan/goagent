@@ -146,6 +146,12 @@ func (m *Memory) commitLocked(req CommitRequest) (CommitReceipt, error) {
 
 	revision := st.revision + 1
 	stored.Revision = revision
+	// A record constructed without a creation time gets one when it first becomes
+	// visible. An idempotent retry above returned before this point, so the stored
+	// record keeps the time it was first committed with.
+	if stored.CreatedAt.IsZero() {
+		stored.CreatedAt = m.nowTime().UTC()
+	}
 	claim := renewedClaim(st, req, now)
 
 	st.revision = revision

@@ -156,8 +156,13 @@ func TestMetadataRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatalf("load legacy: %v", err)
 			}
-			if gotLegacy.ParentRef != nil || gotLegacy.RunID != "" || gotLegacy.TurnID != "" || !gotLegacy.CreatedAt.IsZero() {
-				t.Fatalf("旧记录被补写了元数据: %+v / %q %q %s", gotLegacy.ParentRef, gotLegacy.RunID, gotLegacy.TurnID, gotLegacy.CreatedAt)
+			if gotLegacy.ParentRef != nil || gotLegacy.RunID != "" || gotLegacy.TurnID != "" {
+				t.Fatalf("旧形状记录被补造了归属或运行身份: %+v / %q %q", gotLegacy.ParentRef, gotLegacy.RunID, gotLegacy.TurnID)
+			}
+			// 新写入的记录即使没带创建时间，也会在首次可见时由 store 补一个，
+			// 这样重建同一请求仍能按原摘要幂等确认。
+			if gotLegacy.CreatedAt.IsZero() {
+				t.Fatal("新写入的旧形状记录没有分配创建时间")
 			}
 		})
 	}
@@ -329,11 +334,6 @@ func TestForkLineageMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	forkTime := lineageTime(7)
-	prevClock := lineageNow
-	lineageNow = func() time.Time { return forkTime }
-	t.Cleanup(func() { lineageNow = prevClock })
-
 	child, err := Fork(parent, "fork-child", "fork-child-cp")
 	if err != nil {
 		t.Fatal(err)
@@ -347,8 +347,10 @@ func TestForkLineageMetadata(t *testing.T) {
 	if child.ParentID != "fork-parent" {
 		t.Fatalf("Fork 的 ParentID = %q", child.ParentID)
 	}
-	if !child.CreatedAt.Equal(forkTime) {
-		t.Fatalf("Fork 的创建时间 = %s, want 重新分配的 %s", child.CreatedAt, forkTime)
+	// 分支不继承父记录的创建时间；时间由首次可见的提交分配，这样重建同一个
+	// Fork 请求不会再因为时间不同被判成冲突。
+	if !child.CreatedAt.IsZero() {
+		t.Fatalf("Fork 继承了父记录的创建时间: %s", child.CreatedAt)
 	}
 
 	// 同一请求的提交重试必须得到同一摘要，否则幂等重试会被误判成冲突。
@@ -376,6 +378,102 @@ func TestForkLineageMetadata(t *testing.T) {
 	}
 	if want := (Ref{ThreadID: "legacy-thread", CheckpointID: "legacy-parent"}); legacyChild.ParentRef == nil || *legacyChild.ParentRef != want {
 		t.Fatalf("旧父记录 fork 后 ParentRef = %+v, want %+v", legacyChild.ParentRef, want)
+	}
+}
+
+// TestCommitAssignsCreatedAtOnce：没有构造时间的记录在首次可见时由 store 补上
+// UTC 时间；调用方显式给出的时间保持不变；重建同一请求（store 时钟往前走）
+// 仍是幂等确认，不改写已落盘的时间。
+func TestCommitAssignsCreatedAtOnce(t *testing.T) {
+	ctx := context.Background()
+	threadID := "created-at-once"
+	firstTime := lineageTime(1)
+	laterTime := lineageTime(9)
+
+	for _, storeName := range []string{"memory", "file"} {
+		t.Run(storeName, func(t *testing.T) {
+			clock := firstTime
+			now := func() time.Time { return clock }
+			dir := t.TempDir()
+			open := func() Checkpointer {
+				if storeName == "memory" {
+					m := NewMemory()
+					m.now = now
+					return m
+				}
+				f, err := NewFile(dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				f.now = now
+				return f
+			}
+			store := open()
+			rebuild := func() *Checkpoint {
+				return &Checkpoint{
+					ID:       "stamp-cp",
+					ThreadID: threadID,
+					Step:     1,
+					State:    core.State{Messages: []core.Message{core.UserText("提问")}},
+				}
+			}
+			if err := store.Save(ctx, rebuild()); err != nil {
+				t.Fatal(err)
+			}
+			stored, err := store.Load(ctx, threadID, "stamp-cp")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !stored.CreatedAt.Equal(firstTime) {
+				t.Fatalf("首次可见没有分配创建时间: %s, want %s", stored.CreatedAt, firstTime)
+			}
+			if stored.CreatedAt.Location() != time.UTC {
+				t.Fatalf("创建时间不是 UTC: %s", stored.CreatedAt)
+			}
+
+			// 重建同一请求，store 时钟已经往前走；File 用新实例证明落盘后可重认。
+			clock = laterTime
+			advanced := store
+			if storeName == "file" {
+				advanced = open()
+			}
+			if err := advanced.Save(ctx, rebuild()); err != nil {
+				t.Fatalf("时钟推进后重建同一请求被判冲突: %v", err)
+			}
+			again, err := advanced.Load(ctx, threadID, "stamp-cp")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !again.CreatedAt.Equal(firstTime) {
+				t.Fatalf("幂等重试改写了已落盘的创建时间: %s", again.CreatedAt)
+			}
+			hist, err := advanced.History(ctx, threadID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(hist) != 1 {
+				t.Fatalf("幂等重试追加了记录: %d", len(hist))
+			}
+
+			// 调用方给的时间不被覆盖。
+			caller := &Checkpoint{
+				ID:        "stamp-caller",
+				ThreadID:  threadID,
+				Step:      2,
+				CreatedAt: lineageTime(5),
+				ParentID:  "stamp-cp",
+			}
+			if err := advanced.Save(ctx, caller); err != nil {
+				t.Fatal(err)
+			}
+			got, err := advanced.Load(ctx, threadID, "stamp-caller")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !got.CreatedAt.Equal(lineageTime(5)) {
+				t.Fatalf("store 改写了调用方给出的创建时间: %s", got.CreatedAt)
+			}
+		})
 	}
 }
 

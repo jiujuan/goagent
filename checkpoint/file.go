@@ -254,6 +254,13 @@ func (f *File) commitLocked(threadID string, st *fileState, req CommitRequest) (
 	}
 
 	stored.Revision = st.revision + 1
+	// A record constructed without a creation time gets one when it first becomes
+	// visible. The idempotent retry above returned before this point, so a re-send
+	// of the same request never rewrites the time already in the journal, and the
+	// recorded digest stays the one computed without it.
+	if stored.CreatedAt.IsZero() {
+		stored.CreatedAt = now.UTC()
+	}
 	checkpoint, blobRecords, newHashes, err := buildCheckpointRecord(stored, st.blobs)
 	if err != nil {
 		return CommitReceipt{}, err
