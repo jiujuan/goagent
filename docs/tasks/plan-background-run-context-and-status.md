@@ -148,10 +148,24 @@ BC-01 与 BC-04 同改 queue/agent_bridge.go；BC-03 会修改 agent/run.go、ag
 
 变异检查（每次只改一处实现，确认对应测试会失败）：`cloneCheckpoint` 不拷 Completion → Frozen 失败；`cloneCompletion` 改浅拷贝共享 Result 指针 → Frozen 报"工具参数未深拷贝"；`Fork` 不清 Completion → ForkClearsTerminal 三个子用例全失败；去掉 `omitempty` → JSONShape 与 LegacyReadable 都失败（旧记录夹具断言里也当场暴露多余键）。
 
-**本卡的两点登记：**
+**`065edb9` 复核发现的缺陷与修复：**
+
+`checkpoint.Completion` 当时没有进入提交摘要 `commitRequestDigest`（只覆盖 ID/ThreadID/ParentID/Step/State/Pending/Pause/FileSnapshot），于是同 ID、仅终态内容不同的两次提交摘要相同，Memory 与 File 都把它当作幂等重试返回成功并保留先写入的终态——违反"只有同 ID 同内容才幂等成功"。修复：`commitDigestCheckpoint` 新增 `Completion *commitDigestCompletion` 字段（`omitempty`，位置在 Pause 与 FileSnapshot 之间），`makeCommitDigestCompletion` 折叠 RunID/Kind/Err 与经 `makeCommitDigestMessage` 转换的 Result；nil 终态时该键缺席，因此无终态记录的摘要与修复前逐字节一致，旧日志的幂等重试不受影响。
+
+新增测试（`checkpoint/completion_contract_test.go`）：`TestCompletionDigestKeepsNilBaseline`（钉住无终态记录的修复前摘要基准值，并重开后同内容重试仍成功、不追加记录）、`TestCompletionDigestDistinguishesTerminal`（memory/file 各自独立实例：同内容重试成功；RunID/Kind/Err/结果文本/结果内部字节/结果 nil 化/终态整体 nil 七种变化都返回 `ErrCheckpointConflict`，冲突后存储内容与条数不变；再加"先 nil 后非 nil"反方向）。
+
+| 命令（修复后） | 结果 |
+| --- | --- |
+| `go test ./checkpoint -run 'TestCompletionDigest' -count=1 -v` | 18 个子用例全 PASS |
+| `go test ./checkpoint -count=1`、`go vet ./...`、`go build ./...` | 通过，退出 0 |
+| `go test ./... -count=1` | 退出 0，无 FAIL |
+| `go test -race ./checkpoint ./agent ./queue -count=1` | 三个包 ok |
+
+摘要相关的变异检查：摘要重新不带 Completion → 七种变化子用例在 memory/file 全部报"应冲突，实际: <nil>"（正是复核复现的缺陷）；摘要结构去掉 `omitempty` → 基准值用例报"无终态快照的摘要变了"；只漏掉 `Err` → 仅"Err 不同"两个子用例失败。
+
+**本卡的其余登记：**
 
 1. `cloneCompletion` 的 CloneMessage 错误分支没有专门用例：`core.Part` 带非导出标记方法 `isPart()`，包外测试无法构造"不可克隆的 part"，而 `core` 的 6 个导出 part（Text/Thinking/Image/Video/ToolCall/ToolResult）都可克隆。代码仍按契约返回错误，与 `cloneToolExecution` 同一条 `core.CloneMessage` 路径；不为此在 `core` 开测试后门。
-2. 交给 BC-03 决策：提交摘要 `commitRequestDigest` 覆盖 ID/ThreadID/ParentID/Step/State/Pending/Pause/FileSnapshot，不含 Completion（`checkpoint/coordinator.go`）。两个 ID 相同、仅终态内容不同的提交因此摘要一致，会被 store 当作幂等重复而返回成功并保留先写入的内容。ADR D4 只要求"同 ID 同内容"幂等成功，调用方缓存不可变记录也保证了重试内容一致，但如果希望"同 ID 不同终态"能报冲突，需要在 BC-03 把 Completion 纳入摘要。本卡未动摘要，避免与并发契约混在一起。
 
 ### BC-03：结束凭据与 RecordCompletion
 
