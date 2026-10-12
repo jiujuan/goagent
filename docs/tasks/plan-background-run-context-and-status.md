@@ -105,17 +105,19 @@ BC-01 与 BC-04 同改 queue/agent_bridge.go；BC-03 会修改 agent/run.go、ag
 | --- | --- |
 | `go test ./queue -run '^TestQueue' -count=1` | ok，6 个顶层用例（含暂停收尾子用例）全绿 |
 | `go test -race ./queue -count=1` | ok（1.2s） |
+| `go test -race ./queue -run 'TestMemBusConcurrent' -count=20` | ok（6.8s，补测后复跑） |
 | `go build ./...`、`go vet ./...` | 无输出、退出 0 |
 | `go test ./... -count=1` | 退出 0，31 个包 ok，无 FAIL |
 | `go run ./examples/background` | 五个任务全部完成，输出与改动前一致 |
 
 实现前的失败测试确认：把派生 ctx 改回 `context.WithCancel(ctx)`（即旧行为）后，TestQueueCallerCancelDoesNotStopRun 在"提交方取消：执行 context 不应结束"处失败。逐项变异检查（每次只删一处，其余全绿即视为无效测试）：删 `context.WithoutCancel` → 提交方取消用例失败；删闭包 `defer h.cancelWork()` → 正常/失败/暂停三条收尾用例失败；删 `Handle.Cancel` 内的 `h.cancelWork()` → 仅新增的未消费任务用例失败；删入口 `ctx.Err()` 检查 → TestQueueEnqueueFailsWithCanceledCaller 失败；删入队失败分支的释放 → TestQueueEnqueueFailureReleasesContext 失败。
 
-**与卡的偏离（三条，均已核实）：**
+**与卡的偏离（四条，均已核实）：**
 
 1. 新增卡外用例 TestQueueHandleCancelReleasesUnstartedJob。Handle.Cancel 里那次 `cancelWork()` 在"任务已被 worker 消费"的路径上与闭包 defer 重复，删掉它其余用例仍全绿；只有任务未被取走（没有闭包会运行）才能证明这一层独立存在。变异检查结果见上表。
 2. 实现把 EnqueueAgent 的主体拆到包内函数 `submitAgentRun`，导出函数只是它的薄包装：入队失败时不能向调用方返回 Handle，而包内测试需要那个 Handle 上的 `workDone` 才能检查释放。公开签名与契约未变。
-3. 顺带修复 queue/bus.go 的既有数据竞争（不在本卡文件清单内）：`MemBus.Publish` 原先在锁外向订阅通道发送，与 `Subscribe` 的 cancel 关闭通道相竞争，HEAD `44e106b` 的 `go test -race ./queue` 即可复现 TestBridgeForwardsEvents 失败，直接挡住本卡的 -race 验收。修法是把非阻塞发送放回锁内，投递语义（丢事件、不阻塞发布方）不变，queue/bus_test.go 断言未改。
+3. 顺带修复 queue/bus.go 的既有数据竞争（不在本卡文件清单内）：`MemBus.Publish` 原先在锁外向订阅通道发送，与 `Subscribe` 的 cancel 关闭通道相竞争，HEAD `44e106b` 的 `go test -race ./queue` 即可复现 TestBridgeForwardsEvents 失败，直接挡住本卡的 -race 验收。修法是把非阻塞发送放回锁内，投递语义（丢事件、不阻塞发布方）不变，queue/bus_test.go 的既有断言未改。
+4. 上一条修复起初没有自己的回归测试（`3a22bdb` 只改实现），已补 `queue/bus_test.go` 四个用例（提交 `0b4b8ae`）：并发发布 × 订阅取消交错、Bridge 停在源通道时被取消、缓冲区写满只丢弃不卡发布方、一个慢订阅者不能拖住另一个读取者。实测效力：把实现换回修复前的版本，第一个用例在不带 -race 时就 panic `send on closed channel`（bus.go 的锁外发送）；在当前实现下 `-race -count=20` 连续通过。既有 TestBridgeForwardsEvents 的断言与文件行尾（CRLF）未动。
 
 ### BC-02：Completion 与快照数据边界
 
