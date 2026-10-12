@@ -49,8 +49,15 @@ type commitDigestCheckpoint struct {
 	Pause    *Pause                   `json:"pause,omitempty"`
 	// Completion is omitted when absent, so records committed before the terminal
 	// field keep producing the same digest as before it was added.
-	Completion   *commitDigestCompletion `json:"completion,omitempty"`
-	FileSnapshot map[string][]byte       `json:"file_snapshot"`
+	Completion *commitDigestCompletion `json:"completion,omitempty"`
+	// Lineage metadata is likewise omitted while absent: a checkpoint committed
+	// without run identity keeps the exact digest bytes it had before those
+	// fields existed, which is what makes an old journal retry stay idempotent.
+	ParentRef    *Ref              `json:"parent_ref,omitempty"`
+	RunID        string            `json:"run_id,omitempty"`
+	TurnID       string            `json:"turn_id,omitempty"`
+	CreatedAt    time.Time         `json:"created_at,omitzero"`
+	FileSnapshot map[string][]byte `json:"file_snapshot"`
 }
 
 type commitDigestCompletion struct {
@@ -170,6 +177,10 @@ func commitRequestDigest(cp *Checkpoint, ackMessageIDs []string, claim *Claim, e
 			Pending:      makeCommitDigestPending(cp.Pending),
 			Pause:        cp.Pause,
 			Completion:   completion,
+			ParentRef:    cp.ParentRef,
+			RunID:        cp.RunID,
+			TurnID:       cp.TurnID,
+			CreatedAt:    cp.CreatedAt,
 			FileSnapshot: cp.FileSnapshot,
 		},
 		AckMessageIDs:  acks,

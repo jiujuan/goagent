@@ -14,9 +14,19 @@ package checkpoint
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"github.com/jiujuan/goagent/core"
 )
+
+// Ref locates one checkpoint inside one thread. Lineage edges and result
+// boundaries carry a Ref rather than a bare checkpoint ID because a fork's
+// parent lives on another thread, where the ID alone cannot be resolved.
+type Ref struct {
+	ThreadID     string `json:"thread_id"`
+	CheckpointID string `json:"checkpoint_id"`
+}
 
 // Checkpoint is one snapshot of a run's state.
 type Checkpoint struct {
@@ -48,6 +58,20 @@ type Checkpoint struct {
 	// that never recorded a terminal state, read back nil.
 	Completion *Completion `json:"completion,omitempty"`
 
+	// ParentRef locates this snapshot's parent across threads. ParentID stays the
+	// tree edge that older readers use, and when both are present they must agree.
+	// A record with only ParentID is a legacy edge: its thread was never recorded,
+	// so a reader must not infer one (ADR-0034 D2).
+	ParentRef *Ref `json:"parent_ref,omitempty"`
+	// RunID and TurnID are the execution identity that committed this snapshot.
+	// One user turn can span several runs — the first plus each resume — so both
+	// are kept. They are empty on records committed before run identity existed.
+	RunID  string `json:"run_id,omitempty"`
+	TurnID string `json:"turn_id,omitempty"`
+	// CreatedAt is the UTC time this record was first constructed. A commit retry
+	// reuses it instead of re-stamping; records written before it existed stay zero.
+	CreatedAt time.Time `json:"created_at,omitzero"`
+
 	// FileSnapshot carries the run's file state, reconstructed at read time
 	// from the content-addressed blob records the File checkpointer persists
 	// (ADR-0026). It is deliberately not serialized inline here — State.Files
@@ -56,6 +80,24 @@ type Checkpoint struct {
 	// core.Restorable backend. nil means no portable file snapshot was supplied;
 	// a non-nil empty map is an explicit empty file view.
 	FileSnapshot map[string][]byte `json:"-"`
+}
+
+// validateLineage gates the lineage fields a writer supplies: a ParentRef is
+// either absent, as in every record written before it existed, or complete and
+// consistent with ParentID. Legacy records keep loading and re-saving unchanged;
+// only a newly written contradiction is rejected, because guessing a parent thread
+// would invent lineage the store never recorded.
+func validateLineage(cp *Checkpoint) error {
+	if cp == nil || cp.ParentRef == nil {
+		return nil
+	}
+	if cp.ParentRef.ThreadID == "" || cp.ParentRef.CheckpointID == "" {
+		return fmt.Errorf("checkpoint: parent ref %s/%s requires both a thread ID and a checkpoint ID", cp.ParentRef.ThreadID, cp.ParentRef.CheckpointID)
+	}
+	if cp.ParentID == "" || cp.ParentID != cp.ParentRef.CheckpointID {
+		return fmt.Errorf("checkpoint: parent ref points to checkpoint %q but parent_id is %q", cp.ParentRef.CheckpointID, cp.ParentID)
+	}
+	return nil
 }
 
 // PendingHITL captures the tool calls a run is blocked on at an interrupt.
