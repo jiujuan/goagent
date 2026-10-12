@@ -31,7 +31,8 @@ func (p *Pool) WithRegistry(reg Registry) *Pool {
 // Run drains the queue, running jobs concurrently up to the pool's limit. It
 // acks a job only on success, so a failed Redis job is redelivered. It blocks
 // until ctx is cancelled or the queue is closed and drained, then waits for
-// in-flight jobs.
+// in-flight jobs. Cancelling ctx stops job fetching only: work a job already
+// started keeps running (for background agent runs, see Handle.Cancel).
 func (p *Pool) Run(ctx context.Context) {
 	sem := make(chan struct{}, p.concurrency)
 	var wg sync.WaitGroup

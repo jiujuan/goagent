@@ -8,6 +8,12 @@
 //     delivery with retry + dead-letter. A closure cannot cross a process, so
 //     Redis jobs carry Type+Payload and the worker Pool rebuilds them from a
 //     Registry of Handlers.
+//
+// Agent-run jobs (EnqueueAgent) settle in two steps: the run ends, then the
+// worker writes that run's terminal record to the agent's checkpoint store.
+// Handle.Wait reports the first step, Handle.WaitRecorded both. Cancelling a
+// Pool's context stops dequeuing and waits for in-flight jobs — it does not stop
+// a run that is already executing; Handle.Cancel is how you do that.
 package queue
 
 import (
