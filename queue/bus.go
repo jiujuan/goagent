@@ -75,16 +75,13 @@ func (b *MemBus) Subscribe(key string) (<-chan core.Event, func()) {
 	return ch, cancel
 }
 
-// Publish implements Bus.
+// Publish implements Bus. Delivery stays under the lock: every send is a
+// non-blocking select, so a slow subscriber still drops events instead of
+// stalling the publisher, and cancel can never close a channel underneath a send.
 func (b *MemBus) Publish(key string, ev core.Event) {
 	b.mu.Lock()
-	chans := make([]chan core.Event, 0, len(b.subs[key]))
+	defer b.mu.Unlock()
 	for _, ch := range b.subs[key] {
-		chans = append(chans, ch)
-	}
-	b.mu.Unlock()
-
-	for _, ch := range chans {
 		select {
 		case ch <- ev:
 		default: // slow subscriber: drop
