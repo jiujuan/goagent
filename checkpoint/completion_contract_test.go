@@ -6,6 +6,7 @@ package checkpoint_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -478,4 +479,205 @@ func TestCompletionForkClearsTerminal(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- 提交摘要 ---------------------------------------------------------------
+
+// digestBaseline 是修改摘要之前，下面 digestFixture 这份"无终态"快照的提交摘要。
+// 用它钉住契约：Completion 缺席时摘要不变，旧日志的幂等重试不会被误判为冲突。
+const digestBaseline = "44d357aa58156e2b271a557a4c2c6713a571fd4987a8d1062bd1b8c1962ec2e2"
+
+func digestFixture(id string, cp *checkpoint.Completion) *checkpoint.Checkpoint {
+	return &checkpoint.Checkpoint{
+		ID:       id,
+		ThreadID: "digest-thread",
+		ParentID: "root",
+		Step:     3,
+		State: core.State{
+			Messages: []core.Message{core.UserText("原始提问"), core.AssistantText("回答")},
+			KV:       map[string]any{"k": "v"},
+		},
+		Completion: cp,
+	}
+}
+
+func digestTerminal() *checkpoint.Completion {
+	return &checkpoint.Completion{
+		RunID:  "run-A",
+		Kind:   checkpoint.CompletionCompleted,
+		Result: resultFixture("answer A", []byte(`{"key":"before"}`), []byte("imagex")),
+	}
+}
+
+// journalRequestDigest 取出 File 日志里某个检查点提交记录的外层摘要。
+func journalRequestDigest(t *testing.T, dir, threadID, checkpointID string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, threadID+".jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec struct {
+			Checkpoint *struct {
+				ID string `json:"id"`
+			} `json:"checkpoint"`
+			RequestDigest string `json:"request_digest"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil || rec.Checkpoint == nil {
+			continue
+		}
+		if rec.Checkpoint.ID == checkpointID && rec.RequestDigest != "" {
+			return rec.RequestDigest
+		}
+	}
+	t.Fatalf("日志里找不到 %s 的提交摘要", checkpointID)
+	return ""
+}
+
+// TestCompletionDigestKeepsNilBaseline：无终态快照的提交摘要必须与加入该字段之前
+// 一致，并且重开日志后同内容重试仍按幂等成功处理。
+func TestCompletionDigestKeepsNilBaseline(t *testing.T) {
+	dir := completionDir(t)
+	f, err := checkpoint.NewFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := f.Save(ctx, digestFixture("same-id", nil)); err != nil {
+		t.Fatal(err)
+	}
+	if got := journalRequestDigest(t, dir, "digest-thread", "same-id"); got != digestBaseline {
+		t.Fatalf("无终态快照的摘要变了：新=%s 基线=%s", got, digestBaseline)
+	}
+	reopened, err := checkpoint.NewFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Save(ctx, digestFixture("same-id", nil)); err != nil {
+		t.Fatalf("重开后同内容重试应幂等成功，实际: %v", err)
+	}
+	hist, err := reopened.History(ctx, "digest-thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 1 {
+		t.Fatalf("幂等重试追加了记录: %d", len(hist))
+	}
+}
+
+// TestCompletionDigestDistinguishesTerminal：只有同 ID 且终态内容完全相同才算重复；
+// 终态的每个字段、结果的内部字节，以及 nil 与非 nil 的切换都必须判为冲突，
+// 冲突后存储内容不变。Memory 与 File（含重开）都验证。
+func TestCompletionDigestDistinguishesTerminal(t *testing.T) {
+	ctx := context.Background()
+	for _, storeName := range []string{"memory", "file"} {
+		t.Run(storeName, func(t *testing.T) {
+			t.Run("同内容重试成功", func(t *testing.T) {
+				local := newDigestBackend(t, storeName)
+				if err := local.store.Save(ctx, digestFixture("same-id", digestTerminal())); err != nil {
+					t.Fatal(err)
+				}
+				if err := local.store.Save(ctx, digestFixture("same-id", digestTerminal())); err != nil {
+					t.Fatalf("同内容重试被拒: %v", err)
+				}
+				if err := local.reopen().Save(ctx, digestFixture("same-id", digestTerminal())); err != nil {
+					t.Fatalf("重开后同内容重试被拒: %v", err)
+				}
+				latest, err := local.reopen().Latest(ctx, "digest-thread")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if latest.Completion == nil || latest.Completion.RunID != "run-A" {
+					t.Fatalf("幂等重试改写了存储: %+v", latest.Completion)
+				}
+			})
+
+			conflicting := map[string]func(*checkpoint.Completion) *checkpoint.Completion{
+				"RunID 不同": func(c *checkpoint.Completion) *checkpoint.Completion { c.RunID = "run-B"; return c },
+				"Kind 不同":  func(c *checkpoint.Completion) *checkpoint.Completion { c.Kind = checkpoint.CompletionFailed; return c },
+				"Err 不同":   func(c *checkpoint.Completion) *checkpoint.Completion { c.Err = "failed B"; return c },
+				"结果文本不同": func(c *checkpoint.Completion) *checkpoint.Completion {
+					c.Result = resultFixture("answer B", []byte(`{"key":"before"}`), []byte("imagex"))
+					return c
+				},
+				"结果内部字节不同": func(c *checkpoint.Completion) *checkpoint.Completion {
+					c.Result = resultFixture("answer A", []byte(`{"key":"after!"}`), []byte("imagex"))
+					return c
+				},
+				"结果由非 nil 变 nil": func(c *checkpoint.Completion) *checkpoint.Completion { c.Result = nil; return c },
+				"终态整体变 nil":      func(c *checkpoint.Completion) *checkpoint.Completion { return nil },
+			}
+			for label, mutate := range conflicting {
+				t.Run(label, func(t *testing.T) {
+					local := newDigestBackend(t, storeName)
+					if err := local.store.Save(ctx, digestFixture("same-id", digestTerminal())); err != nil {
+						t.Fatal(err)
+					}
+					if err := local.store.Save(ctx, digestFixture("same-id", mutate(digestTerminal()))); !errors.Is(err, checkpoint.ErrCheckpointConflict) {
+						t.Fatalf("同 ID 不同终态应冲突，实际: %v", err)
+					}
+					// 冲突不能改写已存内容，也不能追加记录。
+					latest, err := local.reopen().Latest(ctx, "digest-thread")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if latest.Completion == nil || latest.Completion.RunID != "run-A" ||
+						latest.Completion.Kind != checkpoint.CompletionCompleted ||
+						latest.Completion.Err != "" || latest.Completion.Result == nil {
+						t.Fatalf("冲突请求改写了存储: %+v", latest.Completion)
+					}
+					args, image := mutablePayloads(t, latest.Completion)
+					if string(args) != `{"key":"before"}` || string(image) != "imagex" {
+						t.Fatalf("冲突请求改写了结果字节: %s / %s", args, image)
+					}
+					hist, err := local.reopen().History(ctx, "digest-thread")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(hist) != 1 {
+						t.Fatalf("冲突请求追加了记录: %d", len(hist))
+					}
+				})
+			}
+
+			// 反方向：先提交无终态，再提交带终态的同 ID 记录同样冲突。
+			t.Run("先 nil 后非 nil", func(t *testing.T) {
+				local := newDigestBackend(t, storeName)
+				if err := local.store.Save(ctx, digestFixture("same-id", nil)); err != nil {
+					t.Fatal(err)
+				}
+				if err := local.store.Save(ctx, digestFixture("same-id", digestTerminal())); !errors.Is(err, checkpoint.ErrCheckpointConflict) {
+					t.Fatalf("无终态记录被同 ID 终态覆盖应冲突，实际: %v", err)
+				}
+				latest, err := local.reopen().Latest(ctx, "digest-thread")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if latest.Completion != nil {
+					t.Fatalf("无终态记录被写入终态: %+v", latest.Completion)
+				}
+			})
+		})
+	}
+}
+
+// newDigestBackend 给每个子用例一套独立实例，避免同 ID 记录互相干扰。
+func newDigestBackend(t *testing.T, name string) backend {
+	t.Helper()
+	if name == "memory" {
+		m := checkpoint.NewMemory()
+		return backend{store: m, reopen: func() checkpoint.Checkpointer { return m }}
+	}
+	dir := t.TempDir()
+	open := func() checkpoint.Checkpointer {
+		f, err := checkpoint.NewFile(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	return backend{store: open(), reopen: open}
 }

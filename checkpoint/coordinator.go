@@ -40,14 +40,24 @@ type ThreadCoordinator interface {
 }
 
 type commitDigestCheckpoint struct {
-	ID           string                   `json:"id"`
-	ThreadID     string                   `json:"thread_id"`
-	ParentID     string                   `json:"parent_id,omitempty"`
-	Step         int                      `json:"step"`
-	State        commitDigestState        `json:"state"`
-	Pending      *commitDigestPendingHITL `json:"pending,omitempty"`
-	Pause        *Pause                   `json:"pause,omitempty"`
-	FileSnapshot map[string][]byte        `json:"file_snapshot"`
+	ID       string                   `json:"id"`
+	ThreadID string                   `json:"thread_id"`
+	ParentID string                   `json:"parent_id,omitempty"`
+	Step     int                      `json:"step"`
+	State    commitDigestState        `json:"state"`
+	Pending  *commitDigestPendingHITL `json:"pending,omitempty"`
+	Pause    *Pause                   `json:"pause,omitempty"`
+	// Completion is omitted when absent, so records committed before the terminal
+	// field keep producing the same digest as before it was added.
+	Completion   *commitDigestCompletion `json:"completion,omitempty"`
+	FileSnapshot map[string][]byte       `json:"file_snapshot"`
+}
+
+type commitDigestCompletion struct {
+	RunID  string               `json:"run_id"`
+	Kind   string               `json:"kind"`
+	Result *commitDigestMessage `json:"result,omitempty"`
+	Err    string               `json:"err,omitempty"`
 }
 
 type commitDigestState struct {
@@ -146,6 +156,10 @@ func commitRequestDigest(cp *Checkpoint, ackMessageIDs []string, claim *Claim, e
 	if err != nil {
 		return "", err
 	}
+	completion, err := makeCommitDigestCompletion(cp.Completion)
+	if err != nil {
+		return "", err
+	}
 	payload := commitDigestPayload{
 		Checkpoint: commitDigestCheckpoint{
 			ID:           cp.ID,
@@ -155,6 +169,7 @@ func commitRequestDigest(cp *Checkpoint, ackMessageIDs []string, claim *Claim, e
 			State:        state,
 			Pending:      makeCommitDigestPending(cp.Pending),
 			Pause:        cp.Pause,
+			Completion:   completion,
 			FileSnapshot: cp.FileSnapshot,
 		},
 		AckMessageIDs:  acks,
@@ -253,6 +268,26 @@ func makeCommitDigestPending(pending *PendingHITL) *commitDigestPendingHITL {
 		out.Pending[i] = commitDigestToolCall{ID: call.ID, Name: call.Name, Args: []byte(call.Args)}
 	}
 	return out
+}
+
+// makeCommitDigestCompletion folds the terminal record into the digest so two
+// commits that share a checkpoint ID but differ only in their terminal content
+// are not treated as one idempotent retry. A nil record leaves the field out,
+// which keeps the digest of every pre-terminal commit unchanged.
+func makeCommitDigestCompletion(completion *Completion) (*commitDigestCompletion, error) {
+	if completion == nil {
+		return nil, nil
+	}
+	out := &commitDigestCompletion{RunID: completion.RunID, Kind: completion.Kind, Err: completion.Err}
+	if completion.Result == nil {
+		return out, nil
+	}
+	result, err := makeCommitDigestMessage(completion.Result.Message)
+	if err != nil {
+		return nil, err
+	}
+	out.Result = &result
+	return out, nil
 }
 
 func makeCommitDigestToolExecution(execution ToolExecution) (commitDigestToolExecution, error) {
