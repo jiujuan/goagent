@@ -154,13 +154,19 @@ func (a *Agent) Stream(ctx context.Context, input string, opts ...RunOption) *Ru
 // restore loads the latest checkpoint's state for a thread, or a fresh State.
 // On store error it returns an empty state plus the error (surfaced via the run).
 // An explicit runFiles backend wins without restoring a snapshot that would be
-// discarded immediately.
-func (a *Agent) restore(ctx context.Context, threadID string, runFiles core.FileStore) (*core.State, error) {
+// discarded immediately. It also reports the head checkpoint it read, which is
+// nil for a thread that has never committed: a run without thread coordination
+// starts its parent chain from that head.
+func (a *Agent) restore(ctx context.Context, threadID string, runFiles core.FileStore) (*core.State, *checkpoint.Checkpoint, error) {
 	cp, err := a.store.Latest(ctx, threadID)
 	if err != nil {
-		return &core.State{}, err
+		return &core.State{}, nil, err
 	}
-	return restoreCheckpoint(cp, runFiles)
+	state, err := restoreCheckpoint(cp, runFiles)
+	if err != nil {
+		return state, cp, err
+	}
+	return state, cp, nil
 }
 
 func restoreCheckpoint(cp *checkpoint.Checkpoint, runFiles core.FileStore) (*core.State, error) {

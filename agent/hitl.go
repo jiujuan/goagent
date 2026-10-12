@@ -149,8 +149,16 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 	}
 	run := a.newRunHandle(ctx, threadID, &state)
 	run.rc.setDurableClaim(claim)
+	// A resume continues the turn the paused checkpoint belongs to and parents its
+	// first commit onto that pause, so the thread stays one chain across the split
+	// into two runs (ADR-0034 D2). A store that cannot claim still gets this.
+	run.preparation = &runPreparation{
+		head:   checkpointRef(cp),
+		turnID: cp.TurnID,
+	}
 	if claim != nil {
-		run.preparation = &runPreparation{claim: copyClaim(claim), headRevision: cp.Revision}
+		run.preparation.claim = copyClaim(claim)
+		run.preparation.headRevision = cp.Revision
 	}
 	for _, decision := range durableDecisions {
 		run.rc.queueApprovalEvent(core.ApprovalDecided{Decision: decision})

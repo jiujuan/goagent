@@ -119,7 +119,7 @@ func (a *Agent) RecordCompletion(ctx context.Context, run *Run) error {
 		if run.terminalID == "" {
 			run.terminalID = core.NewID("completion")
 		}
-		built, err := buildTerminalRecord(ctx, durable, run.ThreadID, run.terminalID, boundaryID, boundaryRevision, completion)
+		built, err := buildTerminalRecord(ctx, durable, run.ThreadID, run.terminalID, boundaryID, boundaryRevision, completion, run.rc.runTurnID())
 		if err != nil {
 			return err
 		}
@@ -140,12 +140,17 @@ func (a *Agent) RecordCompletion(ctx context.Context, run *Run) error {
 // buildTerminalRecord reads the frozen boundary back and copies it into an
 // append-only record: same parent, same step, the boundary's full state and file
 // snapshot, no pause or pending work, and this run's completion.
+//
+// The record keeps the identity of the run it terminates — that run's ID and turn
+// — and its parent stays the boundary this run committed, read from the frozen
+// pair rather than from whatever the thread's head has become since.
 func buildTerminalRecord(
 	ctx context.Context,
 	durable checkpoint.Durable,
 	threadID, recordID, boundaryID string,
 	boundaryRevision uint64,
 	completion *checkpoint.Completion,
+	turnID string,
 ) (*checkpoint.Checkpoint, error) {
 	base, err := durable.Load(ctx, threadID, boundaryID)
 	if err != nil {
@@ -161,12 +166,20 @@ func buildTerminalRecord(
 	if err != nil {
 		return nil, fmt.Errorf("agent: record completion: clone boundary state: %w", err)
 	}
+	if turnID == "" {
+		turnID = base.TurnID // a boundary committed before run identity keeps its own record empty
+	}
 	return &checkpoint.Checkpoint{
-		ID:           recordID,
-		ThreadID:     threadID,
-		ParentID:     boundaryID,
-		Step:         base.Step,
-		State:        state,
+		ID:        recordID,
+		ThreadID:  threadID,
+		ParentID:  boundaryID,
+		ParentRef: &checkpoint.Ref{ThreadID: threadID, CheckpointID: boundaryID},
+		RunID:     completion.RunID,
+		TurnID:    turnID,
+		CreatedAt: lineageNowUTC(),
+		Step:      base.Step,
+		State:     state,
+
 		FileSnapshot: cloneRunFileSnapshot(base.FileSnapshot),
 		Completion:   completion,
 	}, nil

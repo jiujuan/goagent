@@ -12,6 +12,12 @@ type runPreparation struct {
 	restoreCurrent bool
 	claim          *checkpoint.Claim
 	headRevision   uint64
+
+	// head is the checkpoint this run continues from, and turnID the turn it
+	// belongs to. A resume fills both when it claims the paused checkpoint; an
+	// ordinary run resolves the head from the store below and opens a new turn.
+	head   *checkpoint.Ref
+	turnID string
 }
 
 func (r *Run) prepare() error {
@@ -28,6 +34,7 @@ func (r *Run) prepare() error {
 		coordinator  checkpoint.ThreadCoordinator
 		claim        = copyClaim(r.preparation.claim)
 		headRevision = r.preparation.headRevision
+		head         = r.preparation.head
 	)
 	if coordinated, ok := r.agent.store.(checkpoint.ThreadCoordinator); ok {
 		coordinator = coordinated
@@ -46,10 +53,13 @@ func (r *Run) prepare() error {
 			r.rc.setDurableClaim(claim)
 			if begun.Checkpoint != nil {
 				headRevision = begun.Checkpoint.Revision
+				head = checkpointRef(begun.Checkpoint)
 			}
 			state, err = restoreCheckpoint(begun.Checkpoint, r.preparation.files)
 		} else {
-			state, err = r.agent.restore(r.rc.Context, r.ThreadID, r.preparation.files)
+			var latest *checkpoint.Checkpoint
+			state, latest, err = r.agent.restore(r.rc.Context, r.ThreadID, r.preparation.files)
+			head = checkpointRef(latest)
 		}
 		if err != nil {
 			return err
@@ -64,6 +74,14 @@ func (r *Run) prepare() error {
 		}
 		r.rc.State = state
 	}
+	// The head and the turn are resolved when execution actually starts, not when
+	// the handle was created, so a run never parents onto a head that has since
+	// moved. A new input opens a new turn.
+	turnID := r.preparation.turnID
+	if turnID == "" {
+		turnID = core.NewID("turn")
+	}
+	r.rc.setLineageStart(head, turnID)
 	if coordinator != nil && claim != nil {
 		guard := newWriteGuard(coordinator, *claim, headRevision, checkpoint.DefaultLease)
 		r.rc.setDurableGuard(guard)
@@ -72,4 +90,13 @@ func (r *Run) prepare() error {
 		}
 	}
 	return nil
+}
+
+// checkpointRef locates a resolved head on its own thread, or reports no head at
+// all for a thread that has not committed anything yet.
+func checkpointRef(cp *checkpoint.Checkpoint) *checkpoint.Ref {
+	if cp == nil || cp.ID == "" {
+		return nil
+	}
+	return &checkpoint.Ref{ThreadID: cp.ThreadID, CheckpointID: cp.ID}
 }

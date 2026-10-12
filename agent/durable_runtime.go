@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
@@ -29,7 +30,22 @@ type durableRunState struct {
 	boundaryID       string
 	boundaryRevision uint64
 	boundarySet      bool
+
+	// lineageMu is this run's shared commit mutex. One commit at a time reads the
+	// run's visible sequence, stamps its own parent edge, identity and creation
+	// time, and — only on success — advances that sequence, so parallel branches
+	// extend one history instead of each inventing a sibling from a stale head
+	// (ADR-0034 D2). Lock order is lineageMu, then the write guard's own store
+	// mutex, then the store; claim renewal never takes lineageMu, so a renewal
+	// cannot queue behind a commit that is still assembling.
+	lineageMu sync.Mutex
+	headRef   *checkpoint.Ref
+	turnID    string
 }
+
+// lineageNowUTC is the clock a run stamps a freshly constructed checkpoint with.
+// Tests replace it so a constructed record stays deterministic.
+var lineageNowUTC = func() time.Time { return time.Now().UTC() }
 
 func newDurableRunState() *durableRunState {
 	return &durableRunState{executions: make(map[string]checkpoint.ToolExecution)}
@@ -120,6 +136,67 @@ func (rc *RunContext) committedBoundary() (id string, revision uint64, ok bool) 
 	return d.boundaryID, d.boundaryRevision, d.boundarySet
 }
 
+// setLineageStart pins the parent edge and turn a run continues from. The
+// coordinator path passes the head BeginRun resolved, the plain-store path the
+// head it restored, and a resume the paused checkpoint's own ref together with
+// the turn that pause was recorded under. A fresh thread has no head, so its
+// first commit stays a root.
+func (rc *RunContext) setLineageStart(head *checkpoint.Ref, turnID string) {
+	d := rc.ensureDurableState()
+	d.lineageMu.Lock()
+	defer d.lineageMu.Unlock()
+	if head != nil && head.ThreadID != "" && head.CheckpointID != "" {
+		copied := *head
+		d.headRef = &copied
+	}
+	d.turnID = turnID
+}
+
+// runTurnID reports the turn this run stamps its commits with, which is "" until
+// the run actually starts and an empty value on a checkpoint written before run
+// identity existed.
+func (rc *RunContext) runTurnID() string {
+	d := rc.ensureDurableState()
+	d.lineageMu.Lock()
+	defer d.lineageMu.Unlock()
+	return d.turnID
+}
+
+// applyLineageLocked stamps a checkpoint about to be committed. The caller holds
+// lineageMu. A parent edge the caller already chose — a fork's cross-thread
+// source — is left alone; this only fills what the run knows better than anyone.
+func (rc *RunContext) applyLineageLocked(cp *checkpoint.Checkpoint) {
+	d := rc.ensureDurableState()
+	// A record is never its own parent: the head this run just advanced to is the
+	// record itself when an already committed checkpoint is re-submitted, and a
+	// retry must keep the content the store already has.
+	if cp.ParentID == "" && cp.ParentRef == nil && d.headRef != nil && d.headRef.CheckpointID != cp.ID {
+		cp.ParentID = d.headRef.CheckpointID
+		cp.ParentRef = &checkpoint.Ref{ThreadID: d.headRef.ThreadID, CheckpointID: d.headRef.CheckpointID}
+	}
+	if cp.RunID == "" {
+		cp.RunID = rc.RunID
+	}
+	if cp.TurnID == "" {
+		cp.TurnID = d.turnID
+	}
+	if cp.CreatedAt.IsZero() {
+		cp.CreatedAt = lineageNowUTC()
+	}
+}
+
+// advanceLineageLocked records the checkpoint the store just made visible as the
+// parent for this run's next commit. Only a successful commit reaches it, so a
+// failed one leaves the sequence pointing at the previous visible state and can
+// never be used as a parent.
+func (rc *RunContext) advanceLineageLocked(cp *checkpoint.Checkpoint) {
+	if cp.ID == "" {
+		return
+	}
+	d := rc.ensureDurableState()
+	d.headRef = &checkpoint.Ref{ThreadID: cp.ThreadID, CheckpointID: cp.ID}
+}
+
 func (rc *RunContext) setDurableClaim(claim *checkpoint.Claim) {
 	d := rc.ensureDurableState()
 	d.mu.Lock()
@@ -153,10 +230,26 @@ func (rc *RunContext) drainApprovalEvents() []core.ApprovalDecided {
 // commitCheckpoint chooses the store's atomic commit path when available. It
 // deliberately leaves in-flight acknowledgements and tool outcomes intact on
 // any error so a retry can make the exact same durable transition.
+//
+// The whole commit runs under this run's lineage mutex: the parent edge, run and
+// turn identity and creation time are chosen from the sequence as it stands, and
+// only a commit the store accepted advances that sequence.
 func (rc *RunContext) commitCheckpoint(cp *checkpoint.Checkpoint, releaseClaim bool, extra ...checkpoint.ToolExecution) error {
 	if rc.Store == nil {
 		return nil
 	}
+	d := rc.ensureDurableState()
+	d.lineageMu.Lock()
+	defer d.lineageMu.Unlock()
+	rc.applyLineageLocked(cp)
+	if err := rc.commitCheckpointLocked(cp, releaseClaim, extra...); err != nil {
+		return err
+	}
+	rc.advanceLineageLocked(cp)
+	return nil
+}
+
+func (rc *RunContext) commitCheckpointLocked(cp *checkpoint.Checkpoint, releaseClaim bool, extra ...checkpoint.ToolExecution) error {
 	durable, ok := rc.durableStore()
 	if !ok {
 		return rc.Store.Save(rc.Context, cp)
