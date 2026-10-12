@@ -40,6 +40,18 @@ type durableRunState struct {
 	// cannot queue behind a commit that is still assembling.
 	lineageMu sync.Mutex
 	headRef   *checkpoint.Ref
+
+	// headRevision is the store revision of headRef, when the store reports one.
+	// An idempotent confirmation of an older record returns that older revision,
+	// so the sequence only moves forward on a strictly higher one.
+	headRevision    uint64
+	headRevisionSet bool
+
+	// assembled holds the checkpoints this run has already given a lineage. An
+	// empty parent is a determined state for a root record, so re-submitting one
+	// must not be read as "not assembled yet". The map keeps the pointers it
+	// stamped, so an address cannot be recycled behind its back.
+	assembled map[*checkpoint.Checkpoint]struct{}
 	turnID    string
 }
 
@@ -162,14 +174,19 @@ func (rc *RunContext) runTurnID() string {
 	return d.turnID
 }
 
-// applyLineageLocked stamps a checkpoint about to be committed. The caller holds
-// lineageMu. A parent edge the caller already chose — a fork's cross-thread
-// source — is left alone; this only fills what the run knows better than anyone.
+// applyLineageLocked gives a checkpoint about to be committed its parent edge,
+// identity and creation time. The caller holds lineageMu. A record this run has
+// already assembled — a retry of a committed one — is left exactly as it is, so
+// the store still sees the original content, and a parent edge the caller chose
+// up front, such as a fork's cross-thread source, is never overwritten.
 func (rc *RunContext) applyLineageLocked(cp *checkpoint.Checkpoint) {
 	d := rc.ensureDurableState()
+	if _, done := d.assembled[cp]; done {
+		return
+	}
 	// A record is never its own parent: the head this run just advanced to is the
-	// record itself when an already committed checkpoint is re-submitted, and a
-	// retry must keep the content the store already has.
+	// record itself when an already committed checkpoint is rebuilt from the same
+	// request, and that retry must keep the content the store already has.
 	if cp.ParentID == "" && cp.ParentRef == nil && d.headRef != nil && d.headRef.CheckpointID != cp.ID {
 		cp.ParentID = d.headRef.CheckpointID
 		cp.ParentRef = &checkpoint.Ref{ThreadID: d.headRef.ThreadID, CheckpointID: d.headRef.CheckpointID}
@@ -183,17 +200,30 @@ func (rc *RunContext) applyLineageLocked(cp *checkpoint.Checkpoint) {
 	if cp.CreatedAt.IsZero() {
 		cp.CreatedAt = lineageNowUTC()
 	}
+	if d.assembled == nil {
+		d.assembled = make(map[*checkpoint.Checkpoint]struct{}, 4)
+	}
+	d.assembled[cp] = struct{}{}
 }
 
 // advanceLineageLocked records the checkpoint the store just made visible as the
 // parent for this run's next commit. Only a successful commit reaches it, so a
 // failed one leaves the sequence pointing at the previous visible state and can
-// never be used as a parent.
-func (rc *RunContext) advanceLineageLocked(cp *checkpoint.Checkpoint) {
+// never be used as a parent. A receipt carrying a revision this run has already
+// passed is an idempotent confirmation of an older record, so the sequence does
+// not move back onto it.
+func (rc *RunContext) advanceLineageLocked(cp *checkpoint.Checkpoint, receipt checkpoint.CommitReceipt) {
 	if cp.ID == "" {
 		return
 	}
 	d := rc.ensureDurableState()
+	if receipt.Revision > 0 {
+		if d.headRevisionSet && receipt.Revision <= d.headRevision {
+			return
+		}
+		d.headRevision = receipt.Revision
+		d.headRevisionSet = true
+	}
 	d.headRef = &checkpoint.Ref{ThreadID: cp.ThreadID, CheckpointID: cp.ID}
 }
 
@@ -242,17 +272,23 @@ func (rc *RunContext) commitCheckpoint(cp *checkpoint.Checkpoint, releaseClaim b
 	d.lineageMu.Lock()
 	defer d.lineageMu.Unlock()
 	rc.applyLineageLocked(cp)
-	if err := rc.commitCheckpointLocked(cp, releaseClaim, extra...); err != nil {
+	receipt, err := rc.commitCheckpointLocked(cp, releaseClaim, extra...)
+	if err != nil {
 		return err
 	}
-	rc.advanceLineageLocked(cp)
+	rc.advanceLineageLocked(cp, receipt)
 	return nil
 }
 
-func (rc *RunContext) commitCheckpointLocked(cp *checkpoint.Checkpoint, releaseClaim bool, extra ...checkpoint.ToolExecution) error {
+func (rc *RunContext) commitCheckpointLocked(cp *checkpoint.Checkpoint, releaseClaim bool, extra ...checkpoint.ToolExecution) (checkpoint.CommitReceipt, error) {
 	durable, ok := rc.durableStore()
 	if !ok {
-		return rc.Store.Save(rc.Context, cp)
+		if err := rc.Store.Save(rc.Context, cp); err != nil {
+			return checkpoint.CommitReceipt{}, err
+		}
+		// A store without receipts cannot report which revision became visible, so
+		// the sequence just follows the write order.
+		return checkpoint.CommitReceipt{}, nil
 	}
 
 	d := rc.ensureDurableState()
@@ -302,7 +338,7 @@ func (rc *RunContext) commitCheckpointLocked(cp *checkpoint.Checkpoint, releaseC
 		receipt, err = durable.Commit(ctx, req)
 	}
 	if err != nil {
-		return err
+		return checkpoint.CommitReceipt{}, err
 	}
 	rc.noteCommittedBoundary(cp.ID, receipt.Revision)
 
@@ -335,7 +371,7 @@ func (rc *RunContext) commitCheckpointLocked(cp *checkpoint.Checkpoint, releaseC
 		d.claim = copyClaim(receipt.Claim)
 	}
 	d.mu.Unlock()
-	return nil
+	return receipt, nil
 }
 
 func (rc *RunContext) releaseDurableClaim() error {

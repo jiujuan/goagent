@@ -746,6 +746,100 @@ func TestLineageRetryKeepsIdentity(t *testing.T) {
 	}
 }
 
+// newLineageRunContext 造一个已经启动的运行环境，用于直接检验提交序列。
+func newLineageRunContext(store checkpoint.Checkpointer, threadID, runID string) *RunContext {
+	rc := &RunContext{
+		Context:  context.Background(),
+		RunID:    runID,
+		ThreadID: threadID,
+		Store:    store,
+		State:    &core.State{},
+		durable:  newDurableRunState(),
+	}
+	rc.setLineageStart(nil, "turn-"+runID)
+	return rc
+}
+
+// TestLineageRetryRootAfterHeadAdvanced：重试一条父边本来就为空的根记录，不该被
+// 当成"尚未组装谱系"而补上当前 head。
+func TestLineageRetryRootAfterHeadAdvanced(t *testing.T) {
+	ctx := context.Background()
+	threadID := "lineage-retry-root"
+	store := newLineageStore(checkpoint.NewMemory())
+	rc := newLineageRunContext(store, threadID, "run-retry-root")
+
+	created := make([]*checkpoint.Checkpoint, 0, 3)
+	for _, id := range []string{"root-a", "step-b", "step-c"} {
+		cp := &checkpoint.Checkpoint{ID: id, ThreadID: threadID, State: *rc.State}
+		if err := rc.commitCheckpoint(cp, false); err != nil {
+			t.Fatalf("提交 %s: %v", id, err)
+		}
+		created = append(created, cp)
+	}
+
+	if err := rc.commitCheckpoint(created[0], false); err != nil {
+		t.Fatalf("重试已提交的根记录失败: %v", err)
+	}
+	root, err := store.Load(ctx, threadID, "root-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.ParentID != "" || root.ParentRef != nil {
+		t.Fatalf("重试改写了根记录的父边: %q %+v", root.ParentID, root.ParentRef)
+	}
+
+	next := &checkpoint.Checkpoint{ID: "step-d", ThreadID: threadID, State: *rc.State}
+	if err := rc.commitCheckpoint(next, false); err != nil {
+		t.Fatal(err)
+	}
+	if next.ParentID != "step-c" || next.ParentRef == nil || next.ParentRef.CheckpointID != "step-c" {
+		t.Fatalf("重试把 head 带偏了: step-d 的父记录 = %q %+v, want step-c", next.ParentID, next.ParentRef)
+	}
+	hist, err := store.History(ctx, threadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 4 {
+		t.Fatalf("历史条数 = %d, want 4: %v", len(hist), commitIDs(hist))
+	}
+}
+
+// TestLineageOlderRetryDoesNotMoveHeadBack：幂等确认一条旧提交不能把本地 head
+// 拉回那条旧记录，否则之后的提交会插到历史中间去。
+func TestLineageOlderRetryDoesNotMoveHeadBack(t *testing.T) {
+	ctx := context.Background()
+	threadID := "lineage-retry-older"
+	store := newLineageStore(checkpoint.NewMemory())
+	rc := newLineageRunContext(store, threadID, "run-retry-older")
+
+	created := make([]*checkpoint.Checkpoint, 0, 3)
+	for _, id := range []string{"old-a", "old-b", "old-c"} {
+		cp := &checkpoint.Checkpoint{ID: id, ThreadID: threadID, State: *rc.State}
+		if err := rc.commitCheckpoint(cp, false); err != nil {
+			t.Fatalf("提交 %s: %v", id, err)
+		}
+		created = append(created, cp)
+	}
+
+	if err := rc.commitCheckpoint(created[1], false); err != nil {
+		t.Fatalf("重试旧提交失败: %v", err)
+	}
+	next := &checkpoint.Checkpoint{ID: "old-d", ThreadID: threadID, State: *rc.State}
+	if err := rc.commitCheckpoint(next, false); err != nil {
+		t.Fatal(err)
+	}
+	if next.ParentID != "old-c" {
+		t.Fatalf("本地 head 退回了旧提交: old-d 的父记录 = %q, want old-c", next.ParentID)
+	}
+	hist, err := store.History(ctx, threadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 4 {
+		t.Fatalf("历史条数 = %d, want 4: %v", len(hist), commitIDs(hist))
+	}
+}
+
 func commitIDs(hist []*checkpoint.Checkpoint) []string {
 	out := make([]string, 0, len(hist))
 	for _, cp := range hist {
