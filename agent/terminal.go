@@ -79,6 +79,7 @@ func (a *Agent) RecordCompletion(ctx context.Context, run *Run) error {
 	frozen, paused := run.terminalFrozen, run.terminalPaused
 	res, runErr := run.terminalResult, run.terminalErr
 	boundaryID, boundaryRevision, boundaryOK := run.boundaryID, run.boundaryRev, run.boundaryOK
+	threadID, runID, turnID := run.terminalThreadID, run.terminalRunID, run.terminalTurnID
 	run.terminalMu.Unlock()
 
 	if !frozen {
@@ -98,7 +99,7 @@ func (a *Agent) RecordCompletion(ctx context.Context, run *Run) error {
 		return ErrNoCommittedBoundary
 	}
 
-	completion := &checkpoint.Completion{RunID: run.ID, Kind: checkpoint.CompletionCompleted}
+	completion := &checkpoint.Completion{RunID: runID, Kind: checkpoint.CompletionCompleted}
 	if runErr != nil {
 		completion.Kind = checkpoint.CompletionFailed
 		completion.Err = runErr.Error()
@@ -119,7 +120,7 @@ func (a *Agent) RecordCompletion(ctx context.Context, run *Run) error {
 		if run.terminalID == "" {
 			run.terminalID = core.NewID("completion")
 		}
-		built, err := buildTerminalRecord(ctx, durable, run.ThreadID, run.terminalID, boundaryID, boundaryRevision, completion, run.rc.runTurnID())
+		built, err := buildTerminalRecord(ctx, durable, threadID, run.terminalID, boundaryID, boundaryRevision, completion, turnID)
 		if err != nil {
 			return err
 		}

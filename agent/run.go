@@ -48,14 +48,20 @@ type Run struct {
 	// publishes any lifecycle event, so an observer that sees the terminal event
 	// (or a Wait that returns) always finds a complete record. The result is
 	// deep-copied here, so a caller mutating what Wait returned cannot reach it.
-	terminalMu     sync.Mutex
-	terminalFrozen bool
-	terminalPaused bool
-	terminalResult core.Result
-	terminalErr    error
-	boundaryID     string
-	boundaryRev    uint64
-	boundaryOK     bool
+	// The identity is frozen along with it: Run.ID and Run.ThreadID are exported
+	// and a caller can rewrite them after the fact, so a result record never reads
+	// them back as its own credential (ADR-0034 D3).
+	terminalMu       sync.Mutex
+	terminalFrozen   bool
+	terminalPaused   bool
+	terminalResult   core.Result
+	terminalErr      error
+	terminalThreadID string
+	terminalRunID    string
+	terminalTurnID   string
+	boundaryID       string
+	boundaryRev      uint64
+	boundaryOK       bool
 
 	// recordMu serializes building and committing this run's terminal record;
 	// recorded keeps the exact content so a retry is an identical commit.
@@ -158,15 +164,20 @@ func (r *Run) FrozenOutcome() (core.Result, error) {
 }
 
 // freezeTerminal records how this run ended together with the boundary it last
-// committed. drive() calls it before publishing any lifecycle event, so an
-// observer that sees the terminal result always finds a complete record, and the
-// stored result is a deep copy — a caller editing what Wait returned cannot
-// reach it.
+// committed and the identity that produced it. drive() calls it before publishing
+// any lifecycle event, so an observer that sees the terminal result always finds a
+// complete record, and the stored result is a deep copy — a caller editing what
+// Wait returned cannot reach it. The thread, run and turn identifiers are copied
+// here rather than read back from the exported Run fields later, so rewriting those
+// fields cannot reattribute a finished run.
 func (r *Run) freezeTerminal(boundaryID string, boundaryRev uint64, boundaryOK bool, res core.Result, err error, paused bool) {
 	frozen := res
 	if cloned, cloneErr := core.CloneMessage(res.Message); cloneErr == nil {
 		frozen = core.Result{Message: cloned}
 	}
+	// Read the turn before taking terminalMu so the lineage mutex is never nested
+	// under it.
+	turnID := r.rc.runTurnID()
 
 	r.terminalMu.Lock()
 	defer r.terminalMu.Unlock()
@@ -177,6 +188,9 @@ func (r *Run) freezeTerminal(boundaryID string, boundaryRev uint64, boundaryOK b
 	r.terminalPaused = paused
 	r.terminalResult = frozen
 	r.terminalErr = err
+	r.terminalThreadID = r.ThreadID
+	r.terminalRunID = r.ID
+	r.terminalTurnID = turnID
 	r.boundaryID, r.boundaryRev, r.boundaryOK = boundaryID, boundaryRev, boundaryOK
 }
 

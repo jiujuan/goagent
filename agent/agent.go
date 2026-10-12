@@ -21,7 +21,8 @@ import (
 )
 
 // Agent is both the declaration of an agent (its config) and a runnable handle.
-// Build one with New, then call Run (blocking, returns the answer) or Stream
+// Build one with New, then call Run (blocking, returns the answer), RunDetailed
+// (blocking, returns the structured outcome and committed boundary) or Stream
 // (non-blocking, returns a *Run for live events and control).
 type Agent struct {
 	cfg      config
