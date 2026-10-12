@@ -146,7 +146,13 @@ func submitAgentRun(ctx context.Context, q Queue, a *agent.Agent, input string, 
 			// run that ended in error or pause.
 			defer h.cancelWork()
 
-			res, runErr := h.run.Wait()
+			// Wait only drives the run to its own settlement. The outcome reported
+			// below comes from what drive froze, because Wait hands out the run's live
+			// result object: a caller editing that — while the record is still being
+			// written, or before this job was even picked up — must not change what
+			// WaitRecorded returns, and it must keep agreeing with the terminal record.
+			h.run.Wait()
+			res, runErr := h.run.FrozenOutcome()
 			err := errors.Join(runErr, h.commitTerminal(workCtx))
 			// The settled outcome is stored and WaitRecorded unblocked before the
 			// same joined error goes back to the Pool: the pool has no channel that
@@ -178,18 +184,14 @@ func (h *Handle) commitTerminal(workCtx context.Context) error {
 }
 
 // recordSettled freezes the worker's joined outcome and releases WaitRecorded.
-// The stored result is a deep copy taken here: the run's own Wait() hands out its
-// live outcome, and a caller editing that must not reach what later waiters read.
-// It runs once per Handle even if a consumer redelivers the job, so a later
-// attempt cannot close the channel twice or replace the reported outcome.
+// The result it stores is already a copy independent of the run (FrozenOutcome),
+// and each waiter receives another. It runs once per Handle even if a consumer
+// redelivers the job, so a later attempt cannot close the channel twice or
+// replace the reported outcome.
 func (h *Handle) recordSettled(res core.Result, err error) {
 	h.settleOnce.Do(func() {
-		frozen := res
-		if cloned, cloneErr := core.CloneMessage(res.Message); cloneErr == nil {
-			frozen = core.Result{Message: cloned}
-		}
 		h.settleMu.Lock()
-		h.settleRes, h.settleErr = frozen, err
+		h.settleRes, h.settleErr = res, err
 		h.settleMu.Unlock()
 		close(h.settle)
 	})

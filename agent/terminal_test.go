@@ -650,3 +650,37 @@ func TestRecordCompletionRequiresDurable(t *testing.T) {
 		t.Fatalf("记录失败却回退了 Save: %d -> %d", savesAfterRun, base.saveCalls())
 	}
 }
+
+// TestFrozenOutcomeIsDeepCopy：冻结结局的出口必须是独立副本——拿到它的一方就地改写
+// 之后，终态记录仍写运行自己冻结的内容。
+func TestFrozenOutcomeIsDeepCopy(t *testing.T) {
+	ctx := context.Background()
+	const threadID = "frozen-copy"
+	store := checkpoint.NewMemory()
+	a := recordAgent(t, store, "冻结的原始结果")
+
+	run := a.Stream(ctx, "go", agent.OnThread(threadID))
+	if _, err := run.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	frozen, ferr := run.FrozenOutcome()
+	if ferr != nil {
+		t.Fatalf("冻结结局带错误: %v", ferr)
+	}
+	if got := frozen.Message.Text(); got != "冻结的原始结果" {
+		t.Fatalf("冻结结局 = %q", got)
+	}
+	frozen.Message.Parts[0] = core.Text{Text: "被拿到副本的一方改写"}
+
+	if err := a.RecordCompletion(ctx, run); err != nil {
+		t.Fatalf("RecordCompletion: %v", err)
+	}
+	committed := headCompletion(t, store, threadID)
+	if committed.Result == nil {
+		t.Fatalf("终态没有结果快照: %+v", committed)
+	}
+	if got := committed.Result.Message.Text(); got != "冻结的原始结果" {
+		t.Fatalf("已提交的终态被出口副本改写: %q", got)
+	}
+}

@@ -689,3 +689,91 @@ func TestQueueWaitRecordedMultipleWaiters(t *testing.T) {
 		}
 	})
 }
+
+// TestQueueWaitRecordedIsolatedFromWaitEdits：收尾结果必须取自运行自己冻结的结局，
+// 不能是 Wait 递出去的那个活对象。两种时序都要挡住：提交期间被改写、worker 消费前被改写。
+func TestQueueWaitRecordedIsolatedFromWaitEdits(t *testing.T) {
+	const original = "原始结果"
+	const edited = "调用方改写"
+
+	// 断言收尾结果与已落盘的终态文本一致，都仍是运行冻结的内容。
+	assertBothOriginal := func(t *testing.T, settled core.Result, store *settleStore, threadID string) {
+		t.Helper()
+		if got := settled.Message.Text(); got != original {
+			t.Fatalf("WaitRecorded 返回 %q，期望 %q（收尾结果取自被改写的活对象）", got, original)
+		}
+		head, err := store.Latest(context.Background(), threadID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if head.Completion == nil || head.Completion.Result == nil {
+			t.Fatalf("终态结果缺失: %+v", head.Completion)
+		}
+		if got := head.Completion.Result.Message.Text(); got != original {
+			t.Fatalf("已落盘终态 = %q，与冻结结果不一致", got)
+		}
+	}
+
+	t.Run("提交期间被改写", func(t *testing.T) {
+		threadID := "q-isolate-during-commit"
+		store := newSettleStore()
+		store.gateOn = true
+		a := durableTextAgent(t, store, original)
+
+		q := NewMemQueue(4)
+		h, err := EnqueueAgent(context.Background(), q, a, "go", agent.OnThread(threadID))
+		if err != nil {
+			t.Fatalf("EnqueueAgent: %v", err)
+		}
+		q.Close()
+		startPool(t, q, 1)
+
+		select {
+		case <-store.entered:
+		case <-time.After(10 * time.Second):
+			t.Fatal("终态提交没有到达闸门")
+		}
+		// 运行本身已经结束，Wait 立即可返回；调用方就地改写它拿到的结果。
+		res, err := h.Wait()
+		if err != nil {
+			t.Fatalf("运行失败: %v", err)
+		}
+		res.Message.Parts[0] = core.Text{Text: edited}
+
+		close(store.release)
+		settled, err := h.WaitRecorded()
+		if err != nil {
+			t.Fatalf("WaitRecorded 报错: %v", err)
+		}
+		assertBothOriginal(t, settled, store, threadID)
+	})
+
+	t.Run("worker 消费前被改写", func(t *testing.T) {
+		threadID := "q-isolate-before-consume"
+		store := newSettleStore()
+		a := durableTextAgent(t, store, original)
+		rq := &recordQueue{} // 接收任务但没有 worker
+
+		h, err := EnqueueAgent(context.Background(), rq, a, "go", agent.OnThread(threadID))
+		if err != nil {
+			t.Fatalf("EnqueueAgent: %v", err)
+		}
+		_, accepted := rq.snapshot()
+
+		// 调用方先自己把运行驱动到结束，再改写拿到的结果，然后才让 worker 消费。
+		res, err := h.Wait()
+		if err != nil {
+			t.Fatalf("运行失败: %v", err)
+		}
+		res.Message.Parts[0] = core.Text{Text: edited}
+
+		if err := runQueueJob(accepted[0]); err != nil {
+			t.Fatalf("消费任务失败: %v", err)
+		}
+		settled, err := h.WaitRecorded()
+		if err != nil {
+			t.Fatalf("WaitRecorded 报错: %v", err)
+		}
+		assertBothOriginal(t, settled, store, threadID)
+	})
+}

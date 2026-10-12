@@ -138,6 +138,25 @@ func (r *Run) Paused() bool {
 	return r.terminalFrozen && r.terminalPaused
 }
 
+// FrozenOutcome returns the outcome drive() froze when the run ended — the same
+// result and error RecordCompletion writes — as a copy independent of the run, so
+// editing what Wait returned cannot reach what a later reader sees here. Like
+// Paused it only means something once the run has settled: before that it returns
+// a zero result and a nil error, and a paused run reports the same zero result
+// with no error.
+func (r *Run) FrozenOutcome() (core.Result, error) {
+	r.terminalMu.Lock()
+	defer r.terminalMu.Unlock()
+	if !r.terminalFrozen {
+		return core.Result{}, nil
+	}
+	out := r.terminalResult
+	if cloned, err := core.CloneMessage(r.terminalResult.Message); err == nil {
+		out = core.Result{Message: cloned}
+	}
+	return out, r.terminalErr
+}
+
 // freezeTerminal records how this run ended together with the boundary it last
 // committed. drive() calls it before publishing any lifecycle event, so an
 // observer that sees the terminal result always finds a complete record, and the
