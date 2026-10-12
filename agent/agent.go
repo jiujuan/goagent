@@ -135,10 +135,18 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) (strin
 // (Iter/Events), settlement (Wait), and control (Steer/Cancel/Decide). The loop
 // is driven lazily on first observation, so no events are missed.
 func (a *Agent) Stream(ctx context.Context, input string, opts ...RunOption) *Run {
-	rc := RunConfig{ThreadID: core.NewID("thread"), Message: core.UserText(input)}
+	return a.streamConfigured(ctx, resolveRunConfig(input, core.NewID("thread"), opts...))
+}
+
+func resolveRunConfig(input, threadID string, opts ...RunOption) RunConfig {
+	rc := RunConfig{ThreadID: threadID, Message: core.UserText(input)}
 	for _, o := range opts {
 		o(&rc)
 	}
+	return rc
+}
+
+func (a *Agent) streamConfigured(ctx context.Context, rc RunConfig) *Run {
 	// Validation and message freezing happen at handle creation. Store access is
 	// deferred until drive so lazily-created runs restore the current head.
 	err := core.CheckThreadID(rc.ThreadID)

@@ -17,6 +17,7 @@ import (
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/llm"
 	"github.com/jiujuan/goagent/llm/mock"
+	"github.com/jiujuan/goagent/vfs"
 )
 
 // --- 夹具 -------------------------------------------------------------------
@@ -150,6 +151,36 @@ func TestSessionSendThreadBound(t *testing.T) {
 		if res.ThreadID != "session-bound" || res.CheckpointRef == nil || res.CheckpointRef.ThreadID != "session-bound" {
 			t.Fatalf("Send 结果没有留在绑定线程: %+v", res)
 		}
+	}
+}
+
+func TestSessionSendAppliesOptionsOnce(t *testing.T) {
+	ctx := context.Background()
+	base := checkpoint.NewMemory()
+	a := terminalAgent(t, base, mock.New("echo", func(req *llm.Request) *llm.Response {
+		return mock.Text(req.Messages[len(req.Messages)-1].Text())
+	}))
+	session, err := a.OpenSession(ctx, "session-options-once")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	res, err := session.Send(ctx, "default message", func(cfg *agent.RunConfig) {
+		calls++
+		if got := cfg.Message.Text(); got != "default message" {
+			t.Fatalf("RunOption default message = %q, want %q", got, "default message")
+		}
+		cfg.Message = core.UserText("replacement message")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("RunOption called %d times, want 1", calls)
+	}
+	if got := res.Result.Message.Text(); got != "replacement message" {
+		t.Fatalf("model received %q, want %q", got, "replacement message")
 	}
 }
 
@@ -377,6 +408,65 @@ func TestSessionForkFiles(t *testing.T) {
 				t.Fatalf("文件内容没带过来: %v", head.FileSnapshot)
 			}
 		})
+	}
+}
+
+func TestSessionForkDropsExternalFiles(t *testing.T) {
+	ctx := context.Background()
+	base := checkpoint.NewMemory()
+	a := terminalAgent(t, base, resultTextModel("m", "answer"))
+
+	sourceFiles, err := vfs.NewDirStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sourceFiles.Close() })
+	source := &checkpoint.Checkpoint{
+		ID:       "fork-external-source",
+		ThreadID: "fork-external",
+		Step:     1,
+		State: core.State{
+			Messages: []core.Message{core.UserText("question")},
+			Files:    sourceFiles,
+		},
+	}
+	if err := base.Save(ctx, source); err != nil {
+		t.Fatal(err)
+	}
+
+	session, err := a.OpenSession(ctx, source.ThreadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := session.ForkFrom(ctx, source.ID, "fork-external-branch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := branch.GetHead(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head.State.Files != nil {
+		t.Fatalf("fork retained source external files: %T", head.State.Files)
+	}
+	if head.FileSnapshot != nil {
+		t.Fatalf("external files produced a snapshot: %v", head.FileSnapshot)
+	}
+
+	targetFiles, err := vfs.NewDirStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = targetFiles.Close() })
+	if _, err := branch.Send(ctx, "branch question", agent.WithRunFiles(targetFiles)); err != nil {
+		t.Fatal(err)
+	}
+	continued, err := branch.GetHead(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if continued.State.Files != targetFiles {
+		t.Fatalf("branch did not use explicitly injected files: got %T", continued.State.Files)
 	}
 }
 

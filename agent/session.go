@@ -45,16 +45,14 @@ func (s *Session) ThreadID() string { return s.threadID }
 // WithRunFiles, pass through unchanged — an externally managed file backend still has
 // to be supplied by the caller for each run it applies to (ADR-0027).
 func (s *Session) Send(ctx context.Context, input string, opts ...RunOption) (RunResult, error) {
-	probe := RunConfig{ThreadID: s.threadID}
-	for _, opt := range opts {
-		opt(&probe)
-	}
-	if probe.ThreadID != s.threadID {
+	rc := resolveRunConfig(input, s.threadID, opts...)
+	if rc.ThreadID != s.threadID {
 		return RunResult{ThreadID: s.threadID}, fmt.Errorf(
-			"agent: session on thread %q: OnThread(%q) conflicts with the bound thread", s.threadID, probe.ThreadID)
+			"agent: session on thread %q: OnThread(%q) conflicts with the bound thread", s.threadID, rc.ThreadID)
 	}
-	// Appended last, so it wins over any option that names this same thread.
-	return s.agent.RunDetailed(ctx, input, append(append([]RunOption{}, opts...), OnThread(s.threadID))...)
+	run := s.agent.streamConfigured(ctx, rc)
+	_, err := run.Wait()
+	return run.DetailedResult(), err
 }
 
 // GetHead returns the thread's most recent checkpoint, or nil when it has committed
@@ -98,6 +96,10 @@ func (s *Session) ForkFrom(ctx context.Context, checkpointID, newThreadID string
 	if err != nil {
 		return nil, fmt.Errorf("agent: fork session thread %q into %q: %w", s.threadID, newThreadID, err)
 	}
+	// Externally managed file backends belong to their source thread. Snapshot
+	// bytes remain on FileSnapshot, while the target thread must inject its own
+	// backend on a later Send.
+	forked.State.Files = nil
 	emptyThread := uint64(0)
 	if _, err := durable.Commit(ctx, checkpoint.CommitRequest{
 		Checkpoint:       forked,
