@@ -11,6 +11,13 @@ import (
 	"github.com/jiujuan/goagent/core"
 )
 
+// runIdentity is a run's immutable identity, assigned when the handle is created
+// and never rewritten.
+type runIdentity struct {
+	runID    string
+	threadID string
+}
+
 // Run is a non-blocking handle to one in-flight (or paused) run. The loop is
 // driven lazily on first observation, so subscribing via Iter/Events before
 // driving means no events are missed.
@@ -19,8 +26,19 @@ import (
 // Wait() for just the result. On an Interrupted (HITL) pause, record decisions
 // with Decide(...) then call Resume(ctx) to continue.
 type Run struct {
+	// ID and ThreadID are the run's identifiers as created. They are exported and
+	// therefore writable by any caller holding the handle, so nothing internal reads
+	// them back as a credential: the identity used for claims, committed checkpoints,
+	// results and terminal records is the private copy fixed at creation.
 	ID       string
 	ThreadID string
+
+	// identity is fixed by newRunHandle and never reassigned. Everything that must
+	// agree with the RunID and ThreadID written into checkpoints — preparation and
+	// its resume claim, the frozen result, the terminal record, lifecycle events and
+	// resume — reads these fields, so rewriting the exported ones cannot reattribute
+	// a run (ADR-0034 D3).
+	identity runIdentity
 
 	agent       *Agent
 	bus         *bus.Bus
@@ -188,8 +206,8 @@ func (r *Run) freezeTerminal(boundaryID string, boundaryRev uint64, boundaryOK b
 	r.terminalPaused = paused
 	r.terminalResult = frozen
 	r.terminalErr = err
-	r.terminalThreadID = r.ThreadID
-	r.terminalRunID = r.ID
+	r.terminalThreadID = r.identity.threadID
+	r.terminalRunID = r.identity.runID
 	r.terminalTurnID = turnID
 	r.boundaryID, r.boundaryRev, r.boundaryOK = boundaryID, boundaryRev, boundaryOK
 }
@@ -211,7 +229,7 @@ func (r *Run) drive() {
 		r.driveStarted = true
 		r.lifecycleMu.Unlock()
 		go func() {
-			r.bus.Publish(r.topic, core.RunStarted{RunID: r.ID, ThreadID: r.ThreadID})
+			r.bus.Publish(r.topic, core.RunStarted{RunID: r.identity.runID, ThreadID: r.identity.threadID})
 			if r.startErr != nil {
 				err := errors.Join(r.startErr, r.rc.releaseDurableClaim())
 				r.freezeFailure(err)

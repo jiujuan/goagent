@@ -249,6 +249,58 @@ func TestRunDetailedIsolation(t *testing.T) {
 	}
 }
 
+// TestRunDetailedIdentityFixedAtCreation：在 Wait 之前改写导出字段也不能改变身份。
+// 执行准备、已提交检查点、结构化结果与终态记录必须始终用创建时那一份。
+func TestRunDetailedIdentityFixedAtCreation(t *testing.T) {
+	ctx := context.Background()
+	base := checkpoint.NewMemory()
+	a := terminalAgent(t, base, resultToolModel("m", 1), resultEchoTool())
+	threadID := "review-identity"
+
+	run := a.Stream(ctx, "带工具的问题", agent.OnThread(threadID))
+	createdRunID := run.ID
+	run.ID = "rewritten-before-wait"
+	run.ThreadID = "rewritten-thread"
+
+	if _, err := run.Wait(); err != nil {
+		t.Fatalf("改写导出字段不该让运行失败: %v", err)
+	}
+	res := run.DetailedResult()
+	if res.RunID != createdRunID {
+		t.Fatalf("结果跟改了导出字段: run=%q, want 创建时的 %q", res.RunID, createdRunID)
+	}
+	if res.ThreadID != threadID {
+		t.Fatalf("结果线程 = %q, want %q", res.ThreadID, threadID)
+	}
+	if res.CheckpointRef == nil || res.CheckpointRef.ThreadID != threadID {
+		t.Fatalf("边界 Ref 落到别的线程上: %+v", res.CheckpointRef)
+	}
+	boundary, err := base.Load(ctx, res.CheckpointRef.ThreadID, res.CheckpointRef.CheckpointID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if boundary.RunID != res.RunID || boundary.TurnID != res.TurnID || boundary.ThreadID != threadID {
+		t.Fatalf("边界身份与结果不一致: %+v vs %+v", boundary, res)
+	}
+	if count := historyCount(t, base, "rewritten-thread"); count != 0 {
+		t.Fatalf("被改写的线程名上出现了 %d 条记录", count)
+	}
+
+	if err := a.RecordCompletion(ctx, run); err != nil {
+		t.Fatalf("记录终态: %v", err)
+	}
+	record := headCheckpoint(t, base, threadID)
+	if record.Completion == nil || record.Completion.RunID != res.RunID {
+		t.Fatalf("终态记录用了改写后的身份: %+v", record.Completion)
+	}
+	if record.RunID != res.RunID || record.ThreadID != threadID {
+		t.Fatalf("终态记录的谱系身份与结果不一致: run=%q thread=%q", record.RunID, record.ThreadID)
+	}
+	if got := run.DetailedResult(); got.RunID != createdRunID {
+		t.Fatalf("记录终态后结果身份漂移: %q", got.RunID)
+	}
+}
+
 // TestRunDetailedKeepsRunContract：Run 的字符串返回和 checkpoint 条数不变，
 // RunDetailed 不额外追加记录。
 func TestRunDetailedKeepsRunContract(t *testing.T) {

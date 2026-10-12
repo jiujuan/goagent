@@ -88,7 +88,7 @@ func (a *Agent) RecordApproval(ctx context.Context, threadID string, decision Ap
 // RecordApproval records a structured decision against this run's thread and
 // publishes its audit event immediately on the run topic.
 func (r *Run) RecordApproval(ctx context.Context, decision ApprovalDecision) (checkpoint.DecisionReceipt, error) {
-	receipt, err := r.agent.RecordApproval(ctx, r.ThreadID, decision)
+	receipt, err := r.agent.RecordApproval(ctx, r.identity.threadID, decision)
 	if err != nil {
 		return checkpoint.DecisionReceipt{}, err
 	}

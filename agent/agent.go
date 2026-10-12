@@ -227,6 +227,7 @@ func (a *Agent) newRunHandle(ctx context.Context, threadID string, state *core.S
 	return &Run{
 		ID:       runID,
 		ThreadID: threadID,
+		identity: runIdentity{runID: runID, threadID: threadID},
 		agent:    a,
 		bus:      a.bus,
 		topic:    topic,

@@ -44,7 +44,7 @@ func (r *Run) Resume(ctx context.Context) (*Run, error) {
 	r.mu.Lock()
 	decs := append([]Approval(nil), r.decisions...)
 	r.mu.Unlock()
-	return r.agent.Resume(ctx, r.ThreadID, decs...)
+	return r.agent.Resume(ctx, r.identity.threadID, decs...)
 }
 
 // Resume continues a thread from its latest checkpoint. If that checkpoint is a

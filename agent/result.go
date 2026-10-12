@@ -43,20 +43,18 @@ type RunResult struct {
 // DetailedResult returns the outcome drive() froze when the run settled, together
 // with the identity and boundary recorded at that moment. It reads only the frozen
 // copy: the exported Run.ID and Run.ThreadID are a caller's to rewrite, and they are
-// not consulted here.
-//
-// Before the run settles there is no frozen record, so the result carries the
-// thread and run identifiers as currently known with an empty result, no boundary
-// and Paused false. Use Wait or an iterator to reach a settled run.
+// not consulted here — before the run settles the identifiers reported are the ones
+// fixed when the handle was created, with an empty result, no boundary and Paused
+// false. Use Wait or an iterator to reach a settled run.
 func (r *Run) DetailedResult() RunResult {
 	r.terminalMu.Lock()
 	defer r.terminalMu.Unlock()
 	out := RunResult{ThreadID: r.terminalThreadID, RunID: r.terminalRunID, TurnID: r.terminalTurnID}
 	if out.ThreadID == "" {
-		out.ThreadID = r.ThreadID
+		out.ThreadID = r.identity.threadID
 	}
 	if out.RunID == "" {
-		out.RunID = r.ID
+		out.RunID = r.identity.runID
 	}
 	if !r.terminalFrozen {
 		return out

@@ -42,8 +42,8 @@ func (r *Run) prepare() error {
 	if r.preparation.restoreCurrent {
 		if coordinator != nil {
 			begun, beginErr := coordinator.BeginRun(r.rc.Context, checkpoint.BeginRunRequest{
-				ThreadID: r.ThreadID,
-				Owner:    r.ID,
+				ThreadID: r.identity.threadID,
+				Owner:    r.identity.runID,
 				Lease:    checkpoint.DefaultLease,
 			})
 			if beginErr != nil {
@@ -58,7 +58,7 @@ func (r *Run) prepare() error {
 			state, err = restoreCheckpoint(begun.Checkpoint, r.preparation.files)
 		} else {
 			var latest *checkpoint.Checkpoint
-			state, latest, err = r.agent.restore(r.rc.Context, r.ThreadID, r.preparation.files)
+			state, latest, err = r.agent.restore(r.rc.Context, r.identity.threadID, r.preparation.files)
 			head = checkpointRef(latest)
 		}
 		if err != nil {
