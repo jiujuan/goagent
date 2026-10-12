@@ -3,6 +3,9 @@
 // provider, so it runs offline.
 //
 //	go run ./examples/background
+//
+// 这里只演示"入队 + worker 处理 + Handle.Wait 取结果"。要知道某次后台运行的终态
+// 是否已经写进检查点存储，看 examples/background-status（WaitRecorded 与 RunStatus）。
 package main
 
 import (
