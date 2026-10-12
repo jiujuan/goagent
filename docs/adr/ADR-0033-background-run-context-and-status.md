@@ -159,4 +159,6 @@ freezeCheckpoint/cloneCheckpoint 必须深拷贝 Completion，Result.Message 使
 
 一项测试写法上的必要偏离：仓库自带的 Memory 在提交时忽略 context，所以"记录 context 不继承执行的取消"不能靠"记录是否写成功"证明——继承取消同样会写成功。测试在提交那一刻抓取 context 的 `Err()` 与剩余期限并直接断言（去掉 `WithoutCancel` 的改动会让它变红）。
 
+BC-04 复核发现收尾结果的来源不对：worker 原先直接用 `h.run.Wait()` 的返回值，而 `Wait` 递出的是运行自己的结果对象，调用方在终态提交期间（或任务被消费之前）就地改写它，收尾结果就会与已落盘的终态不一致。已改为新增只读出口 `Run.FrozenOutcome() (core.Result, error)`——在终态锁下返回 drive 冻结结局的独立副本，未结束时返回零值，与 `Run.Paused()` 同样是"只在运行结束后有意义"的读法；队列闭包先驱动运行到结束，再从这份冻结结局取收尾结果与运行错误。D5 里"队列通过 Run 的只读方法获取结局"因此从 `Paused()` 一个扩展为 `Paused()` + `FrozenOutcome()` 两个。回归用例：`TestQueueWaitRecordedIsolatedFromWaitEdits`（两种时序：提交期间被改写、消费前被改写）、`agent` 侧 `TestFrozenOutcomeIsDeepCopy`。
+
 `Agent.RunStatus` 仍未实施，V2、V8、V9 尚未执行。

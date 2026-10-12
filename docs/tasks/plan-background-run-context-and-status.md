@@ -256,10 +256,10 @@ BC-01 与 BC-04 同改 queue/agent_bridge.go；BC-03 会修改 agent/run.go、ag
 实现形状（`queue/agent_bridge.go`）：
 
 - `Handle` 新增 `owner *agent.Agent`（记录终态要用它，`RecordCompletion` 会拒绝别的 Agent 的 Run）、`settle chan struct{}` + `settleOnce` + `settleMu/settleRes/settleErr`。`Wait` 与 `Events` 一字未改，仍是运行级语义；`Wait` 的注释补上"成功不代表终态已落盘"。
-- worker 闭包：`defer h.cancelWork()` → `res, runErr := h.run.Wait()` → `err := errors.Join(runErr, h.commitTerminal(workCtx))` → `h.recordSettled(res, err)`（存结果、关 done）→ 再把同一个 `err` 返回给 Pool。
+- worker 闭包：`defer h.cancelWork()` → `h.run.Wait()`（只为驱动运行到结束）→ `res, runErr := h.run.FrozenOutcome()` → `err := errors.Join(runErr, h.commitTerminal(workCtx))` → `h.recordSettled(res, err)`（存结果、关 done）→ 再把同一个 `err` 返回给 Pool。收尾结果取自运行冻结的结局，不是 `Wait` 递出的活对象（评审后修复，见下）。
 - `commitTerminal`：`h.run.Paused()` 为真直接返回 nil，不发起记录；否则 `context.WithTimeout(context.WithoutCancel(workCtx), terminalRecordTimeout)`（`const terminalRecordTimeout = 30 * time.Second`）+ `defer cancel()`，`workCtx` 的值保留、取消不继承。
 - `WaitRecorded`：只 `<-h.settle`，绝不驱动运行；返回前对结果 `core.CloneMessage`，每个等待者拿到自己的副本。
-- `recordSettled` 用 `settleOnce` 保护：重复投递同一 job 不会二次 close，也不会替换已上报的收尾结果。
+- `recordSettled` 用 `settleOnce` 保护：重复投递同一 job 不会二次 close，也不会替换已上报的收尾结果。它存的就是 `FrozenOutcome` 给出的独立副本，不再另拷一次。
 
 测试（`queue/agent_terminal_test.go`，包内测试，因为要观察 Handle 的收尾字段并自己消费 `recordQueue` 里的任务）。夹具 `settleStore` 包装 Memory 的线程协调能力，只截 Completion 非空的提交：可卡在闸门、可拒绝写入、并记下提交那一刻的 context、其 `Err()` 与剩余期限。六个用例覆盖 V7：闸门证明 Wait 已返回而 WaitRecorded 仍等；记录写入失败时 Wait 仍拿到结果、WaitRecorded 的错误同时可 `errors.Is` 命中注入错误并保留运行自身的文本；取消后仍写 failed 且归属正确的 RunID；无边界（取消先于消费）暴露 `agent.ErrNoCommittedBoundary`；暂停零终态提交、暂停元数据仍在、`Resume + Allow("c1")` 恢复后仍零终态；记录 context 独立、剩余期限接近 30 秒、收尾后被释放；三等待者内容一致互不污染、未消费时不驱动运行（模型调用数为 0）。
 
@@ -281,17 +281,37 @@ BC-01 与 BC-04 同改 queue/agent_bridge.go；BC-03 会修改 agent/run.go、ag
 6. 合并错误只留运行错误 → `WaitRecorded 未暴露记录错误: <nil>`。
 7. 合并错误只留记录错误 → `WaitRecorded 掩盖了运行自身的错误: ...`。
 8. 去掉每个等待者的副本 → `等待者 1 的结果被改写污染`。
-9. 去掉收尾时的副本 → `收尾结果被 Wait 返回值的改写污染: "调用方改写"`。
-10. `WaitRecorded` 内先调 `h.run.Wait()` → `WaitRecorded 驱动了运行，模型调用 1 次`。
+9. 把收尾结果的来源改回 `Wait` 递出的活对象 → 两条时序用例都报 `WaitRecorded 返回 "调用方改写"，期望 "原始结果"`（评审后修复新增，见下）。
+10. 去掉 `FrozenOutcome` 内的副本 → `agent` 侧用例报 `已提交的终态被出口副本改写: "被拿到副本的一方改写"`。
+11. `WaitRecorded` 内先调 `h.run.Wait()` → `WaitRecorded 驱动了运行，模型调用 1 次`。
 
 **与卡的偏离（四条）：**
 
-1. 结果深拷贝做成两层，卡上只要求"多等待者互不污染"。`Run.Wait` 返回的是运行自己的结果对象（`agent/run.go:228` 把 `out.Result` 原样交给 `finish`，冻结用的另有一份副本），调用方就地改写它，只等收尾时拷一次才会挡住；只等返回时拷则收尾记录仍与运行内的消息共享底层数组。两处各有一条用例（反向验证 8、9）。
+1. 收尾结果不走 `Wait` 的返回值，而是新增 `Run.FrozenOutcome()` 从运行冻结的结局取独立副本；`WaitRecorded` 再为每个等待者各拷一份。卡上只写了"多等待者互不污染"，但 `Wait` 递出的是运行自己的结果对象，调用方就地改写会让收尾结果与已落盘终态不一致（评审 P2，见下），所以隔离边界必须建在来源上。用例见反向验证 8~10。
 2. "记录 context 不继承取消"不能用"记录是否写成功"来证明：Memory 的 `Commit` 忽略 context（`checkpoint/durable_memory.go:95` 的形参就是 `_`），继承取消也会写成功。测试改为在提交那一刻抓 `ctx.Err()` 与剩余期限并断言。这一条是补强，不是放宽。
 3. 无边界场景独立成 `TestQueueRecordVisibleWithoutBoundary`，没有塞进取消用例：用 `recordQueue` 让任务先不被消费，测试自己 `h.Cancel()` 后再调用 `job.Run` 消费，这样 prepare 在已取消的执行 context 上失败、本次没有任何提交。同时断言闭包返回给 Pool 的也是同一个合并错误，呼应验收行"不能以 Pool 忽略 job 错误代替对外可见性"。
 4. `Handle.owner` 是新增字段。`RecordCompletion` 是 Agent 的方法且拒绝别人的 Run，队列必须记住这个 Run 属于哪个 Agent；不新增该字段就只能让调用方自己保管 Agent，等于把已复现过的身份错配留给调用方。
 
-BC-04 未发现需要另卡修复的缺陷。V7 通过；V2、V8 留给 BC-05，V9 留给 BC-06。
+**评审后修复（P2，2026-10-12）：**
+
+评审指出：worker 从 `h.run.Wait()` 拿到的结果与 `Handle.Wait()` 递给调用方的是同一个消息对象，而收尾副本要到 `recordSettled` 才拷——这中间调用方就地改写 `Wait()` 的结果，就会污染随后保存的收尾结果，使它和已落盘的终态不一致。复现出两种时序：终态提交卡在闸门期间改写；worker 还没消费任务、调用方先自己 `Wait()` 驱动运行并改写、之后再消费。两种都得到 `WaitRecorded` 返回 `"调用方改写"` 而持久化终态仍是原文。
+
+- 实现改动：新增 `agent.Run.FrozenOutcome()`（`agent/run.go`）——在 `terminalMu` 下返回 drive 冻结结局的独立副本 + 冻结错误，未结束时返回零值；队列闭包改成先 `h.run.Wait()` 驱动、再 `res, runErr := h.run.FrozenOutcome()`，收尾与合并错误都以这份冻结结局为准；`recordSettled` 不再另拷一次。这样"改写 Wait 返回值"根本碰不到收尾副本：drive 在发布终态事件之前就把结局冻结成另一份拷贝，`Wait` 递出的活对象再怎么被改，`FrozenOutcome` 拿到的仍是冻结内容。
+- 队列侧不新增等待路径：`FrozenOutcome` 在 `Wait` 返回之后调用，此时 done 已关、结局必然已冻结（drive 的既有顺序保证，见 BC-03 偏离 4），不需要额外的"还没冻结怎么办"分支。
+- 新增用例：`TestQueueWaitRecordedIsolatedFromWaitEdits`（两个子用例，各自复现评审的一种时序，断言收尾结果与已落盘终态文本都仍是原文）、`agent` 侧 `TestFrozenOutcomeIsDeepCopy`（拿到出口副本就地改写后，`RecordCompletion` 仍写冻结内容）。原有"改过 Wait 返回值再等记录"子用例保留，它测的是改写发生在收尾之后。
+
+| 命令 | 结果 |
+| --- | --- |
+| 修复前 `go test ./queue -run TestQueueWaitRecordedIsolatedFromWaitEdits -count=1 -v` | 两个子用例都 FAIL：`WaitRecorded 返回 "调用方改写"，期望 "原始结果"`（评审复现确认） |
+| 修复后同三条相关用例（含 `TestFrozenOutcomeIsDeepCopy`）`-count=2` | 全 PASS |
+| `go test ./queue ./agent -count=3` | 两包 ok，无抖动 |
+| `go test -race ./queue ./agent ./checkpoint -count=1` | 三包 ok |
+| `go build ./...`、`go vet ./...`、`go test ./... -count=1` | 退出 0，31 包 ok，无 FAIL |
+| 反向验证（对应上表第 9、10 条） | 两项改动各自被抓：来源改回活对象 → 两条时序用例红；去掉出口副本 → `TestFrozenOutcomeIsDeepCopy` 红 |
+
+一处实测澄清：把"改写"与"拷贝"做成真正并发，`-race` 在本用例里报不出来（改写点在闸门放行之前、拷贝在放行之后，二者已被串行化）。评审提到的并发读写风险没有独立复现，但按来源修复后共享对象不再被读取，风险随之消失。
+
+V7 通过（含上述修复）；V2、V8 留给 BC-05，V9 留给 BC-06。
 
 ### BC-05：状态查询、治理与兼容性
 
