@@ -161,4 +161,6 @@ freezeCheckpoint/cloneCheckpoint 必须深拷贝 Completion，Result.Message 使
 
 BC-04 复核发现收尾结果的来源不对：worker 原先直接用 `h.run.Wait()` 的返回值，而 `Wait` 递出的是运行自己的结果对象，调用方在终态提交期间（或任务被消费之前）就地改写它，收尾结果就会与已落盘的终态不一致。已改为新增只读出口 `Run.FrozenOutcome() (core.Result, error)`——在终态锁下返回 drive 冻结结局的独立副本，未结束时返回零值，与 `Run.Paused()` 同样是"只在运行结束后有意义"的读法；队列闭包先驱动运行到结束，再从这份冻结结局取收尾结果与运行错误。D5 里"队列通过 Run 的只读方法获取结局"因此从 `Paused()` 一个扩展为 `Paused()` + `FrozenOutcome()` 两个。回归用例：`TestQueueWaitRecordedIsolatedFromWaitEdits`（两种时序：提交期间被改写、消费前被改写）、`agent` 侧 `TestFrozenOutcomeIsDeepCopy`。
 
-`Agent.RunStatus` 仍未实施，V2、V8、V9 尚未执行。
+D5 的查询接口由 BC-05 落地（2026-10-12）：新增 `agent/run_status.go`，`(*Agent).RunStatus` 先 `core.CheckThreadID` 再读 `Latest`，store 错误原样返回、未知线程得到 `Exists=false` 而不是错误，`Paused` 由 `Completion == nil && (Pause != nil || Pending != nil)` 得出；全程不 Save、不 Commit、不取 claim、不续租，实测统计各调用次数后确认查询只读。V8 的另一半是兼容基线：不调用 `RecordCompletion` 的前台路径历史条数不变、零终态记录，`RunStatus` 的出口副本被改写不污染历史（Memory/File 双后端）。治理侧 V2 也由 BC-05 用真实后台路径（入队 + worker + `WaitRecorded` + `RunStatus`）覆盖：`RunBudget` 的 `MaxDuration` 越过后运行按正常收尾结束、终态是 completed 而不是预算错误 failed；配置有限 `WithToolTimeout` 后框架不再等待一个不看 context 的工具；未配工具超时的在途工具不会被预算打断（用例先证明上限确实越过、工具确实在途，放行后才收尾）；`MaxTurns` 只约束有限、会返回的模型循环。一处按实测补强：真实中断写下的快照同时带 `Pause` 与 `Pending`，两个字段各测一半才钉得住 `Paused` 的判定，直接写入两份单字段快照后两条断言才由绿转红。
+
+V2、V8 已由 `agent/run_status_test.go`、`queue/background_budget_test.go` 覆盖并通过（含 `-race ./queue ./agent ./checkpoint`）。`Agent.RunStatus` 已实施；V9（子进程跨进程读写终态与文件、最终回归）留给 BC-06。

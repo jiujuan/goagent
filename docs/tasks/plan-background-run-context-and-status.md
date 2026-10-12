@@ -2,7 +2,7 @@
 
 > 执行者说明：按 executing-plans 技能串行执行 BC-01 至 BC-06，先写对应失败测试，再做最小实现，检查通过后勾选。本文接口与测试均为待实施设计，不能描述为当前已有能力。使用符号名定位代码，不依赖旧稿行号。
 
-- 日期：2026-10-12；状态：BC-01、BC-02、BC-03、BC-04 已完成（见各卡执行记录），BC-05、BC-06 未开工。
+- 日期：2026-10-12；状态：BC-01…BC-05 已完成（见各卡执行记录），BC-06 未开工。
 - 依据：[ADR-0033](../adr/ADR-0033-background-run-context-and-status.md) 的审核修订版 D1–D6、V1–V9。
 - 工作目录：D:/codeproject/mygo/goagent。下文文件路径均相对此目录。
 - 未开工的卡片所写接口与测试仍是设计，不能描述为当前已有能力；已落地范围以各卡执行记录为准。
@@ -315,19 +315,66 @@ V7 通过（含上述修复）；V2、V8 留给 BC-05，V9 留给 BC-06。
 
 ### BC-05：状态查询、治理与兼容性
 
-**状态：** 待实施。**文件：** 新增 agent/run_status.go、agent/run_status_test.go、queue/background_budget_test.go；复用已有 mock 与工具 timeout 夹具。
+**状态：** 已完成（2026-10-12）。**文件：** 新增 agent/run_status.go、agent/run_status_test.go、queue/background_budget_test.go；复用已有 mock 与工具 timeout 夹具。
 
-- [ ] TestRunStatusStates：不存在、有步骤无终态、暂停、completed、failed；字段与 ADR D5 一致。对暂停另走实际 Resume 流程，不把 Paused 当作保证恢复成功。
-- [ ] TestRunStatusErrorsAndCopies：非法 ID、store 读取失败、深拷贝出口；确认查询不 Save/Commit/Claim/续租。
-- [ ] TestRunStatusOldCompletionIsSnapshot：新 run 开始但尚无新 checkpoint 时查询仍可看到旧终态，注释解释不能推断 Running=false。
-- [ ] TestBackgroundRunBudgetWrapsUp：注入时钟越过 MaxDuration，mock 返回正常收尾，WaitRecorded 后为 completed；不得期待预算错误 failed。
-- [ ] TestBackgroundToolTimeoutBoundsWait：有限 WithToolTimeout 触发取消/abandon，检查框架结束等待；不宣称工具 goroutine 已被杀死。
-- [ ] TestBackgroundBudgetDoesNotCancelInflightTool：用工具开始/释放通道和注入时钟验证 duration 不能打断未配工具超时的在途工具；测试必须主动释放工具后收尾。
-- [ ] TestBackgroundMaxTurnsBoundsModelLoop：只断言有限、会返回的模型调用受轮次上限约束，不推广到任意 Runnable 或阻塞 I/O。
-- [ ] TestNonDetachedHistoryCountUnchanged：不调用 RecordCompletion 的前台路径沿用已有历史条数基线；禁止为终态记录改写旧断言。
-- [ ] 运行 go test ./agent ./queue ./middleware -count=1；记录结果。
+- [x] TestRunStatusStates：不存在、有步骤无终态、暂停、completed、failed；字段与 ADR D5 一致。对暂停另走实际 Resume 流程，不把 Paused 当作保证恢复成功。
+- [x] TestRunStatusErrorsAndCopies：非法 ID、store 读取失败、深拷贝出口；确认查询不 Save/Commit/Claim/续租。
+- [x] TestRunStatusOldCompletionIsSnapshot：新 run 开始但尚无新 checkpoint 时查询仍可看到旧终态，注释解释不能推断 Running=false。
+- [x] TestBackgroundRunBudgetWrapsUp：注入时钟越过 MaxDuration，mock 返回正常收尾，WaitRecorded 后为 completed；不得期待预算错误 failed。
+- [x] TestBackgroundToolTimeoutBoundsWait：有限 WithToolTimeout 触发取消/abandon，检查框架结束等待；不宣称工具 goroutine 已被杀死。
+- [x] TestBackgroundBudgetDoesNotCancelInflightTool：用工具开始/释放通道和注入时钟验证 duration 不能打断未配工具超时的在途工具；测试必须主动释放工具后收尾。
+- [x] TestBackgroundMaxTurnsBoundsModelLoop：只断言有限、会返回的模型调用受轮次上限约束，不推广到任意 Runnable 或阻塞 I/O。
+- [x] TestNonDetachedHistoryCountUnchanged：不调用 RecordCompletion 的前台路径沿用已有历史条数基线；禁止为终态记录改写旧断言。
+- [x] 运行 go test ./agent ./queue ./middleware -count=1；记录结果。
 
 **验收：** V2、V8；治理测试证明实际边界，不制造硬期限承诺。
+
+**执行记录（2026-10-12）：**
+
+实现形状（`agent/run_status.go`）：
+
+- `RunStatus` 结构体字段与 D5 一致（`ThreadID`/`Exists`/`Paused`/`Revision`/`Step`/`Completion`/`Latest`）；`(*Agent).RunStatus(ctx, threadID)` 只做两件事：先 `core.CheckThreadID`，再 `a.store.Latest`。store 错误原样返回且不填任何字段；`Latest == nil` 时 `Exists` 为假；`Paused = Completion == nil && (Pause != nil || Pending != nil)`；`Completion` 与 `Latest.Completion` 取自同一个对象。
+- 没有新增写入路径，也没有新增深拷贝 API（见偏离 2）。文档里写明它不能回答"现在是否在跑"，以及 `Paused` 不是恢复成功的承诺。
+
+测试：
+
+- `agent/run_status_test.go`（外部测试包）：`statusCountingStore` 包装 Memory 的协调能力并统计 Save/Load/Latest/History/Commit/BeginRun/RenewClaim/ReleaseClaim 次数，同时可注入 Latest 错误。`TestRunStatusStates`（memory/file 双后端，含"两种暂停元数据"）、`TestRunStatusErrorsAndCopies`（四个子用例）、`TestRunStatusOldCompletionIsSnapshot`、`TestNonDetachedHistoryCountUnchanged`。
+- `queue/background_budget_test.go`（包内测试）：`countingToolModel`（有工具就调用、工具被撤下就用文本回答，并数模型次数）、`heldTool`（阻塞直到放行，并记下确实走过等待分支）、`ignoresContextTool`（不看 context 自己睡 20 秒）、`fastClockAfter`（前 n 次读数不变、其后跳到一小时后）。四个用例都走真实后台路径（`EnqueueAgent` + `NewMemQueue` + `Pool` + `WaitRecorded` + `RunStatus`）。
+
+| 命令 | 结果 |
+| --- | --- |
+| `go test ./agent -run 'TestRunStatus\|TestNonDetached' -count=1 -v` | 四个顶层用例 + 全部子用例 PASS（memory/file 双后端） |
+| `go test ./queue -run TestBackground -count=1 -v` | 四个治理用例 PASS |
+| `go test ./agent -run 'TestRunStatus\|TestNonDetached' -count=3`、`go test ./queue -run 'TestBackground\|TestQueue' -count=3` | ok（0.43s / 3.70s，两处 500ms 与 300ms 负向观察无抖动） |
+| `go test ./middleware -count=1` | ok（预算实现未改动，只被用来构造用例） |
+| `go test -race ./queue ./agent ./checkpoint -count=1` | 三包 ok（queue 2.7s、agent 5.6s、checkpoint 3.7s） |
+| `go build ./...`、`go vet ./...`、`go test ./... -count=1` | 退出 0，31 包 ok，无 FAIL |
+| `gofmt -l`（三个新增文件） | 无输出 |
+
+反向验证（每次只改一处实现，恢复后复跑；引号为实测失败信息）：
+
+`agent/run_status.go`：
+1. `Paused` 只看 `Pause` → `只有待办工具 应读成暂停: {... Paused:false ...}`。
+2. `Paused` 只看 `Pending` → `只有暂停描述 应读成暂停: {... Paused:false ...}`。
+3. 去掉 `core.CheckThreadID` → `非法 ID "" 被接受`。
+4. 吞掉 store 错误 → `错误 = <nil>，期望原样返回 存储不可用`。
+5. 不填 `Completion` → `终态不符: <nil>`、`失败终态不符: <nil>`。
+6. 查询里顺手 `Save` 一次 → `查询触发了 Save：0 -> 3`。
+7. 空线程也当存在 → `未知线程读出了内容: {Exists:true ...}`。
+
+治理机制（被测实现，不是测试自己）：
+8. `middleware.RunBudget.ModifyRequest` 不再撤工具（永不进入收尾模式）→ `预算超限应正常收尾，实际: agent: loop exceeded MaxTurns`。
+9. `agent/exectools.go` 忽略配置的工具超时（走无限等待分支）→ `框架仍在等待一个不看 context 的工具`。
+10. `agent/loop.go` 轮次上限放宽 3 → `模型调用 6 次，期望等于上限 3`。
+11. `middleware.RunBudget.BeforeTool` 去掉"这一轮请求确实带了工具"的门槛（预算越过后在工具执行前就拦停）→ `在途工具没有开始`。
+
+**与卡的偏离（三条）：**
+
+1. 暂停的两个元数据字段要各测一半。真实中断夹具（审批闸门）写下的快照同时带 `Pause` 与 `Pending`，所以只看其中任一半的实现都能通过，第一轮实测里"只看 Pause""只看 Pending"两个改动都是绿的。补了"两种暂停元数据"子用例：直接向 store 写两份各只含一个字段的快照。补完后两条都变红。
+2. `RunStatus` 不额外做深拷贝，也不为此在 checkpoint 包开新的导出 API。理由：`checkpoint` 已有的两个 store 在读取时就交出副本（`checkpoint/memory.go:67` 的 `Latest` 走 `cloneCheckpoint`；`checkpoint/file.go:509` 每次从日志解码新对象），实测"改写出口再重读"两条后端都不污染历史；在 agent 再拷一次没有可观测差别，还会把"store 自己决定交出什么"这条边界藏起来。已在 `Latest` 字段注释里写明这层边界由 store 决定。登记不修。
+3. 时钟注入按"第几次读数"跳变，`TestBackgroundBudgetDoesNotCancelInflightTool` 还要保证越过上限的时机：上限必须在模型已答应调用工具、`AfterModel` 记完账之后才跨过，否则 `ModifyRequest` 会先撤掉工具、那一轮根本不会发起工具调用。实现方式是让时钟依赖模型调用计数（`calls >= 1` 之后跳一小时），并在用例里先断言 `OnExceed` 报出的资源含 `duration`，再断言运行没结束——避免"其实没越界"的空转。同时 `heldTool` 记下自己确实走了等待分支，防止"工具立刻返回"让负向观察失去意义。
+
+BC-05 未发现需要另卡修复的缺陷。V2、V8 通过；V9（跨进程与最终回归）留给 BC-06。
 
 ### BC-06：文档、示例与最终验收
 
