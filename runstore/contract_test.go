@@ -442,13 +442,13 @@ func TestRunStoreVersionsAndClock(t *testing.T) {
 	}
 }
 
-// TestRunStoreCopyIsolation 证明出入口都不共享内存。
+// TestRunStoreCopyIsolation 证明出入口都不共享内存：调用方改进来的记录、拿到手的记录、
+// 还有 Create 返回值，都碰不到存储里的那一份。
 func TestRunStoreCopyIsolation(t *testing.T) {
 	for _, f := range storeFactories() {
 		f := f
 		t.Run(f.name, func(t *testing.T) {
 			stubClock(t, testBase(), time.Hour)
-			ctx := context.Background()
 			store := f.make(t)
 
 			payload := []byte{1, 2, 3}
@@ -473,7 +473,7 @@ func TestRunStoreCopyIsolation(t *testing.T) {
 			input.RecordError.Code = "mutated"
 			input.Result.Message.Parts[0].(core.Image).Data[1] = 9
 
-			roundtripStore(t, store, ctx, "iso")
+			roundtripStore(t, store, "iso")
 
 			// 出口对象同样改不动存储。
 			exported := getRecord(t, store, "iso")
@@ -482,7 +482,15 @@ func TestRunStoreCopyIsolation(t *testing.T) {
 			exported.Error.Code = "mutated"
 			exported.RecordError.Code = "mutated"
 			exported.JobID = "mutated"
-			roundtripStore(t, store, ctx, "iso")
+			roundtripStore(t, store, "iso")
+
+			// 写入接口返回的记录也是副本，顺着它的指针改不动存储。
+			created.Error.Code = "mutated"
+			created.RecordError.Code = "mutated"
+			*created.LatestCheckpointRef = checkpoint.Ref{ThreadID: "c", CheckpointID: "d"}
+			created.Result.Message.Parts[0].(core.Image).Data[0] = 5
+			created.JobID = "mutated"
+			roundtripStore(t, store, "iso")
 
 			if created.Version != 1 {
 				t.Fatalf("出口对象被改坏: %+v", created)
@@ -491,9 +499,9 @@ func TestRunStoreCopyIsolation(t *testing.T) {
 	}
 }
 
-// TestRunStoreWriteReturnsCopies 证明写入接口返回的记录也是副本：调用方拿到 Create 或
-// CompareAndSwap 的返回值之后改它，存储里的内容不受影响。
-func TestRunStoreWriteReturnsCopies(t *testing.T) {
+// TestRunCASReturnsCopies 证明 CompareAndSwap 返回的记录也是副本：顺着它的指针改，
+// 改不动存储里那一份。
+func TestRunCASReturnsCopies(t *testing.T) {
 	for _, f := range storeFactories() {
 		f := f
 		t.Run(f.name, func(t *testing.T) {
@@ -501,18 +509,7 @@ func TestRunStoreWriteReturnsCopies(t *testing.T) {
 			store := f.make(t)
 			created := mustCreate(t, store, recordIn("wcopy", StatusQueued, testBase()))
 
-			created.Error = &RunError{Code: "mutated"}
-			created.Result = settledResult("mutated")
-			created.LatestCheckpointRef = &checkpoint.Ref{ThreadID: "x", CheckpointID: "y"}
-			created.CompletionRef = &checkpoint.Ref{ThreadID: "x", CheckpointID: "z"}
-			if stored := getRecord(t, store, "wcopy"); stored.Error != nil ||
-				stored.Result != nil ||
-				stored.LatestCheckpointRef != nil ||
-				stored.CompletionRef != nil {
-				t.Fatalf("Create 返回值与存储共享了指针: %+v", stored)
-			}
-
-			// 存储里先放一条带指针的记录，再用 CAS 取回它并改返回对象。
+			// 存储里先放一条带指针的记录，再取回 CAS 的返回对象并改它。
 			withRefs, err := cas(t, store, "wcopy", created.Version, func(r *RunRecord) {
 				r.Status = StatusRunning
 				r.LatestCheckpointRef = &checkpoint.Ref{ThreadID: "thread-wcopy", CheckpointID: "cp-live"}
@@ -535,7 +532,7 @@ func TestRunStoreWriteReturnsCopies(t *testing.T) {
 	}
 }
 
-func roundtripStore(t *testing.T, store Store, ctx context.Context, runID string) {
+func roundtripStore(t *testing.T, store Store, runID string) {
 	t.Helper()
 	record := getRecord(t, store, runID)
 	if record.Result.Message.Parts[0].(core.Image).Data[0] != 1 ||
