@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // runFormatVersion is the on-disk format of a run journal line. A line whose version is
@@ -18,11 +19,6 @@ import (
 const runFormatVersion = 1
 
 const eventKindRecord = "record"
-
-// maxRunIDLen bounds a RunID, which is used verbatim as one journal name and one lock name
-// inside the runs directory. Same bound as a checkpoint thread id, so one caller can use
-// either kind of id as a file name.
-const maxRunIDLen = 64
 
 // journalEvent is one append-only line: the record as it stood after the write, plus the
 // version it replaced. PrevVersion lets replay detect a duplicate append of the same event
@@ -48,6 +44,16 @@ type File struct {
 	runs string
 	mu   sync.Mutex
 	ops  fileOps
+	now  func() time.Time
+}
+
+// stamp takes one reading of this store's clock for one write attempt, in UTC like every
+// timestamp the store assigns.
+func (f *File) stamp() time.Time {
+	if f.now == nil {
+		return storageClock()
+	}
+	return f.now().UTC()
 }
 
 type fileOps struct {
@@ -78,44 +84,24 @@ func NewFile(dir string) (*File, error) {
 // path resolves a RunID to its journal, refusing anything that could escape the runs
 // directory.
 func (f *File) path(runID string) (string, error) {
-	if err := checkRunID(runID); err != nil {
+	if err := CheckRunID(runID); err != nil {
 		return "", err
 	}
 	return filepath.Join(f.runs, runID+".jsonl"), nil
 }
 
 func (f *File) lockPath(runID string) (string, error) {
-	if err := checkRunID(runID); err != nil {
+	if err := CheckRunID(runID); err != nil {
 		return "", err
 	}
 	return filepath.Join(f.runs, runID+".lock"), nil
-}
-
-// checkRunID accepts only characters that are safe as a file name on every supported
-// platform. A RunID comes from the caller, so an id carrying path syntax would place one
-// run's record outside the store.
-func checkRunID(id string) error {
-	if id == "" {
-		return fmt.Errorf("runstore: run id is empty: %w", ErrInvalidRecord)
-	}
-	if len(id) > maxRunIDLen {
-		return fmt.Errorf("runstore: run id %q is %d bytes; the limit is %d: %w", id, len(id), maxRunIDLen, ErrInvalidRecord)
-	}
-	for _, r := range id {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-		default:
-			return fmt.Errorf("runstore: run id %q contains %q; only A-Z a-z 0-9 - _ are allowed: %w", id, r, ErrInvalidRecord)
-		}
-	}
-	return nil
 }
 
 // Create records a new run. See Store.Create.
 func (f *File) Create(ctx context.Context, record RunRecord) (RunRecord, error) {
 	var out RunRecord
 	err := f.withRun(ctx, record.RunID, func(latest *RunRecord) error {
-		created, err := prepareCreate(latest, record, nowStamp())
+		created, err := prepareCreate(latest, record, f.stamp())
 		if err != nil {
 			return err
 		}
@@ -156,7 +142,7 @@ func (f *File) Get(ctx context.Context, runID string) (RunRecord, error) {
 func (f *File) CompareAndSwap(ctx context.Context, runID string, expectedVersion uint64, next RunRecord) (RunRecord, error) {
 	var out RunRecord
 	err := f.withRun(ctx, runID, func(latest *RunRecord) error {
-		updated, err := prepareCAS(latest, runID, expectedVersion, next, nowStamp())
+		updated, err := prepareCAS(latest, runID, expectedVersion, next, f.stamp())
 		if err != nil {
 			return err
 		}

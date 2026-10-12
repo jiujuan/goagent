@@ -7,10 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
-	"sync"
 	"testing"
 	"time"
 )
@@ -78,16 +76,6 @@ func TestRunFileProcessHelper(t *testing.T) {
 	if encodeErr := json.NewEncoder(os.Stdout).Encode(outcome); encodeErr != nil {
 		t.Fatal(encodeErr)
 	}
-}
-
-type runProcessChild struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout *io.PipeReader
-	stderr *bytes.Buffer
-	done   chan struct{}
-	wait   sync.Once
-	err    error
 }
 
 // TestRunFileCASAcrossProcesses 让两个进程在同一个版本上各写一次：只有一方成功，落盘的

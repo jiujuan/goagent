@@ -18,6 +18,7 @@ package runstore
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jiujuan/goagent/checkpoint"
@@ -44,7 +45,7 @@ const (
 	// StatusFailed ends this run with an error.
 	StatusFailed Status = "failed"
 	// StatusCancelled ends this run because a persisted cancellation request was
-	// observed before any worker started it.
+	// observed — before any worker started it, or honoured while it was running.
 	StatusCancelled Status = "cancelled"
 )
 
@@ -88,6 +89,11 @@ const (
 	ErrCodeDeadlineExceeded = "deadline_exceeded"
 	// ErrCodeExecutionFailed means the run itself ended with an error.
 	ErrCodeExecutionFailed = "execution_failed"
+	// ErrCodeCompletionRecord means the run reached an outcome but the terminal
+	// checkpoint record could not be committed. It belongs in RecordError, never in
+	// Error: execution success and durable bookkeeping stay separate outcomes
+	// (ADR-0033 D4, ADR-0034 D5).
+	ErrCodeCompletionRecord = "completion_record_failed"
 )
 
 // Store errors.
@@ -174,6 +180,33 @@ type RunRecord struct {
 
 	// Version is this record's CAS counter, assigned by the store starting at 1.
 	Version uint64 `json:"version"`
+}
+
+// maxRunIDLen bounds a RunID. The durable store uses it verbatim as one journal name and
+// one lock name, so the limit keeps it clear of the 255 byte name limit any target
+// filesystem imposes — the same bound a checkpoint thread id follows.
+const maxRunIDLen = 64
+
+// CheckRunID reports whether id may key a run record. A RunID is supplied by the caller and
+// is used as a file name by the durable store, so an id carrying path syntax would place one
+// run's record outside the store; only [A-Za-z0-9_-], 1 to maxRunIDLen bytes, is accepted.
+// Every Store applies it, so an id is accepted or refused the same way in memory and on
+// disk. Callers that assign run ids before a record exists use it to fail early.
+func CheckRunID(id string) error {
+	if id == "" {
+		return fmt.Errorf("runstore: run id is empty: %w", ErrInvalidRecord)
+	}
+	if len(id) > maxRunIDLen {
+		return fmt.Errorf("runstore: run id %q is %d bytes; the limit is %d: %w", id, len(id), maxRunIDLen, ErrInvalidRecord)
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return fmt.Errorf("runstore: run id %q contains %q; only A-Z a-z 0-9 - _ are allowed: %w", id, r, ErrInvalidRecord)
+		}
+	}
+	return nil
 }
 
 // terminalDecisionFields are the parts of a terminal record that no later write may

@@ -65,8 +65,8 @@ func validStatus(s Status) bool {
 // validateShape checks the parts of a record that must hold in every stored state,
 // independent of which state it came from.
 func validateShape(r RunRecord) error {
-	if r.RunID == "" {
-		return fmt.Errorf("runstore: record has no run id: %w", ErrInvalidRecord)
+	if err := CheckRunID(r.RunID); err != nil {
+		return err
 	}
 	if !validStatus(r.Status) {
 		return fmt.Errorf("runstore: unknown run status %q: %w", r.Status, ErrInvalidRecord)
@@ -141,8 +141,8 @@ func createContentEqual(stored, next RunRecord) bool {
 // record, which may be nil when the RunID is unknown. Every Store implementation calls
 // this and only this.
 func prepareCAS(stored *RunRecord, runID string, expectedVersion uint64, next RunRecord, now time.Time) (RunRecord, error) {
-	if runID == "" {
-		return RunRecord{}, fmt.Errorf("runstore: compare-and-swap without a run id: %w", ErrInvalidRecord)
+	if err := CheckRunID(runID); err != nil {
+		return RunRecord{}, err
 	}
 	if next.RunID != "" && next.RunID != runID {
 		return RunRecord{}, fmt.Errorf("runstore: compare-and-swap on %q carries run id %q: %w", runID, next.RunID, ErrInvalidRecord)
@@ -158,20 +158,37 @@ func prepareCAS(stored *RunRecord, runID string, expectedVersion uint64, next Ru
 	if stored.Version != expectedVersion {
 		return RunRecord{}, fmt.Errorf("runstore: run %q is at version %d, expected %d: %w", runID, stored.Version, expectedVersion, ErrConflict)
 	}
-	if err := checkImmutableIdentity(*stored, next); err != nil {
+	// Two store-owned facts are repaired before anything is judged: the creation time is
+	// whatever the record already carries, no matter what the caller echoes, and a
+	// cancellation request that is already persisted is not something a later write may
+	// forget. The third — UpdatedAt — is stamped when the write is published below.
+	merged := next
+	merged.CreatedAt = stored.CreatedAt
+	if merged.CancelRequestedAt.IsZero() {
+		merged.CancelRequestedAt = stored.CancelRequestedAt
+	}
+	if err := validateShape(merged); err != nil {
 		return RunRecord{}, err
 	}
-	merged, err := mergeOwnership(*stored, next)
+	// The repaired fields are store-owned facts; everything the caller is trusted to
+	// restate — who the run is and which job it belongs to — is still compared here.
+	if err := checkImmutableIdentity(*stored, merged); err != nil {
+		return RunRecord{}, err
+	}
+	merged, err := mergeOwnership(*stored, merged)
 	if err != nil {
 		return RunRecord{}, err
 	}
-	// The merged record is the one that would be stored, so it is the one shape-checked:
-	// a write that leaves out a fact the store already holds is repaired before it is
-	// judged, not rejected for the omission.
+	// The merged record is the one that would be stored, so it is the one whose shape and
+	// lifecycle are judged: a write that leaves out a fact the store already holds is
+	// repaired above rather than rejected for the omission.
 	return applyLifecycle(merged, *stored, now)
 }
 
-// checkImmutableIdentity rejects a write that rewrites who the run is or when it began.
+// checkImmutableIdentity rejects a write that rewrites who the run is or which job it
+// belongs to. The creation time is not checked here: prepareCAS repairs it from the
+// stored record before this runs, so a caller that echoes a stale one is corrected
+// rather than credited with a change.
 func checkImmutableIdentity(stored, next RunRecord) error {
 	if stored.RunID != next.RunID {
 		return fmt.Errorf("runstore: run %q cannot change its run id to %q: %w", stored.RunID, next.RunID, ErrConflict)
@@ -187,9 +204,6 @@ func checkImmutableIdentity(stored, next RunRecord) error {
 	}
 	if stored.ResumeOfRunID != next.ResumeOfRunID {
 		return fmt.Errorf("runstore: run %q cannot change resume-of from %q to %q: %w", stored.RunID, stored.ResumeOfRunID, next.ResumeOfRunID, ErrConflict)
-	}
-	if !stored.CreatedAt.IsZero() && !next.CreatedAt.IsZero() && !stored.CreatedAt.Equal(next.CreatedAt) {
-		return fmt.Errorf("runstore: run %q cannot change its created at: %w", stored.RunID, ErrConflict)
 	}
 	return nil
 }
@@ -234,16 +248,11 @@ func mergeOwnership(stored, next RunRecord) (RunRecord, error) {
 
 // applyLifecycle gates the state change itself, then stamps the accepted record.
 func applyLifecycle(base, stored RunRecord, now time.Time) (RunRecord, error) {
-	// A cancellation request, once persisted, is a durable fact: no write may drop it or
-	// date it earlier than the request already on record.
-	if base.CancelRequestedAt.IsZero() {
-		base.CancelRequestedAt = stored.CancelRequestedAt
-	} else if !stored.CancelRequestedAt.IsZero() && base.CancelRequestedAt.Before(stored.CancelRequestedAt) {
+	// A cancellation request, once persisted, is a durable fact: no write may date it earlier
+	// than the request already on record.
+	if !stored.CancelRequestedAt.IsZero() && base.CancelRequestedAt.Before(stored.CancelRequestedAt) {
 		return RunRecord{}, fmt.Errorf("runstore: run %q cannot move its cancellation request from %s to %s: %w",
 			stored.RunID, stored.CancelRequestedAt.Format(time.RFC3339Nano), base.CancelRequestedAt.Format(time.RFC3339Nano), ErrConflict)
-	}
-	if err := validateShape(base); err != nil {
-		return RunRecord{}, err
 	}
 	// Liveness never rewinds either.
 	if base.HeartbeatAt.Before(stored.HeartbeatAt) {
@@ -263,7 +272,6 @@ func applyLifecycle(base, stored RunRecord, now time.Time) (RunRecord, error) {
 		return RunRecord{}, fmt.Errorf("runstore: run %q cannot go from %q to %q: %w",
 			stored.RunID, stored.Status, base.Status, ErrInvalidTransition)
 	}
-	base.CreatedAt = stored.CreatedAt
 	base.Version = stored.Version + 1
 	base.UpdatedAt = now
 	return base.clone()

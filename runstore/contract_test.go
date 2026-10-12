@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -252,7 +253,7 @@ func TestRunTerminalRetryWithDifferentOutcome(t *testing.T) {
 	}
 }
 
-// TestRunIdentityIsImmutable 证明 CAS 不能换掉记录的身份与创建时间。
+// TestRunIdentityIsImmutable 证明 CAS 不能换掉记录的身份字段。
 func TestRunIdentityIsImmutable(t *testing.T) {
 	mutations := []struct {
 		name   string
@@ -262,7 +263,6 @@ func TestRunIdentityIsImmutable(t *testing.T) {
 		{"turn", func(r *RunRecord) { r.TurnID = "other-turn" }},
 		{"job", func(r *RunRecord) { r.JobID = "job-late" }},
 		{"resume_of", func(r *RunRecord) { r.ResumeOfRunID = "run-late" }},
-		{"created_at", func(r *RunRecord) { r.CreatedAt = testBase().Add(24 * time.Hour) }},
 	}
 	for _, f := range storeFactories() {
 		f := f
@@ -288,6 +288,34 @@ func TestRunIdentityIsImmutable(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestRunCASRepairsStoreOwnedTimes 证明过时的创建时间会被存储修回原值，写入本身照样通过：
+// 创建时间归存储维护，调用方说什么是决定不了的。
+func TestRunCASRepairsStoreOwnedTimes(t *testing.T) {
+	for _, f := range storeFactories() {
+		f := f
+		t.Run(f.name, func(t *testing.T) {
+			stubClock(t, testBase(), time.Hour)
+			ctx := context.Background()
+			store := f.make(t)
+			base := recordIn("stamp", StatusQueued, testBase())
+			created := mustCreate(t, store, base)
+
+			next := recordIn("stamp", StatusRunning, testBase())
+			next.CreatedAt = testBase().Add(24 * time.Hour)
+			updated, err := store.CompareAndSwap(ctx, "stamp", created.Version, next)
+			if err != nil {
+				t.Fatalf("带过时创建时间的改写应被接受: %v", err)
+			}
+			if !updated.CreatedAt.Equal(created.CreatedAt) {
+				t.Fatalf("改写动了存储的创建时间: %v → %v", created.CreatedAt, updated.CreatedAt)
+			}
+			if stored := getRecord(t, store, "stamp"); !stored.CreatedAt.Equal(created.CreatedAt) {
+				t.Fatalf("落库的创建时间被改写: %v → %v", created.CreatedAt, stored.CreatedAt)
+			}
+		})
 	}
 }
 
@@ -789,6 +817,32 @@ func TestRunCASRestatesWholeRecord(t *testing.T) {
 				t.Fatalf("漏字段的重写丢了创建时间: %v", dropped.CreatedAt)
 			}
 		})
+	}
+}
+
+// TestRunStoreKeySafety 证明 RunID 的键规则由存储层统一把关：两种实现都拒绝不能当文件名
+// 用的 ID，读写都不放过。
+func TestRunStoreKeySafety(t *testing.T) {
+	unsafe := []string{"", "../escape", "a/b", `a\b`, "a:b", "a b", strings.Repeat("x", maxRunIDLen+1)}
+	for _, f := range storeFactories() {
+		f := f
+		for _, id := range unsafe {
+			t.Run(f.name+"/"+id, func(t *testing.T) {
+				stubClock(t, testBase(), time.Hour)
+				ctx := context.Background()
+				store := f.make(t)
+				record := recordIn(id, StatusQueued, testBase())
+				if _, err := store.Create(ctx, record); !errors.Is(err, ErrInvalidRecord) {
+					t.Fatalf("Create(%q) = %v, want ErrInvalidRecord", id, err)
+				}
+				if _, err := store.Get(ctx, id); !errors.Is(err, ErrInvalidRecord) {
+					t.Fatalf("Get(%q) = %v, want ErrInvalidRecord", id, err)
+				}
+				if _, err := store.CompareAndSwap(ctx, id, 1, record); !errors.Is(err, ErrInvalidRecord) {
+					t.Fatalf("CompareAndSwap(%q) = %v, want ErrInvalidRecord", id, err)
+				}
+			})
+		}
 	}
 }
 
