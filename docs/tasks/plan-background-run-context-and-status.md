@@ -209,8 +209,31 @@ BC-01 与 BC-04 同改 queue/agent_bridge.go；BC-03 会修改 agent/run.go、ag
 
 1. 校验顺序：`RecordCompletion` 把"store 支持 Durable"放在"有本次提交边界"之前。按 D4 原文的顺序，只有基础 Checkpointer 的存储永远走 `Store.Save` 分支、永远没有边界，`ErrDurableUnavailable` 就不可达（第一轮实测确实返回的是 `ErrNoCommittedBoundary`，与卡上 `RequiresDurable` 的期望冲突）。调整后两项契约都可观测，其余顺序不变。
 2. `TerminalBoundaryBeforeEvents` 的"执行失败"实测有自己的成功提交：`AgentLoop.fail`（`agent/loop.go` 的 `l.fail`）会写一个不含 Pause/Pending 的接缝。所以失败运行是可记录的（Kind=failed、Err 为文本、Result 为 nil），"无本次边界"的期望只放在"准备失败"子用例上。
-3. 测试按关注点拆成三个文件（`terminal_test.go` 身份/结局/拒绝、`terminal_cas_test.go` 交错与幂等、`terminal_files_test.go` 文件保留），卡上只列了 `terminal_test.go`；未新增内部测试文件，凭据观察全部通过公开行为与测试用存储包装器完成。
+3. 测试按关注点拆成三个文件（`terminal_test.go` 身份/结局/拒绝、`terminal_cas_test.go` 交错与幂等、`terminal_files_test.go` 文件保留），卡上只列了 `terminal_test.go`；当时未新增内部测试文件，凭据观察全部通过公开行为与测试用存储包装器完成（评审后的修复另加了一个包内测试文件，见下）。
 4. `Run` 同时保留 `<-run.done` 与 `terminalFrozen` 两项检查。实测在当前实现下二者等价（冻结先于发布与 finish），但 done 是既有的"运行结束"公开信号，保留它使 `RecordCompletion` 的契约不依赖冻结的内部时序；去掉 done 检查的变异不会被现有用例抓到（`ErrRunNotFinished` 由 frozen 检查兜住），登记为冗余防护而非缺陷。
+
+**评审后修复（P2，2026-10-12）：**
+
+评审指出：`noteCommittedBoundary` 无条件覆盖，而并行分支共用同一份 `durableRunState`（`agent/runtime.go:96` 的 `forBranch` 直接复制 `durable` 指针），回执返回的顺序可以晚于存储提交的顺序——较早 revision 的回执最后返回时，边界从更高 revision 退回到它，运行虽然正常完成，`RecordCompletion` 却用自己冻结的旧 revision 做比较，被当前 head 拒绝。
+
+- 实现改动只有一处：`agent/durable_runtime.go` 的 `noteCommittedBoundary` 在 `d.mu` 内按 revision 单调更新——尚无边界时接受，已有边界时只有更高的 revision 能替换，且 `boundaryID` 与 `boundaryRevision` 作为一对一起写。同 revision 视为不动（同一线程内一个 revision 只对应一条记录，重试拿到的就是同一对值）。`committedBoundary()`、`RecordCompletion`、`drive` 的冻结顺序都没改。
+- 新增 `agent/terminal_boundary_internal_test.go`（包内测试，因为要直接构造共享 durable 状态的分支执行环境并读取 `run.rc`）：`TestNoteCommittedBoundaryIsMonotonic` 钉住推进规则（更低/相同 revision 不动，更高 revision 成对替换）；`TestLateCommitReceiptKeepsHighestBoundary` 用只实现 `checkpoint.Durable` 的存储包装把 revision 1 的回执压住，让较新提交在本 goroutine 写完边界后再放行；`TestParallelRunRecordsCompletionWithLateReceipt` 跑真正的 `Parallel` 工作流，用分支的 `core.TurnDone` 事件（在同一步提交完成之后发布，`agent/loop.go:272`）证明另一条分支的边界已写入，此时才放行迟到的回执，再断言终态记录成功。
+- 可达性实测：存储只实现 `Durable`、不实现 `ThreadCoordinator` 时（线程协调是可选能力，`checkpoint/coordinator.go:34` 的注释写明 Durable 对第三方实现保持不变），`commitCheckpoint` 走 `durable.Commit` 直连分支，两次提交真正并发，顺序错乱可以稳定构造。存储是 `ThreadCoordinator` 时，`writeGuard.commit` 的 `opMu`（`agent/write_guard.go:120`）把提交本身串行化，但边界写在锁释放之后，仍留有一个调度窗口——这个窗口无法从存储外部确定性地打开，所以确定性覆盖放在前一种存储；后一种存储下"正常并行运行仍能记录终态"这一契约由同一个用例覆盖。
+
+| 命令 | 结果 |
+| --- | --- |
+| `go test ./agent -run 'TestLateCommitReceiptKeepsHighestBoundary\|TestNoteCommittedBoundaryIsMonotonic\|TestParallelRunRecordsCompletionWithLateReceipt' -count=1 -v` | 三个 PASS |
+| 同三条用例 `-count=20` | ok（0.18s，无抖动） |
+| `go test -race ./queue ./agent ./checkpoint -count=1` | 三包 ok（agent 5.4s） |
+| `go build ./...`、`go vet ./...`、`go test ./... -count=1` | 退出 0，31 个包 ok，无 FAIL |
+| `gofmt -l`（本轮两个新增/改动文件） | 无输出 |
+
+反向验证（每次只改一处实现，恢复后复跑）：
+
+1. 去掉单调守卫（恢复无条件覆盖），`-count=3` 三个用例 3/3 全红：`迟到回执把边界退回成 cp-early/1(true)，期望留在 cp-late/2`、`更低的 revision 之后边界 = cp-low/3(true)，期望 cp-high/5`、`并行运行的终态记录失败: agent: record completion: commit at revision 1: checkpoint: expected revision does not match head`。第三条的报错就是评审复现到的那个冲突。
+2. 只更新 revision、不更新 ID（破坏"成对更新"），三个用例同样全红：`较新提交后的边界 = /2(true)，期望 cp-late/2`、`更低的 revision 之后边界 = /5(true)，期望 cp-high/5`、`并行运行的终态记录失败: agent: record completion: load boundary : checkpoint: parallel-late-receipt/ not found`。
+
+附带核实的一条既有行为，登记不修：并行分支的边界写在共享的 durable 状态里，所以 `RecordCompletion` 记录的是"本次运行提交过的最高 revision"，而不是某一条分支自己的最后一步——与 D4"运行自己的提交边界"一致。
 
 ### BC-04：队列持久化等待与错误出口
 
