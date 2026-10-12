@@ -26,8 +26,13 @@ type memoryDurableState struct {
 }
 
 type memoryCommitRecord struct {
-	digest   string
-	revision uint64
+	digest       string
+	storedDigest string
+	revision     uint64
+}
+
+func (r memoryCommitRecord) matches(digest string) bool {
+	return digest != "" && (digest == r.digest || digest == r.storedDigest)
 }
 
 func (m *Memory) durableLocked(threadID string) *memoryDurableState {
@@ -125,7 +130,7 @@ func (m *Memory) commitLocked(req CommitRequest) (CommitReceipt, error) {
 	now := m.nowTime()
 	if cp.ID != "" {
 		if committed, ok := st.commits[cp.ID]; ok {
-			if committed.digest != digest {
+			if !committed.matches(digest) {
 				return CommitReceipt{}, ErrCheckpointConflict
 			}
 			cp.Revision = committed.revision
@@ -152,6 +157,10 @@ func (m *Memory) commitLocked(req CommitRequest) (CommitReceipt, error) {
 	if stored.CreatedAt.IsZero() {
 		stored.CreatedAt = m.nowTime().UTC()
 	}
+	storedDigest, err := commitRequestDigest(stored, req.AckMessageIDs, req.Claim, executions)
+	if err != nil {
+		return CommitReceipt{}, err
+	}
 	claim := renewedClaim(st, req, now)
 
 	st.revision = revision
@@ -173,7 +182,7 @@ func (m *Memory) commitLocked(req CommitRequest) (CommitReceipt, error) {
 		claim = nil
 	}
 	if cp.ID != "" {
-		st.commits[cp.ID] = memoryCommitRecord{digest: digest, revision: revision}
+		st.commits[cp.ID] = memoryCommitRecord{digest: digest, storedDigest: storedDigest, revision: revision}
 	}
 	cp.Revision = revision
 	return CommitReceipt{Revision: revision, Claim: claim}, nil

@@ -47,12 +47,24 @@ type durableRunState struct {
 	headRevision    uint64
 	headRevisionSet bool
 
-	// assembled holds the checkpoints this run has already given a lineage. An
-	// empty parent is a determined state for a root record, so re-submitting one
-	// must not be read as "not assembled yet". The map keeps the pointers it
-	// stamped, so an address cannot be recycled behind its back.
-	assembled map[*checkpoint.Checkpoint]struct{}
+	// assembled holds only the immutable lineage assigned to checkpoint IDs in
+	// this run. Stable IDs recognize Load/clone retries, while the lightweight
+	// values avoid retaining historical State and message payloads.
+	assembled map[lineageCheckpointKey]assembledLineage
 	turnID    string
+}
+
+type lineageCheckpointKey struct {
+	threadID     string
+	checkpointID string
+}
+
+type assembledLineage struct {
+	parentID  string
+	parentRef *checkpoint.Ref
+	runID     string
+	turnID    string
+	createdAt time.Time
 }
 
 // lineageNowUTC is the clock a run stamps a freshly constructed checkpoint with.
@@ -181,7 +193,9 @@ func (rc *RunContext) runTurnID() string {
 // up front, such as a fork's cross-thread source, is never overwritten.
 func (rc *RunContext) applyLineageLocked(cp *checkpoint.Checkpoint) {
 	d := rc.ensureDurableState()
-	if _, done := d.assembled[cp]; done {
+	key, stableKey := checkpointLineageKey(cp)
+	if lineage, done := d.assembled[key]; stableKey && done {
+		lineage.apply(cp)
 		return
 	}
 	// A record is never its own parent: the head this run just advanced to is the
@@ -200,10 +214,45 @@ func (rc *RunContext) applyLineageLocked(cp *checkpoint.Checkpoint) {
 	if cp.CreatedAt.IsZero() {
 		cp.CreatedAt = lineageNowUTC()
 	}
-	if d.assembled == nil {
-		d.assembled = make(map[*checkpoint.Checkpoint]struct{}, 4)
+	if stableKey {
+		if d.assembled == nil {
+			d.assembled = make(map[lineageCheckpointKey]assembledLineage, 4)
+		}
+		d.assembled[key] = captureAssembledLineage(cp)
 	}
-	d.assembled[cp] = struct{}{}
+}
+
+func checkpointLineageKey(cp *checkpoint.Checkpoint) (lineageCheckpointKey, bool) {
+	if cp == nil || cp.ThreadID == "" || cp.ID == "" {
+		return lineageCheckpointKey{}, false
+	}
+	return lineageCheckpointKey{threadID: cp.ThreadID, checkpointID: cp.ID}, true
+}
+
+func captureAssembledLineage(cp *checkpoint.Checkpoint) assembledLineage {
+	return assembledLineage{
+		parentID:  cp.ParentID,
+		parentRef: cloneCheckpointRef(cp.ParentRef),
+		runID:     cp.RunID,
+		turnID:    cp.TurnID,
+		createdAt: cp.CreatedAt,
+	}
+}
+
+func (l assembledLineage) apply(cp *checkpoint.Checkpoint) {
+	cp.ParentID = l.parentID
+	cp.ParentRef = cloneCheckpointRef(l.parentRef)
+	cp.RunID = l.runID
+	cp.TurnID = l.turnID
+	cp.CreatedAt = l.createdAt
+}
+
+func cloneCheckpointRef(ref *checkpoint.Ref) *checkpoint.Ref {
+	if ref == nil {
+		return nil
+	}
+	copy := *ref
+	return &copy
 }
 
 // advanceLineageLocked records the checkpoint the store just made visible as the

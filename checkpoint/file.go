@@ -112,6 +112,7 @@ type journalRecord struct {
 	ToolExecution  *ToolExecution         `json:"tool_execution,omitempty"`
 	ToolExecutions []ToolExecution        `json:"tool_executions,omitempty"`
 	RequestDigest  string                 `json:"request_digest,omitempty"`
+	StoredDigest   string                 `json:"stored_digest,omitempty"`
 }
 
 type fileState struct {
@@ -225,7 +226,7 @@ func (f *File) commitLocked(threadID string, st *fileState, req CommitRequest) (
 	now := f.nowTime()
 	if req.Checkpoint.ID != "" {
 		if committed, ok := st.commits[req.Checkpoint.ID]; ok {
-			if committed.digest == "" || committed.digest != digest {
+			if !committed.matches(digest) {
 				return CommitReceipt{}, ErrCheckpointConflict
 			}
 			// A failed Sync leaves the caller without an acknowledgement even
@@ -256,10 +257,15 @@ func (f *File) commitLocked(threadID string, st *fileState, req CommitRequest) (
 	stored.Revision = st.revision + 1
 	// A record constructed without a creation time gets one when it first becomes
 	// visible. The idempotent retry above returned before this point, so a re-send
-	// of the same request never rewrites the time already in the journal, and the
-	// recorded digest stays the one computed without it.
+	// of the same request never rewrites the time already in the journal. Keep
+	// digests for both the caller's request and the final stored shape so either
+	// form can be recognized after a Load.
 	if stored.CreatedAt.IsZero() {
 		stored.CreatedAt = now.UTC()
+	}
+	storedDigest, err := commitRequestDigest(stored, req.AckMessageIDs, req.Claim, toolExecutions)
+	if err != nil {
+		return CommitReceipt{}, err
 	}
 	checkpoint, blobRecords, newHashes, err := buildCheckpointRecord(stored, st.blobs)
 	if err != nil {
@@ -275,6 +281,7 @@ func (f *File) commitLocked(threadID string, st *fileState, req CommitRequest) (
 		ReleaseClaim:   req.ReleaseClaim && req.Claim != nil,
 		ToolExecutions: toolExecutions,
 		RequestDigest:  digest,
+		StoredDigest:   storedDigest,
 	}
 	if err := f.appendRecordLocked(threadID, st, blobRecords, rec); err != nil {
 		return CommitReceipt{}, err
@@ -759,7 +766,15 @@ func applyJournalRecord(st *fileState, rec journalRecord) {
 				if digest == "" {
 					digest, _ = legacyCommitRequestDigest(st, rec)
 				}
-				st.commits[id] = memoryCommitRecord{digest: digest, revision: rec.Checkpoint.Revision}
+				storedDigest := rec.StoredDigest
+				if storedDigest == "" {
+					storedDigest, _ = legacyCommitRequestDigest(st, rec)
+				}
+				st.commits[id] = memoryCommitRecord{
+					digest:       digest,
+					storedDigest: storedDigest,
+					revision:     rec.Checkpoint.Revision,
+				}
 			}
 		}
 		for _, id := range rec.AckMessageIDs {

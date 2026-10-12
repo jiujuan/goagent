@@ -804,6 +804,41 @@ func TestLineageRetryRootAfterHeadAdvanced(t *testing.T) {
 	}
 }
 
+// TestLineageRetryLoadedRootAfterHeadAdvanced proves retry identity is stable
+// across Load/clone rather than tied to the address of the original Go object.
+func TestLineageRetryLoadedRootAfterHeadAdvanced(t *testing.T) {
+	ctx := context.Background()
+	threadID := "lineage-retry-loaded-root"
+	store := newLineageStore(checkpoint.NewMemory())
+	rc := newLineageRunContext(store, threadID, "run-retry-loaded-root")
+
+	for _, id := range []string{"root-a", "step-b", "step-c"} {
+		cp := &checkpoint.Checkpoint{ID: id, ThreadID: threadID, State: *rc.State}
+		if err := rc.commitCheckpoint(cp, false); err != nil {
+			t.Fatalf("commit %s: %v", id, err)
+		}
+	}
+
+	loadedRoot, err := store.Load(ctx, threadID, "root-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rc.commitCheckpoint(loadedRoot, false); err != nil {
+		t.Fatalf("retry loaded root: %v", err)
+	}
+	if loadedRoot.ParentID != "" || loadedRoot.ParentRef != nil {
+		t.Fatalf("retry rewrote loaded root parent: %q %+v", loadedRoot.ParentID, loadedRoot.ParentRef)
+	}
+
+	next := &checkpoint.Checkpoint{ID: "step-d", ThreadID: threadID, State: *rc.State}
+	if err := rc.commitCheckpoint(next, false); err != nil {
+		t.Fatal(err)
+	}
+	if next.ParentID != "step-c" {
+		t.Fatalf("loaded retry moved head: step-d parent = %q, want step-c", next.ParentID)
+	}
+}
+
 // TestLineageOlderRetryDoesNotMoveHeadBack：幂等确认一条旧提交不能把本地 head
 // 拉回那条旧记录，否则之后的提交会插到历史中间去。
 func TestLineageOlderRetryDoesNotMoveHeadBack(t *testing.T) {

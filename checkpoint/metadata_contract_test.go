@@ -447,6 +447,16 @@ func TestCommitAssignsCreatedAtOnce(t *testing.T) {
 			if !again.CreatedAt.Equal(firstTime) {
 				t.Fatalf("幂等重试改写了已落盘的创建时间: %s", again.CreatedAt)
 			}
+			// Load returns the stored shape, including the timestamp assigned on
+			// first visibility. Saving that unchanged shape must also be idempotent.
+			if err := advanced.Save(ctx, again); err != nil {
+				t.Fatalf("saving an unchanged loaded checkpoint: %v", err)
+			}
+			changedTime := *again
+			changedTime.CreatedAt = laterTime
+			if err := advanced.Save(ctx, &changedTime); !errors.Is(err, ErrCheckpointConflict) {
+				t.Fatalf("saving a changed CreatedAt error = %v, want %v", err, ErrCheckpointConflict)
+			}
 			hist, err := advanced.History(ctx, threadID)
 			if err != nil {
 				t.Fatal(err)
@@ -474,6 +484,79 @@ func TestCommitAssignsCreatedAtOnce(t *testing.T) {
 				t.Fatalf("store 改写了调用方给出的创建时间: %s", got.CreatedAt)
 			}
 		})
+	}
+}
+
+func TestFileLegacyAssignedCreatedAtDigestCompatibility(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	threadID := "legacy-assigned-created-at"
+	firstTime := time.Date(2026, time.October, 12, 10, 0, 0, 0, time.UTC)
+
+	store, err := NewFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.now = func() time.Time { return firstTime }
+	rebuild := func() *Checkpoint {
+		return &Checkpoint{
+			ID:       "legacy-stamp-cp",
+			ThreadID: threadID,
+			State:    core.State{Messages: []core.Message{core.UserText("question")}},
+		}
+	}
+	if err := store.Save(ctx, rebuild()); err != nil {
+		t.Fatal(err)
+	}
+
+	journalPath := filepath.Join(dir, threadID+".jsonl")
+	data, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacyLines []byte
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		if len(line) == 0 {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal(line, &rec); err != nil {
+			t.Fatal(err)
+		}
+		delete(rec, "stored_digest")
+		encoded, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		legacyLines = append(legacyLines, encoded...)
+		legacyLines = append(legacyLines, '\n')
+	}
+	if err := os.WriteFile(journalPath, legacyLines, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := NewFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := reopened.Load(ctx, threadID, "legacy-stamp-cp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.CreatedAt.Equal(firstTime) {
+		t.Fatalf("loaded CreatedAt = %s, want %s", loaded.CreatedAt, firstTime)
+	}
+	if err := reopened.Save(ctx, loaded); err != nil {
+		t.Fatalf("saving legacy stored shape: %v", err)
+	}
+	if err := reopened.Save(ctx, rebuild()); err != nil {
+		t.Fatalf("retrying legacy original request: %v", err)
+	}
+
+	changed := *loaded
+	changed.CreatedAt = firstTime.Add(time.Minute)
+	if err := reopened.Save(ctx, &changed); !errors.Is(err, ErrCheckpointConflict) {
+		t.Fatalf("saving changed legacy CreatedAt error = %v, want %v", err, ErrCheckpointConflict)
 	}
 }
 
