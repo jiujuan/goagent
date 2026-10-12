@@ -137,7 +137,7 @@ freezeCheckpoint/cloneCheckpoint 必须深拷贝 Completion，Result.Message 使
 
 ## 验证
 
-编号供执行计划逐项映射，以下均为待实施验收，不是已通过结果。
+编号供执行计划逐项映射。起草时这些均为待实施验收；BC-01…BC-06 落地后，V1–V9 的逐项通过证据见"实施结果"与执行计划卡 BC-06 的对照表。
 
 1. V1 context：提交后取消仍完成；入口已取消失败；入队失败、显式 Cancel、闭包退出均释放派生 context；检查 Done，不以 goroutine 数量推导 context 数量。
 2. V2 治理：RunBudget 超限正常收尾；有限 ToolTimeout 的超时/abandon；未配置工具超时时预算不能中断在途工具（用测试闸门释放，禁止泄漏测试进程）。
@@ -163,4 +163,8 @@ BC-04 复核发现收尾结果的来源不对：worker 原先直接用 `h.run.Wa
 
 D5 的查询接口由 BC-05 落地（2026-10-12）：新增 `agent/run_status.go`，`(*Agent).RunStatus` 先 `core.CheckThreadID` 再读 `Latest`，store 错误原样返回、未知线程得到 `Exists=false` 而不是错误，`Paused` 由 `Completion == nil && (Pause != nil || Pending != nil)` 得出；全程不 Save、不 Commit、不取 claim、不续租，实测统计各调用次数后确认查询只读。V8 的另一半是兼容基线：不调用 `RecordCompletion` 的前台路径历史条数不变、零终态记录，`RunStatus` 的出口副本被改写不污染历史（Memory/File 双后端）。治理侧 V2 也由 BC-05 用真实后台路径（入队 + worker + `WaitRecorded` + `RunStatus`）覆盖：`RunBudget` 的 `MaxDuration` 越过后运行按正常收尾结束、终态是 completed 而不是预算错误 failed；配置有限 `WithToolTimeout` 后框架不再等待一个不看 context 的工具；未配工具超时的在途工具不会被预算打断（用例先证明上限确实越过、工具确实在途，放行后才收尾）；`MaxTurns` 只约束有限、会返回的模型循环。一处按实测补强：真实中断写下的快照同时带 `Pause` 与 `Pending`，两个字段各测一半才钉得住 `Paused` 的判定，直接写入两份单字段快照后两条断言才由绿转红。
 
-V2、V8 已由 `agent/run_status_test.go`、`queue/background_budget_test.go` 覆盖并通过（含 `-race ./queue ./agent ./checkpoint`）。`Agent.RunStatus` 已实施；V9（子进程跨进程读写终态与文件、最终回归）留给 BC-06。
+V2、V8 已由 `agent/run_status_test.go`、`queue/background_budget_test.go` 覆盖并通过（含 `-race ./queue ./agent ./checkpoint`）。
+
+BC-06（2026-10-12）收口 V9 与文档：新增 `agent/run_status_process_test.go` 的 `TestRunStatusAcrossProcess` 让子进程（`os.Executable()` 重跑本测试二进制）走完整后台链路——`EnqueueAgent` 后取消提交 context、`WaitRecorded` 返回 nil、子进程自己读到 completed 终态——退出后父进程用全新的 `checkpoint.NewFile(dir)` 实例与全新 Agent 读出同一条终态（RunID、head ID、revision、结果文本一致）和同一份 `report.txt`，再在同线程新运行里用工具把文件读回来并确认 head 继续前进。新增 `examples/background-status` 演示这条路径的用法与错误分诊（`ErrRevisionConflict`/`ErrClaimConflict`/`ErrStaleFencingToken`/`ErrDurableUnavailable`/`agent.ErrNoCommittedBoundary` 各给处置），README 增"后台运行的终态与状态查询"一节说明两个终点、记录拒绝条件、冲突语义、崩溃窗口、三条时间线（30 秒记录期限 ≠ 整次运行期限 ≠ 单个工具上限）与保持不做清单；`queue` 包文档与 `Pool.Run` 注释明写"Pool 的 context 取消只停止取任务，不中止已在执行的运行，中止用 `Handle.Cancel`"。README 里把跨进程进度事件说成 `bus` 内置能力的一行已更正：`bus` 包只有进程内 pub/sub，Redis 后端在 `queue/redis_pubsub.go`（`queue.NewBus(queue.WithRedis(url))`）与 `queue/redis_stream.go`。
+
+最终门禁（实测，2026-10-12，Windows）：`go build ./...` 与 `go vet ./...` 无输出、退出 0；`go test ./... -count=1` 退出 0，31 个包 ok、0 个 FAIL、58 个包无测试文件；`go test -race ./queue ./agent ./checkpoint -count=1` 三包 ok（queue 2.66s、agent 6.73s、checkpoint 3.76s）。验收全部离线（mock 模型、临时目录 JSONL、测试二进制自重跑）；`queue/redis_pubsub.go`、`queue/redis_stream.go` 与 `examples/redis` 没有自动化测试，这轮门禁不为它们背书。一处采集方式的偏离：跨进程用例先等子进程退出再一次性读完整段 stdout 取 JSON 行，因为 go test 的失败诊断也写 stdout，逐行边读边解析会在子进程失败时丢掉诊断信息；删掉队列的终态提交后该用例实测变红并完整带出子进程的诊断，恢复后复跑通过。V1–V9 的逐项证据映射见执行计划卡 BC-06。

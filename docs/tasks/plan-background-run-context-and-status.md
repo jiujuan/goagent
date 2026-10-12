@@ -2,10 +2,10 @@
 
 > 执行者说明：按 executing-plans 技能串行执行 BC-01 至 BC-06，先写对应失败测试，再做最小实现，检查通过后勾选。本文接口与测试均为待实施设计，不能描述为当前已有能力。使用符号名定位代码，不依赖旧稿行号。
 
-- 日期：2026-10-12；状态：BC-01…BC-05 已完成（见各卡执行记录），BC-06 未开工。
+- 日期：2026-10-12；状态：BC-01…BC-06 全部完成（见各卡执行记录），V1–V9 有对应通过证据，ADR-0033 实施结果已回填。
 - 依据：[ADR-0033](../adr/ADR-0033-background-run-context-and-status.md) 的审核修订版 D1–D6、V1–V9。
 - 工作目录：D:/codeproject/mygo/goagent。下文文件路径均相对此目录。
-- 未开工的卡片所写接口与测试仍是设计，不能描述为当前已有能力；已落地范围以各卡执行记录为准。
+- 各卡列出的接口与测试均已实施；已落地范围以各卡执行记录为准，未落地项会在对应卡里明写。
 
 ## 一、目标与完成条件
 
@@ -380,21 +380,65 @@ BC-05 未发现需要另卡修复的缺陷。V2、V8 通过；V9（跨进程与�
 
 **状态：** 待实施。**文件：** 新增 examples/background-status/main.go；更新 README.md、queue 包/Handle 注释、examples/background/main.go 的示例指引及本 ADR 的实施结果。跨进程测试放 agent/run_status_process_test.go，复用 checkpoint/coordinator_process_test.go 风格。
 
-- [ ] 示例配置 File store、RunBudget、非零 WithToolTimeout，启动 worker 后入队、取消提交 ctx、等待 WaitRecorded，再查 RunStatus；处理运行/记录错误，不把 Wait 当落盘确认。
-- [ ] 文档解释记录 CAS 冲突、无边界、基础 store 不支持、崩溃窗口；用户应如何检查 WaitRecorded 错误，不示范读取新 head 后盲目重写旧终态。
-- [ ] 解释 Pool 停止与 Handle.Cancel 区别，未消费任务的等待边界，30 秒记录期限与整次运行期限区别；保持不做列表。
-- [ ] 若 README 仍将 bus 描述为内置 Redis 后端，核对后将跨进程能力指向 queue/redis_pubsub.go 与 queue/redis_stream.go，不改无关实现。
-- [ ] TestRunStatusAcrossProcess：子进程完成后台任务并确认 WaitRecorded 后退出，父进程新开 File store 读取 completed 和文件；真正使用子进程，不以新 Agent 实例冒充跨进程。
-- [ ] 执行以下最终命令，记录实际输出与环境限制：
+- [x] 示例配置 File store、RunBudget、非零 WithToolTimeout，启动 worker 后入队、取消提交 ctx、等待 WaitRecorded，再查 RunStatus；处理运行/记录错误，不把 Wait 当落盘确认。
+- [x] 文档解释记录 CAS 冲突、无边界、基础 store 不支持、崩溃窗口；用户应如何检查 WaitRecorded 错误，不示范读取新 head 后盲目重写旧终态。
+- [x] 解释 Pool 停止与 Handle.Cancel 区别，未消费任务的等待边界，30 秒记录期限与整次运行期限区别；保持不做列表。
+- [x] 若 README 仍将 bus 描述为内置 Redis 后端，核对后将跨进程能力指向 queue/redis_pubsub.go 与 queue/redis_stream.go，不改无关实现。
+- [x] TestRunStatusAcrossProcess：子进程完成后台任务并确认 WaitRecorded 后退出，父进程新开 File store 读取 completed 和文件；真正使用子进程，不以新 Agent 实例冒充跨进程。
+- [x] 执行以下最终命令，记录实际输出与环境限制：
 
     go build ./...
     go vet ./...
     go test ./... -count=1
     go test -race ./queue ./agent ./checkpoint -count=1
 
-- [ ] 核对 V1–V9 每项已有对应通过证据；回填 ADR 实施结果。偏离已决契约时明确记录原因与追加决议，不默默改写验收目标。
+- [x] 核对 V1–V9 每项已有对应通过证据；回填 ADR 实施结果。偏离已决契约时明确记录原因与追加决议，不默默改写验收目标。
 
 **验收：** V9 及全部前置卡；不以“待运行”标记为通过。
+
+**执行记录（2026-10-12）：**
+
+交付物：
+
+- `examples/background-status/main.go`（新增，离线 mock）：File store + `middleware.RunBudget{MaxDuration: 500ms, MaxTurns: 8}` + `agent.WithToolTimeout(3s)`；先 `go pool.Run(ctx)` 再 `EnqueueAgent`，入队成功后立刻取消提交 ctx，用 `WaitRecorded` 等落盘（错误按 `errors.Is` 分成 `ErrRevisionConflict`/`ErrClaimConflict`/`ErrStaleFencingToken`/`ErrDurableUnavailable`/`agent.ErrNoCommittedBoundary` 五类各给一句处置说明），再用 `Agent.RunStatus` 读 head，最后换一个新的 `checkpoint.NewFile(dir)` 实例 + 新 Agent 在同一线程跑一次 `Run` 读回 `report.txt`。注释与输出都写明 `Wait` 不是落盘确认、`MaxDuration` 是正常收尾不是硬期限、能打断不回应工具的是 `WithToolTimeout`。
+- `agent/run_status_process_test.go`（新增）：`TestRunStatusAcrossProcess` 用 `os.Executable()` 重跑本测试二进制作为子进程（环境变量 `GOAGENT_RUN_STATUS_PROCESS_HELPER=1` 分支）。子进程走完整后台链路（`NewMemQueue` + `Pool` + `EnqueueAgent` + 取消提交 ctx + `WaitRecorded` 返回 nil + 自己那次 `RunStatus`），把 JobID/RunID/head ID/revision/回答/Kind/文件内容一行 JSON 交回；父进程等子进程退出后用全新 `checkpoint.NewFile(dir)` 与全新 Agent 读出同一条 completed 终态、同样的 `report.txt`，再在同线程新运行里通过 `peek` 工具把文件读回来，并断言新运行把 head 推前。
+- 文档：README 新增“后台运行的终态与状态查询”一节（归属、两个终点、谁写终态及其拒绝、CAS/claim/fence 冲突与"不读新 head 改写旧终态"、崩溃窗口、三条时间线、RunStatus 的四条限制、保持不做清单）；修正“异步任务与事件总线”一行——`bus` 包只有进程内 pub/sub，跨进度事件走 `queue.NewBus(queue.WithRedis(url))`（`queue/redis_pubsub.go`），持久化队列在 `queue/redis_stream.go`；示例表加 `background-status` 一行；`examples/background/main.go` 顶部指向新示例；`queue` 包文档与 `Pool.Run` 注释补上“Pool 的 ctx 取消只停止取任务，不中止已在执行的运行；要用 Handle.Cancel”。
+
+| 命令 | 结果 |
+| --- | --- |
+| `go run ./examples/background-status` | 退出 0；实测输出：`[budget] 资源 [duration] 越过上限，改为正常收尾` → `✅ 运行结束且终态记录已确认: 本季度报告已生成并归档。` → `🔎 RunStatus: exists=true paused=false revision=3 step=1 kind=completed run=run_…` → `快照里的文件: report.txt = "队列不再随提交方取消。"` → `♻️ 同线程新运行从终态快照恢复文件: 读回: 队列不再随提交方取消。` → `📌 新运行把 head 从 revision 3 推到 5，此刻 head 上还带着终态记录吗: false`（跑三次结构一致，只有 ID 与临时目录名变化） |
+| `go run ./examples/background` | 退出 0（只改了注释，行为不变） |
+| `go test ./agent -run '^TestRunStatusAcrossProcess$' -count=1 -v` | PASS（0.09s） |
+| `go test ./agent -run '^TestRunStatusAcrossProcess$' -count=3`、`go test -race ./agent -run '^TestRunStatusAcrossProcess$' -count=2` | ok（0.35s / 3.50s），无抖动 |
+| `go build ./...` | 无输出，退出 0 |
+| `go vet ./...` | 无输出，退出 0 |
+| `go test ./... -count=1` | 退出 0，31 个包 ok，0 个 FAIL，58 个包无测试文件 |
+| `go test -race ./queue ./agent ./checkpoint -count=1` | 三包 ok（queue 2.66s、agent 6.73s、checkpoint 3.76s） |
+| `gofmt -l`（两个新增文件） | 无输出。`queue/queue.go`、`queue/worker_pool.go`、`examples/background/main.go` 被标记是既有 CRLF 行尾（三个文件全部行均为 CRLF，`gofmt -d` 只有行尾差异，`queue/`、`agent/` 下多个未改动文件同样被标记），未重排行尾 |
+
+环境限制：本轮全部验收为离线（`llm/mock`、临时目录里的 JSONL 文件存储、测试二进制自重跑）。`queue/redis_pubsub.go`、`queue/redis_stream.go` 与 `examples/redis` 没有自动化测试，最终门禁不能替它们背书。跨进程用例依赖 `os.Executable()` 重跑测试二进制（Windows 上实测可用），子进程 `-test.timeout=120s`。
+
+反向验证（删代码变异，每次只改一处）：把 `queue/agent_bridge.go` 的 `commitTerminal` 改成无条件 `return nil`（不再写终态）后，`TestRunStatusAcrossProcess` 变红为 `子进程退出失败: exit status 1`，且失败信息里完整带出子进程自己的 `WaitRecorded 之后没有终态记录`——同时证明父进程确实读的是磁盘上由另一个进程写下的记录，也证明 stdout 采集能交出跨进程诊断。恢复 `queue/agent_bridge.go`（`git checkout --`，工作区干净）后复跑 ok。
+
+V1–V9 对照（全部为本轮实测通过，非“待运行”）：
+
+| 验收 | 证据 |
+| --- | --- |
+| V1 | `queue/agent_bridge_test.go`：`TestQueueCallerCancelDoesNotStopRun`、`TestQueueEnqueueFailsWithCanceledCaller`、`TestQueueEnqueueFailureReleasesContext`、`TestQueueHandleCancelStops`、`TestQueueHandleCancelReleasesUnstartedJob`、`TestQueueContextReleasedAfterSettlement` |
+| V2 | `queue/background_budget_test.go`：`TestBackgroundRunBudgetWrapsUp`、`TestBackgroundToolTimeoutBoundsWait`、`TestBackgroundBudgetDoesNotCancelInflightTool`、`TestBackgroundMaxTurnsBoundsModelLoop` |
+| V3 | `checkpoint/completion_contract_test.go`：`TestCompletionRoundTripAcrossStores`、`TestCompletionJSONShape`、`TestCompletionFrozenAcrossStores`、`TestCompletionLegacyReadable`、`TestCompletionForkClearsTerminal`、`TestCompletionDigestKeepsNilBaseline`、`TestCompletionDigestDistinguishesTerminal` |
+| V4 | `agent/terminal_test.go`：`TestRecordCompletionUsesRunIdentity`、`TestRunPausedOutcome`、`TestRunTerminalBoundaryBeforeEvents`、`TestRecordCompletionRejectsInvalidRun`、`TestRecordCompletionRequiresOwnBoundary`、`TestRecordCompletionRequiresDurable`、`TestFrozenOutcomeIsDeepCopy`；`agent/terminal_boundary_internal_test.go`：`TestNoteCommittedBoundaryIsMonotonic` |
+| V5 | `agent/terminal_cas_test.go`：`TestRecordCompletionStaleRunRejected`、`TestRecordCompletionCASAfterLoad`、`TestRecordCompletionClaimConflict`、`TestRecordCompletionIdempotent`；`agent/terminal_boundary_internal_test.go`：`TestLateCommitReceiptKeepsHighestBoundary`、`TestParallelRunRecordsCompletionWithLateReceipt` |
+| V6 | `agent/terminal_files_test.go`：`TestRecordCompletionPreservesFiles`、`TestRecordCompletionPreservesEmptyFileView` |
+| V7 | `queue/agent_terminal_test.go`：`TestQueueWaitRecordedWaitsForCommit`、`TestQueueRecordFailureVisible`、`TestQueueCancelStillRecords`、`TestQueueRecordVisibleWithoutBoundary`、`TestQueuePauseSkipsCompletion`、`TestQueueRecordContextDeadline`、`TestQueueWaitRecordedMultipleWaiters`、`TestQueueWaitRecordedIsolatedFromWaitEdits` |
+| V8 | `agent/run_status_test.go`：`TestRunStatusStates`、`TestRunStatusErrorsAndCopies`、`TestRunStatusOldCompletionIsSnapshot`、`TestNonDetachedHistoryCountUnchanged` |
+| V9 | `agent/run_status_process_test.go`：`TestRunStatusAcrossProcess`；四条最终门禁命令见上表 |
+
+偏离与登记：
+
+1. 跨进程测试的读法与卡面不同：父进程先等子进程退出，再一次性读完整段 stdout 并从中取 JSON 行；原设计"读一行就解码"会把 go test 写在 stdout 的失败诊断和交付行撞在一起，变异红时诊断信息拿不到（实测改后能完整带出）。不改验收目标，只改采集方式。
+2. `examples/background-status` 里 RunBudget 的 500ms 一定被 800ms 的工具越过（靠 sleep 下限保证，不靠时钟注入），所以示例稳定演示“越过后正常收尾、终态是 completed”；工具上限设 3s，因此示例不演示 abandon——那条路径由 `queue/background_budget_test.go` 与 `examples/tool-timeout*` 负责，示例注释里指明了分工。
+3. 保持不做清单未增删：公开 detach API、事件重放、跨进程 agent job、Running 登记表、整次运行硬期限、前台自动写终态，全部继续排除。
 
 ## 五、风险与控制
 
@@ -413,6 +457,6 @@ BC-05 未发现需要另卡修复的缺陷。V2、V8 通过；V9（跨进程与�
 
 ## 六、交付与本次文档验证
 
-公开契约为 checkpoint.Completion、Agent.RecordCompletion(ctx, run)、Run.Paused、Handle.WaitRecorded、Agent.RunStatus 和 RunStatus。代码实现后才可称为已提供；不再使用旧 threadID/res/err 签名或普通 Save 方案。
+公开契约为 checkpoint.Completion、Agent.RecordCompletion(ctx, run)、Run.Paused、Run.FrozenOutcome（BC-04 复核后新增的只读出口）、Handle.WaitRecorded、Agent.RunStatus 和 RunStatus。这些契约均已实施，不再使用旧 threadID/res/err 签名或普通 Save 方案。
 
-本次文档修订已对照 agent/run.go、agent/durable_runtime.go、agent/write_guard.go、checkpoint/durable.go、checkpoint/snapshot.go、checkpoint/file.go、queue/agent_bridge.go、queue/worker_pool.go、middleware/runbudget.go 与 agent/options.go 的相关符号。代码测试是未来实施验收，本次未运行；任务卡未勾选。最终测试数量由实际实现记录，不沿用旧稿固定的“18 个用例”数字。
+本次文档修订已对照 agent/run.go、agent/durable_runtime.go、agent/write_guard.go、checkpoint/durable.go、checkpoint/snapshot.go、checkpoint/file.go、queue/agent_bridge.go、queue/worker_pool.go、middleware/runbudget.go 与 agent/options.go 的相关符号。实施阶段（BC-01…BC-06，2026-10-12）逐卡运行了测试并回填执行记录，最终门禁为 `go build ./...`、`go vet ./...` 退出 0，`go test ./... -count=1` 31 包 ok、无 FAIL，`go test -race ./queue ./agent ./checkpoint -count=1` 三包 ok；用例数量以各卡记录为准，不沿用旧稿固定的“18 个用例”数字。
