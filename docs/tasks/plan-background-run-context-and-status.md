@@ -2,7 +2,7 @@
 
 > 执行者说明：按 executing-plans 技能串行执行 BC-01 至 BC-06，先写对应失败测试，再做最小实现，检查通过后勾选。本文接口与测试均为待实施设计，不能描述为当前已有能力。使用符号名定位代码，不依赖旧稿行号。
 
-- 日期：2026-10-12；状态：BC-01、BC-02 已完成（见各卡执行记录），BC-03 至 BC-06 未开工。
+- 日期：2026-10-12；状态：BC-01、BC-02、BC-03 已完成（见各卡执行记录），BC-04 至 BC-06 未开工。
 - 依据：[ADR-0033](../adr/ADR-0033-background-run-context-and-status.md) 的审核修订版 D1–D6、V1–V9。
 - 工作目录：D:/codeproject/mygo/goagent。下文文件路径均相对此目录。
 - 未开工的卡片所写接口与测试仍是设计，不能描述为当前已有能力；已落地范围以各卡执行记录为准。
@@ -169,23 +169,48 @@ BC-01 与 BC-04 同改 queue/agent_bridge.go；BC-03 会修改 agent/run.go、ag
 
 ### BC-03：结束凭据与 RecordCompletion
 
-**状态：** 待实施。**文件：** 修改 agent/run.go、agent/durable_runtime.go；新增 agent/terminal.go、agent/terminal_test.go；根据现有测试包约定放置必要内部凭据测试。复用 agent/write_guard.go 的 commit 回执，不改变其 claim 续租与释放规则。
+**状态：** 已完成（2026-10-12）。**文件：** 修改 agent/run.go、agent/durable_runtime.go；新增 agent/terminal.go、agent/terminal_test.go、agent/terminal_cas_test.go、agent/terminal_files_test.go。复用 agent/write_guard.go 的 commit 回执，不改变其 claim 续租与释放规则。
 
-- [ ] 先写 TestRecordCompletionUsesRunIdentity：接口按锁定签名，完成/失败结果和 RunID 一致；Wait 返回结果被修改后不污染冻结终态。
-- [ ] 在成功 commit 后保存 ID/revision，drive 释放 claim 前冻结边界，发布终态事件之前冻结 outcome/result/error。补 Run.Paused；TestRunPausedOutcome 覆盖暂停、空结果正常完成、失败，不用结果空值区分。
-- [ ] TestRunTerminalBoundaryBeforeEvents：并发 Iter/Events 与 Wait，终态事件可见或 Wait 返回时凭据与 Paused 已完整；覆盖成功、暂停、准备失败与执行失败。
-- [ ] TestRecordCompletionRejectsInvalidRun：nil、其他 Agent、未结束、暂停均拒绝且历史不变。
-- [ ] TestRecordCompletionRequiresOwnBoundary：准备失败、首步失败、仅继承旧 head、失败提交不更新凭据；不覆盖前次 Completion，不伪造根记录。
-- [ ] TestRecordCompletionRequiresDurable：基础 Checkpointer stub 返回 ErrDurableUnavailable，不调用 Save；前台仍可使用该 stub。
-- [ ] 实现固定 ID 的不可变记录缓存和并发保护，Load 冻结边界、深拷贝 State/FileSnapshot，检查 Pause/Pending 与 identity，使用 ExpectedRevision Commit。
-- [ ] TestRecordCompletionStaleRunRejected：用通道闸门确定 A 结束→B 完成→A 记录，断言 ErrRevisionConflict 且 B head/历史不变；Memory/File 均覆盖。
-- [ ] TestRecordCompletionCASAfterLoad：阻塞 A 的 Commit，在其 Load 后允许 B 提交，恢复 A 后仍拒绝；不是仅在 Load 时检查 revision。
-- [ ] TestRecordCompletionClaimConflict：边界不变但其他 owner 持有活跃 claim，返回 ErrClaimRequired，不携旧 claim、不重读新 head。
-- [ ] TestRecordCompletionIdempotent：并发/重复调用只追加一次；模拟提交成功但回执失败再重试；A 已记录、B 前进后 A 重试不改变 B head。Memory/File 均覆盖。
-- [ ] TestRecordCompletionPreservesFiles：写文件→记录终态→重开 File→新运行或 Fork 恢复文件，覆盖空快照和历史副本修改；不能只检查旧 head。
-- [ ] 运行 go test ./agent -run 'TestRecordCompletion|TestRunPaused' -count=1；go test -race ./agent ./checkpoint -count=1；记录结果。
+- [x] 先写 TestRecordCompletionUsesRunIdentity：接口按锁定签名，完成/失败结果和 RunID 一致；Wait 返回结果被修改后不污染冻结终态。
+- [x] 在成功 commit 后保存 ID/revision，drive 释放 claim 前冻结边界，发布终态事件之前冻结 outcome/result/error。补 Run.Paused；TestRunPausedOutcome 覆盖暂停、空结果正常完成、失败，不用结果空值区分。
+- [x] TestRunTerminalBoundaryBeforeEvents：并发 Iter/Events 与 Wait，终态事件可见或 Wait 返回时凭据与 Paused 已完整；覆盖成功、暂停、准备失败与执行失败。
+- [x] TestRecordCompletionRejectsInvalidRun：nil、其他 Agent、未结束、暂停均拒绝且历史不变。
+- [x] TestRecordCompletionRequiresOwnBoundary：准备失败、首步失败、仅继承旧 head、失败提交不更新凭据；不覆盖前次 Completion，不伪造根记录。
+- [x] TestRecordCompletionRequiresDurable：基础 Checkpointer stub 返回 ErrDurableUnavailable，不调用 Save；前台仍可使用该 stub。
+- [x] 实现固定 ID 的不可变记录缓存和并发保护，Load 冻结边界、深拷贝 State/FileSnapshot，检查 Pause/Pending 与 identity，使用 ExpectedRevision Commit。
+- [x] TestRecordCompletionStaleRunRejected：用通道闸门确定 A 结束→B 完成→A 记录，断言 ErrRevisionConflict 且 B head/历史不变；Memory/File 均覆盖。
+- [x] TestRecordCompletionCASAfterLoad：阻塞 A 的 Commit，在其 Load 后允许 B 提交，恢复 A 后仍拒绝；不是仅在 Load 时检查 revision。
+- [x] TestRecordCompletionClaimConflict：边界不变但其他 owner 持有活跃 claim，返回 ErrClaimRequired，不携旧 claim、不重读新 head。
+- [x] TestRecordCompletionIdempotent：并发/重复调用只追加一次；模拟提交成功但回执失败再重试；A 已记录、B 前进后 A 重试不改变 B head。Memory/File 均覆盖。
+- [x] TestRecordCompletionPreservesFiles：写文件→记录终态→重开 File→新运行或 Fork 恢复文件，覆盖空快照和历史副本修改；不能只检查旧 head。
+- [x] 运行 go test ./agent -run 'TestRecordCompletion|TestRunPaused' -count=1；go test -race ./agent ./checkpoint -count=1；记录结果。
 
 **验收：** V4、V5、V6；接口和并发规则无需留给后续卡片决定。
+
+**执行记录（2026-10-12）：**
+
+实现形状：
+
+- `agent/durable_runtime.go`：`durableRunState` 增加 `boundaryID/boundaryRevision/boundarySet`；`commitCheckpoint` 只在 durable 分支成功返回后调用 `noteCommittedBoundary(cp.ID, receipt.Revision)`，失败提交不更新；非 durable 的 `Store.Save` 分支没有回执，因此永不记录边界。新增 `committedBoundary()`。
+- `agent/run.go`：`Run` 增加 `terminalMu` 保护的冻结区（frozen/paused/result/err/边界）与 `recordMu` 保护的记录缓存；`freezeTerminal` 在冻结时就用 `core.CloneMessage` 深拷贝结果；`Paused()` 只读冻结结局。`drive()` 的尾部分支改成先 `committedBoundary()`（claim 仍持有）→ `releaseDurableClaim()` → `terminalOutcome(out, cleanupErr)` → `freezeTerminal(...)` → 才发布终态事件；startErr 与 prepare 失败走 `freezeFailure`。原三分支的发布/finish 顺序与错误合并语义（`errors.Join`）逐条保持。
+- `agent/terminal.go`：导出错误 `ErrNoRun`/`ErrRunNotOwned`/`ErrRunNotFinished`/`ErrRunPaused`/`ErrNoCommittedBoundary`，纯函数 `terminalOutcome`，以及 `RecordCompletion`：校验身份与结局 → 断言 store 支持 `checkpoint.Durable` → 校验本次边界 → `recordMu` 下固定终态 checkpoint ID、`buildTerminalRecord`（Load 边界并核对 ThreadID/ID/Revision、拒绝 Pause/Pending、`core.CloneStateData` 与逐字节拷贝 FileSnapshot 并保留 nil/空映射区别）→ `Durable.Commit` 带 `ExpectedRevision=冻结 revision`，不带 claim、ack、工具执行；错误保留 `errors.Is`。
+
+| 命令 | 结果 |
+| --- | --- |
+| `go test ./agent -run 'TestRecordCompletion\|TestRunPaused\|TestRunTerminalBoundary' -count=1 -v` | 12 个顶层/子用例结构全 PASS（memory/file 双后端） |
+| `go test ./agent -count=1` | ok（2.0s，既有 agent 测试未退化） |
+| `go test -race ./queue ./agent ./checkpoint -count=1` | 三包 ok（agent 5.3s） |
+| `go build ./...`、`go vet ./...`、`go test ./... -count=1` | 退出 0，无 FAIL |
+| `gofmt -l`（六个新增/改动文件） | 无输出 |
+
+变异检查（每次只改一处实现，恢复后复跑绿）：失败提交也记录边界 → `RequiresOwnBoundary/首步提交失败` 报"边界不存在"；提交不带 `ExpectedRevision` → `StaleRunRejected`（memory+file）与 `CASAfterLoad`、`ClaimConflict` 全部失败；不缓存记录（每次新 ID） → 幂等三个子用例失败（回执丢失重试、B 前进后重试 A 都变成 revision 冲突）；冻结时不深拷贝结果 → `UsesRunIdentity` 报"调用方改写污染了冻结终态"；把 `freezeTerminal` 移到发布终态事件之后 → `TerminalBoundaryBeforeEvents/成功` 立刻报 `run has not finished`（观察方先看到事件）；去掉暂停拒绝 → `PausedOutcome/暂停` 拿到"边界是暂停点"的错误而非 `ErrRunPaused`；去掉归属检查 → `RejectsInvalidRun` 的他人运行被接受。
+
+**与卡的偏离（四条）：**
+
+1. 校验顺序：`RecordCompletion` 把"store 支持 Durable"放在"有本次提交边界"之前。按 D4 原文的顺序，只有基础 Checkpointer 的存储永远走 `Store.Save` 分支、永远没有边界，`ErrDurableUnavailable` 就不可达（第一轮实测确实返回的是 `ErrNoCommittedBoundary`，与卡上 `RequiresDurable` 的期望冲突）。调整后两项契约都可观测，其余顺序不变。
+2. `TerminalBoundaryBeforeEvents` 的"执行失败"实测有自己的成功提交：`AgentLoop.fail`（`agent/loop.go` 的 `l.fail`）会写一个不含 Pause/Pending 的接缝。所以失败运行是可记录的（Kind=failed、Err 为文本、Result 为 nil），"无本次边界"的期望只放在"准备失败"子用例上。
+3. 测试按关注点拆成三个文件（`terminal_test.go` 身份/结局/拒绝、`terminal_cas_test.go` 交错与幂等、`terminal_files_test.go` 文件保留），卡上只列了 `terminal_test.go`；未新增内部测试文件，凭据观察全部通过公开行为与测试用存储包装器完成。
+4. `Run` 同时保留 `<-run.done` 与 `terminalFrozen` 两项检查。实测在当前实现下二者等价（冻结先于发布与 finish），但 done 是既有的"运行结束"公开信号，保留它使 `RecordCompletion` 的契约不依赖冻结的内部时序；去掉 done 检查的变异不会被现有用例抓到（`ErrRunNotFinished` 由 frozen 检查兜住），登记为冗余防护而非缺陷。
 
 ### BC-04：队列持久化等待与错误出口
 
