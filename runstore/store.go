@@ -3,6 +3,7 @@ package runstore
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"time"
 )
 
@@ -30,6 +31,11 @@ type Store interface {
 	// ownership and the heartbeat, none of which a write may erase or move backwards. The
 	// store advances Version by one and stamps UpdatedAt from its clock. On success the
 	// accepted record is returned.
+	//
+	// After a claim, worker mutations require matching WorkerID and WorkerEpoch.
+	// Omitting both permits only unchanged content or a pure cancellation request
+	// (running/cancelling -> cancelling); all other fields must be restated unchanged.
+	// Reconciliation of execution outcomes is not an ownerless CAS operation.
 	//
 	// A retry that matches the stored terminal outcome exactly is idempotent: the stored
 	// record comes back unchanged, without a new Version.
@@ -101,21 +107,34 @@ func prepareCreate(stored *RunRecord, next RunRecord, now time.Time) (RunRecord,
 	return created.clone()
 }
 
-// createContentEqual is the create-idempotency comparison. Timestamps and the store's own
-// Version are excluded because the store assigns or advances them.
+// createContentEqual compares all caller-owned content. A missing CreatedAt means
+// the caller accepts the creation time assigned by the store on the first attempt.
+// Version and UpdatedAt are always assigned by the store.
 func createContentEqual(stored, next RunRecord) bool {
-	if stored.RunID != next.RunID ||
-		stored.ThreadID != next.ThreadID ||
-		stored.TurnID != next.TurnID ||
-		stored.JobID != next.JobID ||
-		stored.ResumeOfRunID != next.ResumeOfRunID ||
-		stored.Status != next.Status {
+	next.CreatedAt = storedTime(next.CreatedAt, stored.CreatedAt)
+	stored.Version, next.Version = 0, 0
+	stored.UpdatedAt, next.UpdatedAt = time.Time{}, time.Time{}
+	// Compare timestamps as instants, independent of location and monotonic metadata.
+	if !stored.CreatedAt.Equal(next.CreatedAt) ||
+		!stored.HeartbeatAt.Equal(next.HeartbeatAt) ||
+		!stored.CancelRequestedAt.Equal(next.CancelRequestedAt) ||
+		!stored.WorkerLeaseUntil.Equal(next.WorkerLeaseUntil) {
 		return false
 	}
-	if next.Status.Terminal() {
-		return stored.terminalDecision().equal(next.terminalDecision())
+	stored.CreatedAt, next.CreatedAt = time.Time{}, time.Time{}
+	stored.HeartbeatAt, next.HeartbeatAt = time.Time{}, time.Time{}
+	stored.CancelRequestedAt, next.CancelRequestedAt = time.Time{}, time.Time{}
+	stored.WorkerLeaseUntil, next.WorkerLeaseUntil = time.Time{}, time.Time{}
+	// Message payloads use the same encoded-content equality as terminal retries.
+	if stored.Result == nil || next.Result == nil {
+		if stored.Result != next.Result {
+			return false
+		}
+	} else if !equalMessage(stored.Result.Message, next.Result.Message) {
+		return false
 	}
-	return true
+	stored.Result, next.Result = nil, nil
+	return reflect.DeepEqual(stored, next)
 }
 
 // prepareCAS applies the lifecycle to one compare-and-swap attempt against the stored
@@ -177,8 +196,8 @@ func checkImmutableIdentity(stored, next RunRecord) error {
 
 // mergeOwnership reconciles the worker fields. Ownership is assigned once — by the CAS
 // that starts the run — and from then on a write that names a worker must name the one
-// that owns the run. A write that names none (a cancellation request, a reconciler) keeps
-// the stored owner and is still bound by the lifecycle.
+// that owns the run. An ownerless write may only restate content or request
+// cancellation; it cannot publish worker progress or an execution outcome.
 //
 // It returns the record whose ownership fields are reconciled with the stored ones.
 func mergeOwnership(stored, next RunRecord) (RunRecord, error) {
@@ -195,6 +214,15 @@ func mergeOwnership(stored, next RunRecord) (RunRecord, error) {
 		out := next
 		out.WorkerID = stored.WorkerID
 		out.WorkerEpoch = stored.WorkerEpoch
+		comparable := out
+		if (stored.Status == StatusRunning || stored.Status == StatusCancelling) &&
+			out.Status == StatusCancelling && !out.CancelRequestedAt.IsZero() {
+			comparable.Status = stored.Status
+			comparable.CancelRequestedAt = stored.CancelRequestedAt
+		}
+		if !createContentEqual(stored, comparable) {
+			return RunRecord{}, fmt.Errorf("runstore: run %q worker mutation requires its owner and epoch: %w", stored.RunID, ErrOwnershipLost)
+		}
 		return out, nil
 	}
 	if next.WorkerID != stored.WorkerID || next.WorkerEpoch != stored.WorkerEpoch {

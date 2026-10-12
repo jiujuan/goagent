@@ -3,6 +3,7 @@ package runstore
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -115,7 +116,7 @@ func TestRunTransitions(t *testing.T) {
 	allowed := map[Status][]Status{
 		StatusQueued: {
 			// 入队重试保持 queued；投递确定失败时 queued 直接落 failed。
-			StatusQueued, StatusRunning, StatusCancelling, StatusCancelled, StatusFailed,
+			StatusQueued, StatusRunning, StatusCancelled, StatusFailed,
 		},
 		StatusRunning:    {StatusRunning, StatusPaused, StatusSucceeded, StatusFailed, StatusCancelling},
 		StatusCancelling: {StatusCancelling, StatusCancelled, StatusPaused, StatusSucceeded, StatusFailed},
@@ -826,5 +827,125 @@ func TestRunStoreShapeErrors(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestRunCreateContent covers fields beyond identity and status, including terminal records.
+func TestRunCreateContent(t *testing.T) {
+	for _, f := range storeFactories() {
+		t.Run(f.name, func(t *testing.T) {
+			for _, status := range []Status{StatusQueued, StatusSucceeded} {
+				t.Run(string(status), func(t *testing.T) {
+					store := f.make(t)
+					original := recordIn("content", status, testBase())
+					saved := mustCreate(t, store, original)
+					mutations := map[string]func(*RunRecord){
+						"worker":       func(r *RunRecord) { r.WorkerID = "other" },
+						"epoch":        func(r *RunRecord) { r.WorkerEpoch = 2 },
+						"cancel":       func(r *RunRecord) { r.CancelRequestedAt = testBase() },
+						"heartbeat":    func(r *RunRecord) { r.HeartbeatAt = testBase() },
+						"lease":        func(r *RunRecord) { r.WorkerLeaseUntil = testBase() },
+						"checkpoint":   func(r *RunRecord) { r.LatestCheckpointRef = &checkpoint.Ref{ThreadID: "other", CheckpointID: "cp"} },
+						"revision":     func(r *RunRecord) { r.CheckpointRevision++ },
+						"completion":   func(r *RunRecord) { r.CompletionRef = &checkpoint.Ref{ThreadID: r.ThreadID, CheckpointID: "done"} },
+						"result":       func(r *RunRecord) { r.Result = settledResult("different") },
+						"error":        func(r *RunRecord) { r.Error = &RunError{Code: ErrCodeDispatchUnknown} },
+						"record error": func(r *RunRecord) { r.RecordError = &RunError{Code: "record_failed"} },
+						"finish":       func(r *RunRecord) { r.FinishReason = FinishReasonFailed },
+						"created":      func(r *RunRecord) { r.CreatedAt = saved.CreatedAt.Add(time.Hour) },
+					}
+					for name, mutate := range mutations {
+						t.Run(name, func(t *testing.T) {
+							next := saved
+							mutate(&next)
+							if _, err := store.Create(context.Background(), next); !errors.Is(err, ErrConflict) {
+								t.Fatalf("different content: got %v, want ErrConflict", err)
+							}
+							if got := getRecord(t, store, saved.RunID); got.Version != saved.Version {
+								t.Fatal("conflict changed version")
+							}
+						})
+					}
+					replay := original
+					replay.Version = 999
+					replay.UpdatedAt = testBase().Add(time.Hour)
+					if _, err := store.Create(context.Background(), replay); err != nil {
+						t.Fatalf("original replay: %v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestRunOwnerlessMutations(t *testing.T) {
+	for _, f := range storeFactories() {
+		t.Run(f.name, func(t *testing.T) {
+			store := f.make(t)
+			initial := recordIn("fenced", StatusRunning, testBase())
+			initial.WorkerID, initial.WorkerEpoch = "worker", 1
+			saved := mustCreate(t, store, initial)
+			mutations := map[string]func(*RunRecord){
+				"heartbeat":  func(r *RunRecord) { r.HeartbeatAt = testBase() },
+				"lease":      func(r *RunRecord) { r.WorkerLeaseUntil = testBase() },
+				"result":     func(r *RunRecord) { r.Result = settledResult("unauthorized") },
+				"checkpoint": func(r *RunRecord) { r.CheckpointRevision++ },
+				"succeeded":  func(r *RunRecord) { r.Status = StatusSucceeded; r.Result = settledResult("done") },
+				"failed":     func(r *RunRecord) { r.Status = StatusFailed; r.Error = &RunError{Code: ErrCodeExecutionFailed} },
+				"paused":     func(r *RunRecord) { r.Status = StatusPaused },
+				"cancel with payload": func(r *RunRecord) {
+					r.Status = StatusCancelling
+					r.CancelRequestedAt = testBase()
+					r.Result = settledResult("injected")
+				},
+			}
+			for name, mutate := range mutations {
+				t.Run(name, func(t *testing.T) {
+					store := f.make(t)
+					saved := mustCreate(t, store, initial)
+					next := saved
+					next.WorkerID, next.WorkerEpoch = "", 0
+					mutate(&next)
+					if _, err := store.CompareAndSwap(context.Background(), next.RunID, saved.Version, next); !errors.Is(err, ErrOwnershipLost) {
+						t.Fatalf("ownerless mutation: got %v, want ErrOwnershipLost", err)
+					}
+					if got := getRecord(t, store, saved.RunID); !reflect.DeepEqual(got, saved) {
+						t.Fatal("rejected write changed record")
+					}
+				})
+			}
+			if got := getRecord(t, store, saved.RunID); got.Version != saved.Version {
+				t.Fatal("rejected writes changed record")
+			}
+			cancel := saved
+			cancel.WorkerID, cancel.WorkerEpoch = "", 0
+			cancel.Status, cancel.CancelRequestedAt = StatusCancelling, testBase()
+			requested, err := store.CompareAndSwap(context.Background(), saved.RunID, saved.Version, cancel)
+			if err != nil {
+				t.Fatalf("coordinator cancellation: %v", err)
+			}
+			if requested.WorkerID != saved.WorkerID || requested.WorkerEpoch != saved.WorkerEpoch {
+				t.Fatal("cancellation changed ownership")
+			}
+			retry := requested
+			retry.WorkerID, retry.WorkerEpoch = "", 0
+			requested, err = store.CompareAndSwap(context.Background(), retry.RunID, retry.Version, retry)
+			if err != nil {
+				t.Fatalf("repeat cancellation: %v", err)
+			}
+			requested.HeartbeatAt = testBase().Add(time.Minute)
+			beat, err := store.CompareAndSwap(context.Background(), requested.RunID, requested.Version, requested)
+			if err != nil {
+				t.Fatalf("owner heartbeat: %v", err)
+			}
+			beat.Status, beat.FinishReason, beat.Result = StatusSucceeded, FinishReasonCompleted, settledResult("owner result")
+			done, err := store.CompareAndSwap(context.Background(), beat.RunID, beat.Version, beat)
+			if err != nil {
+				t.Fatalf("owner completion after cancellation: %v", err)
+			}
+			if !done.CancelRequestedAt.Equal(cancel.CancelRequestedAt) {
+				t.Fatal("completion erased cancellation")
+			}
+		})
 	}
 }

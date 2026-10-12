@@ -215,10 +215,9 @@ func refCheckpointID(ref *checkpoint.Ref) string {
 // an identical retry.
 var allowedTransitions = map[Status]map[Status]bool{
 	StatusQueued: {
-		StatusQueued:     true,
-		StatusRunning:    true,
-		StatusCancelling: true,
-		StatusCancelled:  true,
+		StatusQueued:    true,
+		StatusRunning:   true,
+		StatusCancelled: true,
 		// A delivery that failed before any worker started still ends the run.
 		StatusFailed: true,
 	},
