@@ -2,10 +2,10 @@
 
 > 执行者说明：按 executing-plans 技能串行执行 BC-01 至 BC-06，先写对应失败测试，再做最小实现，检查通过后勾选。本文接口与测试均为待实施设计，不能描述为当前已有能力。使用符号名定位代码，不依赖旧稿行号。
 
-- 日期：2026-10-12；状态：待实施，全部任务未开工。
+- 日期：2026-10-12；状态：BC-01 已完成（见该卡执行记录），BC-02 至 BC-06 未开工。
 - 依据：[ADR-0033](../adr/ADR-0033-background-run-context-and-status.md) 的审核修订版 D1–D6、V1–V9。
 - 工作目录：D:/codeproject/mygo/goagent。下文文件路径均相对此目录。
-- 本次只修订设计和任务文档，不执行实现、不创建新接口、不运行代码验收。
+- 未开工的卡片所写接口与测试仍是设计，不能描述为当前已有能力；已落地范围以各卡执行记录为准。
 
 ## 一、目标与完成条件
 
@@ -87,17 +87,35 @@ BC-01 与 BC-04 同改 queue/agent_bridge.go；BC-03 会修改 agent/run.go、ag
 
 ### BC-01：队列执行 context 与释放
 
-**状态：** 待实施。**文件：** 修改 queue/agent_bridge.go；新增 queue/agent_bridge_test.go。
+**状态：** 已完成（2026-10-12）。**文件：** 修改 queue/agent_bridge.go；新增 queue/agent_bridge_test.go。
 
-- [ ] 写 TestQueueCallerCancelDoesNotStopRun：先入队，再取消提交 ctx，再启动 worker，运行仍完成。
-- [ ] 按 context 契约实现入口 ctx.Err 检查、派生执行 ctx 和三条幂等释放路径；Handle.Cancel 同时取消两层，不改 Run.Cancel 既有 claim 释放行为。
-- [ ] TestQueueEnqueueFailsWithCanceledCaller 与 TestQueueEnqueueFailureReleasesContext：用失败 Queue stub 确认不执行且释放；用包内夹具观察派生 Done，不依赖不存在的 context introspection。
-- [ ] TestQueueHandleCancelStops：显式取消能结束执行，有限工具超时/abandon 路径遵守 ADR-0029。
-- [ ] TestQueueContextReleasedAfterSettlement：执行成功、失败和暂停后检查释放，重复 Cancel 无副作用。不以 runtime.NumGoroutine 单独证明 context 释放。
-- [ ] 更新 Handle/EnqueueAgent 注释：提交 ctx 不控制已入队执行，Pool 停止取任务不代表执行取消，未消费任务的资源仍由队列持有。
-- [ ] 运行 go test ./queue -run '^TestQueue' -count=1；go test -race ./queue -count=1；记录结果。
+- [x] 写 TestQueueCallerCancelDoesNotStopRun：先入队，再取消提交 ctx，再启动 worker，运行仍完成。
+- [x] 按 context 契约实现入口 ctx.Err 检查、派生执行 ctx 和三条幂等释放路径；Handle.Cancel 同时取消两层，不改 Run.Cancel 既有 claim 释放行为。
+- [x] TestQueueEnqueueFailsWithCanceledCaller 与 TestQueueEnqueueFailureReleasesContext：用失败 Queue stub 确认不执行且释放；用包内夹具观察派生 Done，不依赖不存在的 context introspection。
+- [x] TestQueueHandleCancelStops：显式取消能结束执行，有限工具超时/abandon 路径遵守 ADR-0029。
+- [x] TestQueueContextReleasedAfterSettlement：执行成功、失败和暂停后检查释放，重复 Cancel 无副作用。不以 runtime.NumGoroutine 单独证明 context 释放。
+- [x] 更新 Handle/EnqueueAgent 注释：提交 ctx 不控制已入队执行，Pool 停止取任务不代表执行取消，未消费任务的资源仍由队列持有。
+- [x] 运行 go test ./queue -run '^TestQueue' -count=1；go test -race ./queue -count=1；记录结果。
 
 **验收：** V1；现有 queue 测试断言不变。
+
+**执行记录（2026-10-12）：**
+
+| 命令 | 结果 |
+| --- | --- |
+| `go test ./queue -run '^TestQueue' -count=1` | ok，6 个顶层用例（含暂停收尾子用例）全绿 |
+| `go test -race ./queue -count=1` | ok（1.2s） |
+| `go build ./...`、`go vet ./...` | 无输出、退出 0 |
+| `go test ./... -count=1` | 退出 0，31 个包 ok，无 FAIL |
+| `go run ./examples/background` | 五个任务全部完成，输出与改动前一致 |
+
+实现前的失败测试确认：把派生 ctx 改回 `context.WithCancel(ctx)`（即旧行为）后，TestQueueCallerCancelDoesNotStopRun 在"提交方取消：执行 context 不应结束"处失败。逐项变异检查（每次只删一处，其余全绿即视为无效测试）：删 `context.WithoutCancel` → 提交方取消用例失败；删闭包 `defer h.cancelWork()` → 正常/失败/暂停三条收尾用例失败；删 `Handle.Cancel` 内的 `h.cancelWork()` → 仅新增的未消费任务用例失败；删入口 `ctx.Err()` 检查 → TestQueueEnqueueFailsWithCanceledCaller 失败；删入队失败分支的释放 → TestQueueEnqueueFailureReleasesContext 失败。
+
+**与卡的偏离（三条，均已核实）：**
+
+1. 新增卡外用例 TestQueueHandleCancelReleasesUnstartedJob。Handle.Cancel 里那次 `cancelWork()` 在"任务已被 worker 消费"的路径上与闭包 defer 重复，删掉它其余用例仍全绿；只有任务未被取走（没有闭包会运行）才能证明这一层独立存在。变异检查结果见上表。
+2. 实现把 EnqueueAgent 的主体拆到包内函数 `submitAgentRun`，导出函数只是它的薄包装：入队失败时不能向调用方返回 Handle，而包内测试需要那个 Handle 上的 `workDone` 才能检查释放。公开签名与契约未变。
+3. 顺带修复 queue/bus.go 的既有数据竞争（不在本卡文件清单内）：`MemBus.Publish` 原先在锁外向订阅通道发送，与 `Subscribe` 的 cancel 关闭通道相竞争，HEAD `44e106b` 的 `go test -race ./queue` 即可复现 TestBridgeForwardsEvents 失败，直接挡住本卡的 -race 验收。修法是把非阻塞发送放回锁内，投递语义（丢事件、不阻塞发布方）不变，queue/bus_test.go 断言未改。
 
 ### BC-02：Completion 与快照数据边界
 
