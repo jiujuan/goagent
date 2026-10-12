@@ -491,6 +491,50 @@ func TestRunStoreCopyIsolation(t *testing.T) {
 	}
 }
 
+// TestRunStoreWriteReturnsCopies 证明写入接口返回的记录也是副本：调用方拿到 Create 或
+// CompareAndSwap 的返回值之后改它，存储里的内容不受影响。
+func TestRunStoreWriteReturnsCopies(t *testing.T) {
+	for _, f := range storeFactories() {
+		f := f
+		t.Run(f.name, func(t *testing.T) {
+			stubClock(t, testBase(), time.Hour)
+			store := f.make(t)
+			created := mustCreate(t, store, recordIn("wcopy", StatusQueued, testBase()))
+
+			created.Error = &RunError{Code: "mutated"}
+			created.Result = settledResult("mutated")
+			created.LatestCheckpointRef = &checkpoint.Ref{ThreadID: "x", CheckpointID: "y"}
+			created.CompletionRef = &checkpoint.Ref{ThreadID: "x", CheckpointID: "z"}
+			if stored := getRecord(t, store, "wcopy"); stored.Error != nil ||
+				stored.Result != nil ||
+				stored.LatestCheckpointRef != nil ||
+				stored.CompletionRef != nil {
+				t.Fatalf("Create 返回值与存储共享了指针: %+v", stored)
+			}
+
+			// 存储里先放一条带指针的记录，再用 CAS 取回它并改返回对象。
+			withRefs, err := cas(t, store, "wcopy", created.Version, func(r *RunRecord) {
+				r.Status = StatusRunning
+				r.LatestCheckpointRef = &checkpoint.Ref{ThreadID: "thread-wcopy", CheckpointID: "cp-live"}
+				r.CompletionRef = &checkpoint.Ref{ThreadID: "thread-wcopy", CheckpointID: "cp-done"}
+				r.RecordError = &RunError{Code: ErrCodeDispatchUnknown}
+			})
+			if err != nil {
+				t.Fatalf("queued→running 应允许: %v", err)
+			}
+			withRefs.LatestCheckpointRef.CheckpointID = "mutated"
+			withRefs.CompletionRef.CheckpointID = "mutated"
+			withRefs.RecordError.Code = "mutated"
+			stored := getRecord(t, store, "wcopy")
+			if stored.LatestCheckpointRef.CheckpointID != "cp-live" ||
+				stored.CompletionRef.CheckpointID != "cp-done" ||
+				stored.RecordError.Code != ErrCodeDispatchUnknown {
+				t.Fatalf("CAS 返回值与存储共享了指针: %+v", stored)
+			}
+		})
+	}
+}
+
 func roundtripStore(t *testing.T, store Store, ctx context.Context, runID string) {
 	t.Helper()
 	record := getRecord(t, store, runID)

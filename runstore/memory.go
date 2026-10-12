@@ -34,7 +34,9 @@ func (m *Memory) Create(ctx context.Context, record RunRecord) (RunRecord, error
 		return RunRecord{}, err
 	}
 	m.byRun[created.RunID] = created
-	return created, nil
+	// The stored value shares its pointers with the caller's copy, so the caller gets a
+	// fresh clone instead of it.
+	return created.clone()
 }
 
 // Get reads a record without changing it. See Store.Get.
@@ -64,7 +66,7 @@ func (m *Memory) CompareAndSwap(ctx context.Context, runID string, expectedVersi
 	// A terminal retry returns the stored record unchanged; writing it back is the same
 	// value, so the map stays consistent either way.
 	m.byRun[updated.RunID] = updated
-	return updated, nil
+	return updated.clone()
 }
 
 // runNotFound keeps the not-found message uniform across implementations.
