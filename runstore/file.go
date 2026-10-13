@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 )
 
@@ -42,7 +41,6 @@ type journalEvent struct {
 type File struct {
 	dir  string
 	runs string
-	mu   sync.Mutex
 	ops  fileOps
 	now  func() time.Time
 }
@@ -73,6 +71,10 @@ func defaultFileOps() fileOps {
 // NewFile opens, creating if needed, a file-backed run store rooted at dir. Records live
 // in dir/runs, so the same directory can hold a checkpoint store without either side
 // touching the other's files or lock names.
+//
+// Lock files are permanent OS-lock anchors. Stop all older processes using the
+// O_EXCL/TTL lock protocol before opening this store with this implementation;
+// the two lock protocols must not access the same runs directory concurrently.
 func NewFile(dir string) (*File, error) {
 	runs := filepath.Join(dir, "runs")
 	if err := os.MkdirAll(runs, 0o755); err != nil {
@@ -106,7 +108,11 @@ func (f *File) Create(ctx context.Context, record RunRecord) (RunRecord, error) 
 			return err
 		}
 		if latest != nil && created.Version == latest.Version {
-			// Replay of a record that is already durable: nothing to append.
+			// A prior append may have returned a Sync error. Confirm durability
+			// even when this retry has no new event to append.
+			if err := f.syncJournalLocked(record.RunID); err != nil {
+				return err
+			}
 			out = created
 			return nil
 		}
@@ -147,8 +153,10 @@ func (f *File) CompareAndSwap(ctx context.Context, runID string, expectedVersion
 			return err
 		}
 		if latest != nil && updated.Version == latest.Version {
-			// A terminal retry of the same outcome: it is already durable, so appending
-			// another event would be a rewrite.
+			// Confirm a prior append whose Sync may have failed.
+			if err := f.syncJournalLocked(runID); err != nil {
+				return err
+			}
 			out = updated
 			return nil
 		}
@@ -161,8 +169,8 @@ func (f *File) CompareAndSwap(ctx context.Context, runID string, expectedVersion
 	return out, err
 }
 
-// withRun is the only lock order in this store: process-local mutex, then the per-run lock
-// file. The critical section covers the scan, the tail repair and the append, so a second
+// withRun holds a per-run OS lock across the scan, tail repair and append.
+// Separate handles also serialize callers in the same process, so a second
 // instance cannot observe a state that the first is about to replace.
 func (f *File) withRun(ctx context.Context, runID string, fn func(latest *RunRecord) error) error {
 	if _, err := f.path(runID); err != nil {
@@ -171,8 +179,6 @@ func (f *File) withRun(ctx context.Context, runID string, fn func(latest *RunRec
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	release, err := f.acquireProcessLock(ctx, runID)
 	if err != nil {
 		return err
@@ -202,8 +208,6 @@ func (f *File) withRunRead(ctx context.Context, runID string, fn func(latest *Ru
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	release, err := f.acquireProcessLock(ctx, runID)
 	if err != nil {
 		return err
@@ -380,6 +384,23 @@ func (f *File) writeLine(fh *os.File, line []byte) error {
 		if n == 0 {
 			return io.ErrShortWrite
 		}
+	}
+	return nil
+}
+
+// syncJournalLocked confirms durability for an idempotent write without appending.
+func (f *File) syncJournalLocked(runID string) error {
+	path, err := f.path(runID)
+	if err != nil {
+		return err
+	}
+	fh, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer fh.Close()
+	if err := f.ops.sync(fh); err != nil {
+		return fmt.Errorf("runstore: sync run %q journal: %w", runID, err)
 	}
 	return nil
 }

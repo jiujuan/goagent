@@ -18,7 +18,7 @@ import (
 //
 // Like the checkpoint package's cross-process test, it re-executes the test binary with a
 // helper guard rather than shipping a second program, and it is not skipped on Windows —
-// the lock file uses O_EXCL precisely so this works everywhere the store runs.
+// the backend uses OS locks on both Windows and Unix.
 
 const runProcessHelperEnv = "GOAGENT_RUN_PROCESS_HELPER"
 
@@ -190,4 +190,77 @@ func TestRunFileCASAcrossProcesses(t *testing.T) {
 	if lines := bytes.Count([]byte(readJournal(t, dir, "cross-process")), []byte("\n")); lines != 2 {
 		t.Fatalf("journal 行数 = %d, 期望 2", lines)
 	}
+}
+
+const runLockHelperEnv = "GOAGENT_RUN_LOCK_HELPER"
+
+func TestRunFileLockProcessHelper(t *testing.T) {
+	if os.Getenv(runLockHelperEnv) != "1" {
+		return
+	}
+	store := newFileStore(t, os.Getenv(runProcessDirEnv))
+	release, err := store.acquireProcessLock(context.Background(), "crash-lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if _, err := fmt.Fprintln(os.Stdout, "locked"); err != nil {
+		t.Fatal(err)
+	}
+	// The parent kills this process while the OS lock is held.
+	_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+}
+
+func TestRunFileLockReleasedOnProcessExit(t *testing.T) {
+	dir := t.TempDir()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe, "-test.run=^TestRunFileLockProcessHelper$")
+	cmd.Env = append(os.Environ(), runLockHelperEnv+"=1", runProcessDirEnv+"="+dir)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
+	ready, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil || ready != "locked\n" {
+		t.Fatalf("helper: %q %v", ready, err)
+	}
+	store := newFileStore(t, dir)
+	waitCtx, stop := context.WithTimeout(ctx, 30*time.Millisecond)
+	release, err := store.acquireProcessLock(waitCtx, "crash-lock")
+	stop()
+	if err == nil {
+		release()
+		t.Fatal("entered another process's critical section")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal(err)
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+	release, err = store.acquireProcessLock(ctx, "crash-lock")
+	if err != nil {
+		t.Fatalf("dead process retained lock: %v", err)
+	}
+	release()
 }

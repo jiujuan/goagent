@@ -42,7 +42,8 @@ func WithWorkerLease(d time.Duration) WorkerOption {
 	return func(w *ManagedRunWorker) { w.lease = d }
 }
 
-// WithManagedRecordTimeout bounds the terminal checkpoint write alone. It must be positive.
+// WithManagedRecordTimeout bounds each recording phase: the terminal checkpoint write
+// and the task-store publication. It must be positive.
 func WithManagedRecordTimeout(d time.Duration) WorkerOption {
 	return func(w *ManagedRunWorker) { w.recordTimeout = d }
 }
@@ -82,8 +83,18 @@ func NewManagedRunWorker(a *agent.Agent, store runstore.Store, workerID string, 
 // delivery either executed the run, found it already claimed or settled, or found the queued
 // record cancelled before anything started.
 type ManagedRunOutcome struct {
-	// Record is the task record as the store holds it after this delivery.
+	// Record is the last task record read or successfully written by this delivery.
+	// If a later read fails it may be stale; RecordError reports that failure.
 	Record runstore.RunRecord
+	// Result is the frozen execution result, even if task-store publication failed.
+	// It is nil for deliveries that did not execute.
+	Result *agent.RunResult
+	// RunError is the execution error, independent of both recording errors.
+	RunError error
+	// CompletionRef identifies a successfully committed terminal checkpoint.
+	CompletionRef *checkpoint.Ref
+	// CompletionError is the checkpoint terminal-record error.
+	CompletionError error
 	// Executed means this delivery claimed the record and ran the model and tools.
 	Executed bool
 	// Duplicate means another delivery already owns or has settled this run, so nothing
@@ -208,24 +219,33 @@ func (w *ManagedRunWorker) recordCheckpoint(ctx context.Context, run *agent.Run,
 // running record, which moves its version, and publishing from the claim's version would then
 // be refused rather than report what happened.
 func (w *ManagedRunWorker) publish(ctx context.Context, claimed runstore.RunRecord, detail agent.RunResult, runErr error, completionRef *checkpoint.Ref, completionErr error) (ManagedRunOutcome, error) {
+	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.recordTimeout)
+	defer cancel()
+	out := ManagedRunOutcome{
+		Record: claimed, Executed: true, Result: &detail, RunError: runErr,
+		CompletionRef: cloneRef(completionRef), CompletionError: completionErr,
+	}
 	joined := errors.Join(runErr, completionErr)
-	current, err := w.store.Get(ctx, claimed.RunID)
+	current, err := w.store.Get(recordCtx, claimed.RunID)
 	if err != nil {
-		return ManagedRunOutcome{Executed: true, RecordError: err}, errors.Join(joined, err)
+		out.RecordError = err
+		return out, errors.Join(joined, err)
 	}
+	out.Record = current
 	next := terminalTaskRecord(current, detail, runErr, completionRef, completionErr)
-	published, writeErr := w.store.CompareAndSwap(ctx, current.RunID, current.Version, next)
+	published, writeErr := w.store.CompareAndSwap(recordCtx, current.RunID, current.Version, next)
 	if writeErr == nil {
-		return ManagedRunOutcome{Record: published, Executed: true}, joined
+		out.Record = published
+		return out, joined
 	}
-	// The store refused the outcome, so report the state it actually holds rather than the one
-	// this delivery wanted.
-	joined = errors.Join(joined, writeErr)
-	latest, getErr := w.store.Get(ctx, claimed.RunID)
-	if getErr != nil {
-		return ManagedRunOutcome{Executed: true, RecordError: errors.Join(writeErr, getErr)}, joined
+	// Keep the frozen result separate from the last known persisted state. A failed
+	// read must not erase either the execution evidence or the record's identity.
+	latest, getErr := w.store.Get(recordCtx, claimed.RunID)
+	out.RecordError = errors.Join(writeErr, getErr)
+	if getErr == nil {
+		out.Record = latest
 	}
-	return ManagedRunOutcome{Record: latest, Executed: true, RecordError: writeErr}, joined
+	return out, errors.Join(joined, out.RecordError)
 }
 
 // terminalTaskRecord turns a frozen run outcome into the task record's terminal state. stored
@@ -251,6 +271,7 @@ func terminalTaskRecord(stored runstore.RunRecord, detail agent.RunResult, runEr
 		// A pause ends this run; continuing it creates a new record whose ResumeOfRunID names
 		// this one, and no terminal checkpoint record exists for a pause.
 		next.Status = runstore.StatusPaused
+		next.Error = nil
 		next.FinishReason = runstore.FinishReasonPaused
 		next.Result = cloneResult(detail.Result)
 	case runErr != nil && honouredCancellation(stored, runErr):
@@ -273,6 +294,7 @@ func terminalTaskRecord(stored runstore.RunRecord, detail agent.RunResult, runEr
 		// A cancellation request that arrives while the run is still executing does not
 		// rewrite an outcome the run reached on its own (ADR-0034 D4).
 		next.Status = runstore.StatusSucceeded
+		next.Error = nil
 		next.FinishReason = runstore.FinishReasonCompleted
 		next.Result = cloneResult(detail.Result)
 	}

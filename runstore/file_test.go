@@ -100,7 +100,7 @@ func TestRunFileLayout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("列目录失败: %v", err)
 	}
-	if len(entries) != 1 {
+	if len(entries) != 2 || entries[0].Name() != "first.jsonl" || entries[1].Name() != "first.lock" {
 		names := []string{}
 		for _, e := range entries {
 			names = append(names, e.Name())
@@ -393,14 +393,15 @@ func TestRunFileLockWaitIsCancellable(t *testing.T) {
 	stubClock(t, testBase(), time.Hour)
 	dir := t.TempDir()
 	store := newFileStore(t, dir)
-	lockPath := filepath.Join(dir, "runs", "held.lock")
-	if err := os.WriteFile(lockPath, []byte("other process"), 0o600); err != nil {
-		t.Fatalf("造锁失败: %v", err)
+	release, err := store.acquireProcessLock(context.Background(), "held")
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer release()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
-	_, err := store.Create(ctx, recordIn("held", StatusQueued, testBase()))
+	_, err = store.Create(ctx, recordIn("held", StatusQueued, testBase()))
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("等锁应可被 context 取消, got %v", err)
 	}
