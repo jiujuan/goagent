@@ -44,7 +44,7 @@ func (r *Run) prepare() error {
 			begun, beginErr := coordinator.BeginRun(r.rc.Context, checkpoint.BeginRunRequest{
 				ThreadID: r.identity.threadID,
 				Owner:    r.identity.runID,
-				Lease:    checkpoint.DefaultLease,
+				Lease:    r.agent.cfg.claimLease,
 			})
 			if beginErr != nil {
 				return beginErr
@@ -83,7 +83,7 @@ func (r *Run) prepare() error {
 	}
 	r.rc.setLineageStart(head, turnID)
 	if coordinator != nil && claim != nil {
-		guard := newWriteGuard(coordinator, *claim, headRevision, checkpoint.DefaultLease)
+		guard := newWriteGuard(coordinator, *claim, headRevision, r.agent.cfg.claimLease)
 		r.rc.setDurableGuard(guard)
 		if err := guard.start(r.rc.Context, r.cancel); err != nil {
 			return err

@@ -38,14 +38,29 @@ type ManagedRunWorker struct {
 	lease         time.Duration
 	recordTimeout time.Duration
 	cancelPoll    time.Duration
+	heartbeat     time.Duration
+
+	// now and newTicker are the loop's clock and ticker. Production uses the runtime
+	// ones; a test injects its own so one delivery can be stepped across several
+	// leases without real time passing.
+	now       func() time.Time
+	newTicker func(time.Duration) runTicker
 }
 
 // WorkerOption tunes a ManagedRunWorker.
 type WorkerOption func(*ManagedRunWorker)
 
-// WithWorkerLease sets how long a claim is meant to last. It must be positive.
+// WithWorkerLease sets how long a claim is meant to last. It must be positive, and long
+// enough to cover at least three heartbeats.
 func WithWorkerLease(d time.Duration) WorkerOption {
 	return func(w *ManagedRunWorker) { w.lease = d }
+}
+
+// WithHeartbeatInterval sets how often a running worker rewrites its record's liveness
+// fields. It must be positive and short enough for the worker lease to cover at least three
+// of them.
+func WithHeartbeatInterval(d time.Duration) WorkerOption {
+	return func(w *ManagedRunWorker) { w.heartbeat = d }
 }
 
 // WithCancelPollInterval sets how often a running worker checks its task record for a
@@ -79,6 +94,11 @@ func NewManagedRunWorker(a *agent.Agent, store runstore.Store, workerID string, 
 		lease:         managedRunLease,
 		recordTimeout: terminalRecordTimeout,
 		cancelPoll:    defaultCancelPollInterval,
+		heartbeat:     defaultHeartbeatInterval,
+		now:           func() time.Time { return time.Now().UTC() },
+		newTicker: func(d time.Duration) runTicker {
+			return runtimeRunTicker{Ticker: time.NewTicker(d)}
+		},
 	}
 	for _, opt := range opts {
 		opt(w)
@@ -91,6 +111,13 @@ func NewManagedRunWorker(a *agent.Agent, store runstore.Store, workerID string, 
 	}
 	if w.cancelPoll <= 0 {
 		return nil, fmt.Errorf("queue: managed run cancel poll interval must be positive, got %v", w.cancelPoll)
+	}
+	if w.heartbeat <= 0 {
+		return nil, fmt.Errorf("queue: managed run heartbeat interval must be positive, got %v", w.heartbeat)
+	}
+	if need := minHeartbeatsPerLease * w.heartbeat; w.lease < need {
+		return nil, fmt.Errorf("queue: managed run worker lease %v must cover %d heartbeats of %v, need %v",
+			w.lease, minHeartbeatsPerLease, w.heartbeat, need)
 	}
 	return w, nil
 }
@@ -166,11 +193,17 @@ func (w *ManagedRunWorker) Execute(ctx context.Context, runID string, input stri
 
 	execCtx, cancelExec := context.WithCancel(ctx)
 	defer cancelExec()
+	watch := w.newTaskWatch(claimed)
 	stopWatching := make(chan struct{})
 	defer close(stopWatching)
-	go w.watchCancellation(execCtx, claimed.RunID, stopWatching, cancelExec)
+	go watch.run(execCtx, stopWatching, cancelExec)
 
 	run, detail, runErr := w.drive(execCtx, claimed, input, opts...)
+	if lost := watch.ownershipLost(); lost != nil {
+		// The record no longer belongs to this delivery: it gets neither a task terminal
+		// state nor a checkpoint terminal record from here.
+		return w.abandon(ctx, claimed, detail, runErr, lost), errors.Join(runErr, lost)
+	}
 	completionRef, completionErr := w.recordCheckpoint(ctx, run, detail)
 	return w.publish(ctx, claimed, detail, runErr, completionRef, completionErr)
 }
@@ -188,39 +221,25 @@ func deliveryDecision(record runstore.RunRecord) (ManagedRunOutcome, bool) {
 	return ManagedRunOutcome{Record: record, Duplicate: true}, true
 }
 
-// watchCancellation looks at this run's task record while the run is executing and cancels the
-// execution context when it finds a persisted cancellation request. The request is written by
-// somebody else's CancelRun, so a run that never looks cannot honour it (ADR-0034 D4).
-//
-// A read that fails is ignored: a store outage is not a cancellation, and the next tick tries
-// again. Once the record has ended the watch stops — there is nothing left to cancel here.
-//
-// This loop neither renews the claim lease nor writes heartbeats; those stay separate duties
-// (ADR-0034 D6, TASK-SM-09).
-func (w *ManagedRunWorker) watchCancellation(ctx context.Context, runID string, stop <-chan struct{}, cancel context.CancelFunc) {
-	ticker := time.NewTicker(w.cancelPoll)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-
-		record, err := w.store.Get(ctx, runID)
-		if err != nil {
-			continue
-		}
-		if record.Status.Terminal() {
-			return
-		}
-		if !record.CancelRequestedAt.IsZero() || record.Status == runstore.StatusCancelling {
-			cancel()
-			return
-		}
+// abandon reports a delivery that lost its right to write the record. The run's own outcome
+// stays in the result so the caller can see what happened, but nothing further is written:
+// the record belongs to another owner or can no longer be trusted, and a stale epoch must not
+// overwrite it (ADR-0034 D6). The best available record is read back when the store answers.
+func (w *ManagedRunWorker) abandon(ctx context.Context, claimed runstore.RunRecord, detail agent.RunResult, runErr error, lost error) ManagedRunOutcome {
+	out := ManagedRunOutcome{
+		Record:      claimed,
+		Executed:    true,
+		Result:      &detail,
+		RunError:    runErr,
+		RecordError: lost,
 	}
+	current, err := w.store.Get(context.WithoutCancel(ctx), claimed.RunID)
+	if err != nil {
+		out.RecordError = errors.Join(lost, err)
+		return out
+	}
+	out.Record = current
+	return out
 }
 
 // claim moves a queued record to running under this worker's identity. The epoch advances
@@ -231,7 +250,7 @@ func (w *ManagedRunWorker) claim(ctx context.Context, record runstore.RunRecord)
 	next.Status = runstore.StatusRunning
 	next.WorkerID = w.workerID
 	next.WorkerEpoch = record.WorkerEpoch + 1
-	next.WorkerLeaseUntil = time.Now().UTC().Add(w.lease)
+	next.WorkerLeaseUntil = w.now().Add(w.lease)
 	claimed, err := w.store.CompareAndSwap(ctx, record.RunID, record.Version, next)
 	if err != nil {
 		return runstore.RunRecord{}, err

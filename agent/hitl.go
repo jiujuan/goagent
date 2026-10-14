@@ -88,7 +88,7 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 			Revision: cp.Revision,
 			PauseID:  checkpoint.EffectivePauseID(cp),
 			Owner:    core.NewID("resume"),
-			Lease:    checkpoint.DefaultLease,
+			Lease:    a.cfg.claimLease,
 		})
 		if err != nil {
 			return nil, err

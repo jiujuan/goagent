@@ -23,6 +23,11 @@ type durableRunState struct {
 	guard          *writeGuard
 	approvalEvents []core.ApprovalDecided
 
+	// claimLease is the agent's configured checkpoint lease, fixed when the run handle
+	// is created and shared by every nested run. Commits without a write guard ask for
+	// this one, so a claim is never shortened by a second lease owner.
+	claimLease time.Duration
+
 	// boundary is the highest-revision checkpoint this run committed
 	// successfully, with the revision the store assigned it. A failed commit
 	// never touches it, so the pair always identifies a visible state of THIS
@@ -345,6 +350,7 @@ func (rc *RunContext) commitCheckpointLocked(cp *checkpoint.Checkpoint, releaseC
 	acks := append([]string(nil), d.ackMessageIDs...)
 	claim := copyClaim(d.claim)
 	guard := d.guard
+	claimLease := d.claimLease
 	executions := make(map[string]checkpoint.ToolExecution, len(d.executions)+len(extra))
 	for id, ex := range d.executions {
 		executions[id] = ex
@@ -373,7 +379,7 @@ func (rc *RunContext) commitCheckpointLocked(cp *checkpoint.Checkpoint, releaseC
 		Checkpoint:     cp,
 		AckMessageIDs:  acks,
 		Claim:          claim,
-		Lease:          checkpoint.DefaultLease,
+		Lease:          claimLeaseOrDefault(claimLease),
 		ReleaseClaim:   releaseClaim,
 		ToolExecutions: committed,
 	}

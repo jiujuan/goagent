@@ -25,6 +25,7 @@ type config struct {
 	maxTurns                  int
 	toolExec                  ToolExecMode
 	toolTimeout               time.Duration
+	claimLease                time.Duration
 	modelOpts                 []llm.Option
 	outputKey                 string
 	requireThreadCoordination bool
@@ -103,6 +104,19 @@ func WithToolExecution(m ToolExecMode) Option { return func(c *config) { c.toolE
 // executing. Total wall-clock for a whole run is RunBudget.MaxDuration's job,
 // not this one's.
 func WithToolTimeout(d time.Duration) Option { return func(c *config) { c.toolTimeout = d } }
+
+// WithClaimLease sets how long this agent's checkpoint claims are held: the thread claim
+// taken when a run starts, the resume claim claimed by Agent.Resume, the renewal interval
+// derived from it (lease/2), and the lease each commit asks the store to keep. One value
+// covers all of those, so a run cannot hold a claim shorter than the one it renewed, and a
+// sub-agent built by its own New uses its own setting.
+//
+// It must be positive; the default is checkpoint.DefaultLease (30 seconds). This does not
+// change the store's package-level default for anybody else, and it is not the queue's task
+// record lease: that bounds a worker's ownership of a run record and is configured on
+// queue.ManagedRunWorker. A heartbeat on the task record never renews this claim, and this
+// claim's renewal never writes a task record (ADR-0034 D6).
+func WithClaimLease(d time.Duration) Option { return func(c *config) { c.claimLease = d } }
 
 // WithOutputKey writes this agent's final answer text into State.KV under key,
 // for inter-stage coordination in a workflow. Later stages reference it in their

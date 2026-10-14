@@ -43,18 +43,25 @@ type writeGuard struct {
 }
 
 func newWriteGuard(store checkpoint.ThreadCoordinator, claim checkpoint.Claim, headRevision uint64, lease time.Duration) *writeGuard {
-	if lease <= 0 {
-		lease = checkpoint.DefaultLease
-	}
 	return &writeGuard{
 		store:        store,
 		claim:        claim,
 		headRevision: headRevision,
-		lease:        lease,
+		lease:        claimLeaseOrDefault(lease),
 		newTicker: func(interval time.Duration) writeGuardTicker {
 			return runtimeWriteGuardTicker{Ticker: time.NewTicker(interval)}
 		},
 	}
+}
+
+// claimLeaseOrDefault keeps one place where an unset lease means the store's default. A run
+// built through an Agent always carries its configured lease; a hand-constructed execution
+// environment in a test may leave it empty.
+func claimLeaseOrDefault(lease time.Duration) time.Duration {
+	if lease <= 0 {
+		return checkpoint.DefaultLease
+	}
+	return lease
 }
 
 func (g *writeGuard) start(ctx context.Context, cancel context.CancelFunc) error {

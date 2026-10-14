@@ -35,12 +35,15 @@ type Agent struct {
 
 // New builds an Agent from functional options. WithModel is required.
 func New(opts ...Option) (*Agent, error) {
-	c := config{maxTurns: defaultMaxTurns}
+	c := config{maxTurns: defaultMaxTurns, claimLease: checkpoint.DefaultLease}
 	for _, o := range opts {
 		o(&c)
 	}
 	if c.model == nil {
 		return nil, errors.New("agent: WithModel is required")
+	}
+	if c.claimLease <= 0 {
+		return nil, fmt.Errorf("agent: claim lease must be positive, got %v", c.claimLease)
 	}
 	if c.bus == nil {
 		c.bus = bus.New()
@@ -238,6 +241,9 @@ func (a *Agent) newRunHandleWithID(ctx context.Context, runID, threadID string, 
 		State:    state,
 		durable:  newDurableRunState(),
 	}
+	// The lease lives on the durable state every nested run shares, so one run cannot
+	// commit under one lease while its claim was renewed under another.
+	rc.durable.claimLease = a.cfg.claimLease
 	return &Run{
 		ID:       runID,
 		ThreadID: threadID,
