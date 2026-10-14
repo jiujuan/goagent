@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jiujuan/goagent/agent"
 	"github.com/jiujuan/goagent/checkpoint"
@@ -599,4 +600,81 @@ func historyCount(t *testing.T, store checkpoint.Checkpointer, threadID string) 
 		t.Fatal(err)
 	}
 	return len(hist)
+}
+
+// --- SM-13 场景 E：受管路径遇到只有四个方法的外部存储 -------------------------
+
+// plainCapabilityStore 只转发 checkpoint.Checkpointer 的四个方法：外部接进来的最基础存储
+// 就是这个形状，能力缺失必须在构造期或写的那一刻说清楚，不能悄悄降级。
+type plainCapabilityStore struct {
+	inner checkpoint.Checkpointer
+}
+
+func (s *plainCapabilityStore) Save(ctx context.Context, cp *checkpoint.Checkpoint) error {
+	return s.inner.Save(ctx, cp)
+}
+
+func (s *plainCapabilityStore) Load(ctx context.Context, threadID, checkpointID string) (*checkpoint.Checkpoint, error) {
+	return s.inner.Load(ctx, threadID, checkpointID)
+}
+
+func (s *plainCapabilityStore) Latest(ctx context.Context, threadID string) (*checkpoint.Checkpoint, error) {
+	return s.inner.Latest(ctx, threadID)
+}
+
+func (s *plainCapabilityStore) History(ctx context.Context, threadID string) ([]*checkpoint.Checkpoint, error) {
+	return s.inner.History(ctx, threadID)
+}
+
+var _ checkpoint.Checkpointer = (*plainCapabilityStore)(nil)
+
+// TestManagedRunReportsMissingCheckpointCapabilities 把受管运行压在只有四方法的存储上跑：
+// 执行本身照常成功，任务记录写终态，但"补一条终态快照"这件事明确失败并单独记账；修复器在
+// 构造时就拒绝，因为查证据的能力根本没有。重复投递依旧无害。
+func TestManagedRunReportsMissingCheckpointCapabilities(t *testing.T) {
+	ctx := context.Background()
+	plain := &plainCapabilityStore{inner: checkpoint.NewMemory()}
+	store := runstore.NewMemory()
+	var calls atomic.Int64
+	w := managedWorker(t, managedAgent(t, plain, "基础存储的答案", &calls), store, "worker-plain",
+		WithCancelPollInterval(5*time.Millisecond))
+	r := managedCreate(t, store, managedRecord("managed-plain", "thread-plain", "turn-plain"))
+
+	out, err := w.Execute(ctx, r.RunID, "问题")
+	if !out.Executed || calls.Load() != 1 {
+		t.Fatalf("基础存储上执行没跑起来: executed=%v calls=%d", out.Executed, calls.Load())
+	}
+	if !errors.Is(out.CompletionError, checkpoint.ErrDurableUnavailable) {
+		t.Fatalf("终态快照应报能力缺失: %v", out.CompletionError)
+	}
+	if out.RunError != nil {
+		t.Fatalf("执行不该失败: %v", out.RunError)
+	}
+	if err == nil || !errors.Is(err, checkpoint.ErrDurableUnavailable) {
+		t.Fatalf("返回错误应带上能力缺失: %v", err)
+	}
+	if out.CompletionRef != nil {
+		t.Fatalf("没有能力却报出了终态引用: %+v", out.CompletionRef)
+	}
+	if out.Record.Status != runstore.StatusSucceeded || out.Record.Result == nil {
+		t.Fatalf("任务记录没写下执行结果: %s %+v", out.Record.Status, out.Record.Result)
+	}
+	if out.Record.RecordError == nil || out.Record.RecordError.Code != runstore.ErrCodeCompletionRecord ||
+		!out.Record.RecordError.Retryable {
+		t.Fatalf("记账错误没单独报出: %+v", out.Record.RecordError)
+	}
+
+	// 修复器需要摘要能力：缺了就在构造期拒绝，不留"跑到一半才发现"的坑。
+	if _, err := NewRunReconciler(store, plain); !errors.Is(err, checkpoint.ErrCapabilityUnavailable) {
+		t.Fatalf("缺能力的修复器应被拒: %v", err)
+	}
+
+	// 记录已终结：同一份投递再来一次是无害的重复，不会第二次调模型。
+	second, err := w.Execute(ctx, r.RunID, "问题")
+	if err != nil || !second.Duplicate || second.Executed {
+		t.Fatalf("重复投递应只报重复: duplicate=%v executed=%v err=%v", second.Duplicate, second.Executed, err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("重复投递后模型调用 %d 次", calls.Load())
+	}
 }

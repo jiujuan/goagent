@@ -865,3 +865,76 @@ func TestSessionHistoryRequiresQueryCapability(t *testing.T) {
 		t.Errorf("GetHead 没有走 Latest")
 	}
 }
+
+// --- SM-13 场景 E：只有四个方法的外部存储 ------------------------------------
+
+// TestSessionPlainCheckpointerKeepsRunAndRefusesCapabilities 把"第三方只实现 Checkpointer"
+// 这一条兼容承诺摊开跑一遍：普通执行、会话执行、受管身份执行都照常，摘要查询、Fork 和终态
+// 记录各报各的能力缺失，且失败的一方不许偷偷写出一条快照。
+func TestSessionPlainCheckpointerKeepsRunAndRefusesCapabilities(t *testing.T) {
+	ctx := context.Background()
+	// historyBlindStore 只转发四个方法，并带 History/Latest 的调用计数：既能证明能力缺失，
+	// 也能证明失败时没有退化成整线程读取。
+	base := &historyBlindStore{inner: checkpoint.NewMemory()}
+	a := terminalAgent(t, base, resultTextModel("m", "基础存储的回答"))
+
+	// 前台执行：四方法存储本来就是 agent.Run 的既有契约。
+	text, err := a.Run(ctx, "问题")
+	if err != nil {
+		t.Fatalf("基础存储上的 Run: %v", err)
+	}
+	if text != "基础存储的回答" {
+		t.Fatalf("Run 结果 = %q", text)
+	}
+
+	session, err := a.OpenSession(ctx, "plain-capabilities")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sent, err := session.Send(ctx, "再问一句")
+	if err != nil {
+		t.Fatalf("基础存储上的 Send: %v", err)
+	}
+	if sent.CheckpointRef != nil || sent.Revision != 0 {
+		t.Fatalf("没有回执的存储报出了边界: %+v rev=%d", sent.CheckpointRef, sent.Revision)
+	}
+
+	// 受管身份：执行照旧带上 RunID/ThreadID/TurnID，身份不依赖存储的能力。
+	managed, err := a.StreamManaged(ctx, agent.ManagedRunSpec{
+		RunID: "run-plain-1", ThreadID: "plain-managed", TurnID: "turn-plain-1",
+	}, "后台问题")
+	if err != nil {
+		t.Fatalf("基础存储上的 StreamManaged: %v", err)
+	}
+	if _, err := managed.Wait(); err != nil {
+		t.Fatalf("等受管执行结束: %v", err)
+	}
+	detail := managed.DetailedResult()
+	if detail.RunID != "run-plain-1" || detail.TurnID != "turn-plain-1" || detail.ThreadID != "plain-managed" {
+		t.Fatalf("受管身份丢了: %+v", detail)
+	}
+	if err := a.RecordCompletion(ctx, managed); !errors.Is(err, checkpoint.ErrDurableUnavailable) {
+		t.Fatalf("终态记录应报能力缺失: %v", err)
+	}
+
+	// 摘要分页：不降级成整线程读取。
+	page, err := session.History(ctx, checkpoint.ListOptions{})
+	if !errors.Is(err, checkpoint.ErrCapabilityUnavailable) {
+		t.Fatalf("History 应报能力缺失: %v page=%+v", err, page)
+	}
+	if base.historyCalls != 0 {
+		t.Fatalf("History 退化成整线程读取 %d 次", base.historyCalls)
+	}
+
+	// Fork：目标线程一条都不许写。
+	head, err := session.GetHead(ctx)
+	if err != nil || head == nil {
+		t.Fatalf("GetHead 在基础存储上应可用: head=%+v err=%v", head, err)
+	}
+	if branch, err := session.ForkFrom(ctx, head.ID, "plain-capabilities-branch"); !errors.Is(err, checkpoint.ErrDurableUnavailable) || branch != nil {
+		t.Fatalf("ForkFrom 应报能力缺失且不返回门面: err=%v branch=%+v", err, branch)
+	}
+	if count := historyCount(t, base, "plain-capabilities-branch"); count != 0 {
+		t.Fatalf("不支持的 Fork 写了 %d 条", count)
+	}
+}
