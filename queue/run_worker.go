@@ -17,6 +17,11 @@ import (
 // only a heartbeat loop renews it (ADR-0034 D6, TASK-SM-09).
 const managedRunLease = 30 * time.Second
 
+// defaultCancelPollInterval is how often a running worker looks at its own task record for a
+// cancellation request. A request is written by somebody else's RunClient, so looking is the
+// only way a run can honour it.
+const defaultCancelPollInterval = 250 * time.Millisecond
+
 // ManagedRunWorker executes one recorded run from a queue delivery: it claims the task
 // record, runs the agent under the identity that record carries, then publishes the frozen
 // outcome back to it (ADR-0034 D4, D5).
@@ -32,6 +37,7 @@ type ManagedRunWorker struct {
 	workerID      string
 	lease         time.Duration
 	recordTimeout time.Duration
+	cancelPoll    time.Duration
 }
 
 // WorkerOption tunes a ManagedRunWorker.
@@ -40,6 +46,12 @@ type WorkerOption func(*ManagedRunWorker)
 // WithWorkerLease sets how long a claim is meant to last. It must be positive.
 func WithWorkerLease(d time.Duration) WorkerOption {
 	return func(w *ManagedRunWorker) { w.lease = d }
+}
+
+// WithCancelPollInterval sets how often a running worker checks its task record for a
+// cancellation request. It must be positive.
+func WithCancelPollInterval(d time.Duration) WorkerOption {
+	return func(w *ManagedRunWorker) { w.cancelPoll = d }
 }
 
 // WithManagedRecordTimeout bounds each recording phase: the terminal checkpoint write
@@ -66,6 +78,7 @@ func NewManagedRunWorker(a *agent.Agent, store runstore.Store, workerID string, 
 		workerID:      workerID,
 		lease:         managedRunLease,
 		recordTimeout: terminalRecordTimeout,
+		cancelPoll:    defaultCancelPollInterval,
 	}
 	for _, opt := range opts {
 		opt(w)
@@ -75,6 +88,9 @@ func NewManagedRunWorker(a *agent.Agent, store runstore.Store, workerID string, 
 	}
 	if w.recordTimeout <= 0 {
 		return nil, fmt.Errorf("queue: managed run record timeout must be positive, got %v", w.recordTimeout)
+	}
+	if w.cancelPoll <= 0 {
+		return nil, fmt.Errorf("queue: managed run cancel poll interval must be positive, got %v", w.cancelPoll)
 	}
 	return w, nil
 }
@@ -111,7 +127,7 @@ type ManagedRunOutcome struct {
 
 // Execute claims and runs the recorded run identified by runID, then publishes its frozen
 // outcome. input is the user text for this turn: the task record carries identity, not the
-// prompt, so whoever resolved the delivery supplies it (TASK-SM-08's payload).
+// prompt, so whoever resolved the delivery supplies it (see ManagedRunPayload).
 //
 // The returned error is the run's own failure, joined with the checkpoint terminal record's
 // failure when a run that reached an outcome could not be recorded. A task-store write
@@ -119,27 +135,28 @@ type ManagedRunOutcome struct {
 // into the returned error.
 //
 // ctx drives execution. Cancelling it stops the run, and the record then says the run failed
-// — or was cancelled, when a cancellation request was persisted first.
+// — or was cancelled, when a cancellation request was persisted first. A request persisted
+// while the run is going is noticed by this worker's own polling and then stops the run, so
+// CancelRun works without any caller holding a handle.
 func (w *ManagedRunWorker) Execute(ctx context.Context, runID string, input string, opts ...agent.RunOption) (ManagedRunOutcome, error) {
 	record, err := w.store.Get(ctx, runID)
 	if err != nil {
 		return ManagedRunOutcome{}, err
 	}
-	if record.Status != runstore.StatusQueued {
-		// A record already cancelled means the request landed before any worker started;
-		// anything else under this RunID is a run another delivery owns or has settled.
-		if record.Status == runstore.StatusCancelled {
-			return ManagedRunOutcome{Record: record, CancelledBeforeStart: true}, nil
-		}
-		return ManagedRunOutcome{Record: record, Duplicate: true}, nil
+	if decision, settled := deliveryDecision(record); settled {
+		return decision, nil
 	}
 
 	claimed, err := w.claim(ctx, record)
 	if errors.Is(err, runstore.ErrConflict) {
-		// Another worker claimed it between the read and the swap: nothing runs here.
+		// Another write landed between the read and the swap: a cancellation that got there
+		// first ends this run, anything else means another delivery holds it.
 		latest, getErr := w.store.Get(ctx, runID)
 		if getErr != nil {
 			return ManagedRunOutcome{}, errors.Join(err, getErr)
+		}
+		if decision, settled := deliveryDecision(latest); settled {
+			return decision, nil
 		}
 		return ManagedRunOutcome{Record: latest, Duplicate: true}, nil
 	}
@@ -147,9 +164,63 @@ func (w *ManagedRunWorker) Execute(ctx context.Context, runID string, input stri
 		return ManagedRunOutcome{}, err
 	}
 
-	run, detail, runErr := w.drive(ctx, claimed, input, opts...)
+	execCtx, cancelExec := context.WithCancel(ctx)
+	defer cancelExec()
+	stopWatching := make(chan struct{})
+	defer close(stopWatching)
+	go w.watchCancellation(execCtx, claimed.RunID, stopWatching, cancelExec)
+
+	run, detail, runErr := w.drive(execCtx, claimed, input, opts...)
 	completionRef, completionErr := w.recordCheckpoint(ctx, run, detail)
 	return w.publish(ctx, claimed, detail, runErr, completionRef, completionErr)
+}
+
+// deliveryDecision reports what a delivery should do with a record it has just read. Only a
+// queued record is its own to run; a cancelled one ended before anything started, and any
+// other non-queued state belongs to a delivery that got there first.
+func deliveryDecision(record runstore.RunRecord) (ManagedRunOutcome, bool) {
+	if record.Status == runstore.StatusQueued {
+		return ManagedRunOutcome{}, false
+	}
+	if record.Status == runstore.StatusCancelled {
+		return ManagedRunOutcome{Record: record, CancelledBeforeStart: true}, true
+	}
+	return ManagedRunOutcome{Record: record, Duplicate: true}, true
+}
+
+// watchCancellation looks at this run's task record while the run is executing and cancels the
+// execution context when it finds a persisted cancellation request. The request is written by
+// somebody else's CancelRun, so a run that never looks cannot honour it (ADR-0034 D4).
+//
+// A read that fails is ignored: a store outage is not a cancellation, and the next tick tries
+// again. Once the record has ended the watch stops — there is nothing left to cancel here.
+//
+// This loop neither renews the claim lease nor writes heartbeats; those stay separate duties
+// (ADR-0034 D6, TASK-SM-09).
+func (w *ManagedRunWorker) watchCancellation(ctx context.Context, runID string, stop <-chan struct{}, cancel context.CancelFunc) {
+	ticker := time.NewTicker(w.cancelPoll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		record, err := w.store.Get(ctx, runID)
+		if err != nil {
+			continue
+		}
+		if record.Status.Terminal() {
+			return
+		}
+		if !record.CancelRequestedAt.IsZero() || record.Status == runstore.StatusCancelling {
+			cancel()
+			return
+		}
+	}
 }
 
 // claim moves a queued record to running under this worker's identity. The epoch advances

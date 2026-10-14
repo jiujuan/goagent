@@ -14,6 +14,14 @@
 // Handle.Wait reports the first step, Handle.WaitRecorded both. Cancelling a
 // Pool's context stops dequeuing and waits for in-flight jobs — it does not stop
 // a run that is already executing; Handle.Cancel is how you do that.
+//
+// Managed runs are the durable task-record path: EnqueueManagedAgent records the run as
+// queued and dispatches a versioned Type/Payload naming the run's identity and an agent
+// key, so any worker holding that configuration can claim the record, execute under the
+// identity it carries and publish the frozen outcome (ManagedRunHandler, ManagedRunWorker).
+// A caller that has no handle follows the run through the task record alone with RunClient,
+// which can wait and request cancellation; a redelivered job never runs the same task twice.
+// EnqueueAgent's closure path is unchanged.
 package queue
 
 import (

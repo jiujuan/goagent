@@ -640,6 +640,14 @@ func TestManagedRunWorkerConstruction(t *testing.T) {
 			_, e := NewManagedRunWorker(a, store, "w", WithManagedRecordTimeout(0))
 			return e
 		}(),
+		"zero cancel poll": func() error {
+			_, e := NewManagedRunWorker(a, store, "w", WithCancelPollInterval(0))
+			return e
+		}(),
+		"negative cancel poll": func() error {
+			_, e := NewManagedRunWorker(a, store, "w", WithCancelPollInterval(-time.Millisecond))
+			return e
+		}(),
 	} {
 		if err == nil {
 			t.Fatalf("%s 应构造失败", name)
@@ -649,6 +657,9 @@ func TestManagedRunWorkerConstruction(t *testing.T) {
 	w := managedWorker(t, a, store, "w")
 	if w.lease != managedRunLease || w.recordTimeout != terminalRecordTimeout {
 		t.Fatalf("默认值 = %v / %v", w.lease, w.recordTimeout)
+	}
+	if w.cancelPoll != defaultCancelPollInterval {
+		t.Fatalf("默认取消轮询 = %v, 期望 %v", w.cancelPoll, defaultCancelPollInterval)
 	}
 }
 
