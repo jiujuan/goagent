@@ -14,16 +14,25 @@ type Memory struct {
 	mu       sync.RWMutex
 	byThread map[string][]*Checkpoint
 	durable  map[string]*memoryDurableState
-	now      func() time.Time
+	// summaries is the payload-free projection the query interfaces read: one entry per
+	// snapshot this store made visible, in visibility order. It holds no *Checkpoint, so
+	// serving a page never has to walk a State (ADR-0034 D7).
+	summaries map[string][]CheckpointMetadata
+	// projections holds the page walks in flight, bounded by age and count.
+	projections *projectionCache
+	now         func() time.Time
 }
 
 // NewMemory constructs an in-memory checkpointer.
 func NewMemory() *Memory {
-	return &Memory{
-		byThread: map[string][]*Checkpoint{},
-		durable:  map[string]*memoryDurableState{},
-		now:      time.Now,
+	m := &Memory{
+		byThread:  map[string][]*Checkpoint{},
+		durable:   map[string]*memoryDurableState{},
+		summaries: map[string][]CheckpointMetadata{},
+		now:       time.Now,
 	}
+	m.projections = newProjectionCache(CursorTTL, MaxPinnedProjections, m.nowTime)
+	return m
 }
 
 func (m *Memory) nowTime() time.Time {

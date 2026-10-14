@@ -165,6 +165,11 @@ func (m *Memory) commitLocked(req CommitRequest) (CommitReceipt, error) {
 
 	st.revision = revision
 	m.byThread[cp.ThreadID] = append(m.byThread[cp.ThreadID], stored)
+	// The summary index moves with the snapshot it describes, inside the same lock: a
+	// commit that returned an error above never reaches this line, and a commit that was
+	// recognised as a retry returned before it. Either way a page walk sees one entry per
+	// visible record (ADR-0034 D7).
+	m.summaries[cp.ThreadID] = append(m.summaries[cp.ThreadID], checkpointMetadataOf(stored))
 	for _, id := range req.AckMessageIDs {
 		delete(st.inbox, id)
 	}
