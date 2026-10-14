@@ -14,13 +14,17 @@ type Memory struct {
 	mu    sync.RWMutex
 	byRun map[string]RunRecord
 	now   func() time.Time
+	// projections holds the run list page walks in flight, bounded by age and count.
+	projections *projectionCache
 }
 
 var _ Store = (*Memory)(nil)
 
 // NewMemory constructs an empty in-memory run store.
 func NewMemory() *Memory {
-	return &Memory{byRun: map[string]RunRecord{}, now: storageClock}
+	m := &Memory{byRun: map[string]RunRecord{}, now: storageClock}
+	m.projections = newProjectionCache(runCursorTTL, maxPinnedRunProjections, m.stamp)
+	return m
 }
 
 // stamp takes one reading of this store's clock for one write attempt.

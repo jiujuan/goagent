@@ -43,6 +43,10 @@ type File struct {
 	runs string
 	ops  fileOps
 	now  func() time.Time
+	// projections holds the run list page walks in flight, bounded by age and count. It is
+	// process-local: a restart lets outstanding tokens expire rather than pretending a
+	// cursor outlived the process that minted it (ADR-0034 D7).
+	projections *projectionCache
 }
 
 // stamp takes one reading of this store's clock for one write attempt, in UTC like every
@@ -80,7 +84,9 @@ func NewFile(dir string) (*File, error) {
 	if err := os.MkdirAll(runs, 0o755); err != nil {
 		return nil, fmt.Errorf("runstore: create runs dir: %w", err)
 	}
-	return &File{dir: dir, runs: runs, ops: defaultFileOps()}, nil
+	f := &File{dir: dir, runs: runs, ops: defaultFileOps()}
+	f.projections = newProjectionCache(runCursorTTL, maxPinnedRunProjections, f.stamp)
+	return f, nil
 }
 
 // path resolves a RunID to its journal, refusing anything that could escape the runs
