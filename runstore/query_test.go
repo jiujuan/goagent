@@ -183,7 +183,7 @@ func sameRunIDs(got, want []string) bool {
 	return true
 }
 
-func TestRunListOrderingAndFilters(t *testing.T) {
+func TestQueryRunOrderingAndFilters(t *testing.T) {
 	for _, store := range runQueryStores() {
 		t.Run(store.name, func(t *testing.T) {
 			b := store.open(t)
@@ -233,7 +233,7 @@ func TestRunListOrderingAndFilters(t *testing.T) {
 	}
 }
 
-func TestRunListPagesAreFrozen(t *testing.T) {
+func TestQueryRunPagesAreFrozen(t *testing.T) {
 	for _, store := range runQueryStores() {
 		t.Run(store.name, func(t *testing.T) {
 			b := store.open(t)
@@ -304,7 +304,7 @@ func TestRunListPagesAreFrozen(t *testing.T) {
 	}
 }
 
-func TestRunListSummariesCarryNoPayload(t *testing.T) {
+func TestQueryRunSummariesCarryNoPayload(t *testing.T) {
 	for _, store := range runQueryStores() {
 		t.Run(store.name, func(t *testing.T) {
 			b := store.open(t)
@@ -361,7 +361,7 @@ func assertNoPayloadTypes(t *testing.T, typ reflect.Type) {
 	}
 }
 
-func TestRunListLimitAndEmptyResult(t *testing.T) {
+func TestQueryRunLimitAndEmptyResult(t *testing.T) {
 	for _, store := range runQueryStores() {
 		t.Run(store.name, func(t *testing.T) {
 			b := store.open(t)
@@ -392,7 +392,7 @@ func TestRunListLimitAndEmptyResult(t *testing.T) {
 	}
 }
 
-func TestRunListRejectsForeignCursors(t *testing.T) {
+func TestQueryRunRejectsForeignCursors(t *testing.T) {
 	for _, store := range runQueryStores() {
 		t.Run(store.name, func(t *testing.T) {
 			b := store.open(t)
@@ -476,7 +476,7 @@ func seedEightRunWantedIDs() []string {
 	return []string{"r-2", "r-1", "r-3", "r-4", "r-5", "r-6", "r-7", "r-8"}
 }
 
-func TestRunListCursorExpiry(t *testing.T) {
+func TestQueryRunCursorExpiry(t *testing.T) {
 	for _, store := range runQueryStores() {
 		t.Run(store.name, func(t *testing.T) {
 			b := store.open(t)
@@ -521,7 +521,7 @@ func TestRunListCursorExpiry(t *testing.T) {
 	}
 }
 
-func TestRunListRowsAreCopies(t *testing.T) {
+func TestQueryRunRowsAreCopies(t *testing.T) {
 	for _, store := range runQueryStores() {
 		t.Run(store.name, func(t *testing.T) {
 			b := store.open(t)
@@ -559,7 +559,7 @@ func TestRunListRowsAreCopies(t *testing.T) {
 	}
 }
 
-func TestRunListOptionsTimeBoundsSkipUnknownTime(t *testing.T) {
+func TestQueryRunOptionsTimeBoundsSkipUnknownTime(t *testing.T) {
 	// A record with no creation time is only reachable by hand — the store always stamps one
 	// — so the rule is checked on the filter itself: no bound matches it, any bound excludes it.
 	unknown := RunSummary{RunID: "r-0", ThreadID: "alpha", Status: StatusQueued}
@@ -589,7 +589,7 @@ func TestRunListOptionsTimeBoundsSkipUnknownTime(t *testing.T) {
 	}
 }
 
-func TestFileRunListEnumeration(t *testing.T) {
+func TestQueryFileRunEnumeration(t *testing.T) {
 	dir := t.TempDir()
 	f, err := NewFile(dir)
 	if err != nil {
@@ -680,7 +680,7 @@ func TestFileRunListEnumeration(t *testing.T) {
 	}
 }
 
-func TestFileRunListPageStaysPayloadFree(t *testing.T) {
+func TestQueryFileRunPageStaysPayloadFree(t *testing.T) {
 	// A page over journals that each carry a frozen result must still hand back rows with no
 	// body, while the record path keeps returning the body it stores.
 	dir := t.TempDir()
