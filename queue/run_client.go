@@ -73,10 +73,12 @@ func (c *RunClient) GetRun(ctx context.Context, runID string) (runstore.RunRecor
 // here never means waiting for an approval.
 //
 // ctx bounds the wait. On cancellation or deadline the record last read is returned together
-// with ctx's error, so a caller can report where the run stood when it gave up. An unknown
-// RunID reports runstore.ErrNotFound without waiting, and a read that fails mid-wait is
-// returned rather than retried blindly: the client cannot tell a store outage from a
-// deleted run.
+// with ctx's error, so a caller can report where the run stood when it gave up — unless the
+// deadline lands inside a read, which fails like any other read error and returns the zero
+// record. A caller that needs the record's state at that moment re-reads it after the wait.
+// An unknown RunID reports runstore.ErrNotFound without waiting, and a read that fails
+// mid-wait is returned rather than retried blindly: the client cannot tell a store outage from
+// a deleted run.
 func (c *RunClient) WaitRun(ctx context.Context, runID string) (runstore.RunRecord, error) {
 	var last runstore.RunRecord
 	delay := c.minWait
