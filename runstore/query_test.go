@@ -731,25 +731,32 @@ func coreText(r RunRecord) string {
 	return string(encoded)
 }
 
-// BenchmarkRunListPages measures a page of 50 rows taken from a store holding 500 runs. The
-// file number is the cost of replaying every journal a query has to enumerate; the memory
-// number is what a sidecar-style projection would have to beat.
+// BenchmarkRunListPages measures a 50-row page taken from a store holding 500 runs, in the two
+// shapes a caller actually sees: resuming a walk whose projection is already frozen, and
+// starting a new query. The second one is where the file store's cost lives — it enumerates and
+// replays every run journal — so both are reported rather than only the cheap one.
 func BenchmarkRunListPages(b *testing.B) {
 	for _, backend := range []string{"memory", "file"} {
-		b.Run(backend, func(b *testing.B) {
-			store := benchRunStore(b, backend, 500)
-			q := store.(Query)
-			warm, err := q.ListRuns(context.Background(), RunListOptions{Limit: 50})
-			if err != nil {
-				b.Fatalf("first page: %v", err)
-			}
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				if _, err := q.ListRuns(context.Background(), RunListOptions{Limit: 50, Cursor: warm.NextCursor}); err != nil {
-					b.Fatalf("second page: %v", err)
+		for _, shape := range []string{"resume", "new-query"} {
+			b.Run(backend+"/"+shape, func(b *testing.B) {
+				store := benchRunStore(b, backend, 500)
+				q := store.(Query)
+				warm, err := q.ListRuns(context.Background(), RunListOptions{Limit: 50})
+				if err != nil {
+					b.Fatalf("first page: %v", err)
 				}
-			}
-		})
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					opts := RunListOptions{Limit: 50, Cursor: warm.NextCursor}
+					if shape == "new-query" {
+						opts = RunListOptions{Limit: 50}
+					}
+					if _, err := q.ListRuns(context.Background(), opts); err != nil {
+						b.Fatalf("page: %v", err)
+					}
+				}
+			})
+		}
 	}
 }
 
