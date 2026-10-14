@@ -607,6 +607,32 @@ func TestQueryProtocolConstants(t *testing.T) {
 	}
 }
 
+// 上限必须是拒绝，不是悄悄夹紧：以为拿到 1000 行实际只拿到 200 行的调用方，算出来的是错
+// 答案而不是慢答案。
+func TestQueryLimitRejectedAboveMax(t *testing.T) {
+	for _, store := range queryStores() {
+		t.Run(store.name, func(t *testing.T) {
+			b := store.open(t)
+			queryCommitEight(t, b)
+			ctx := context.Background()
+
+			if _, err := b.query.QueryCheckpoints(ctx, ListOptions{Limit: MaxQueryLimit + 1}); !errors.Is(err, ErrInvalidQuery) {
+				t.Errorf("QueryCheckpoints 超上限: err = %v, 期望 ErrInvalidQuery", err)
+			}
+			if _, err := b.query.ListSessions(ctx, ListOptions{Limit: MaxQueryLimit + 1}); !errors.Is(err, ErrInvalidQuery) {
+				t.Errorf("ListSessions 超上限: err = %v, 期望 ErrInvalidQuery", err)
+			}
+			// 上限本身可用，未设置时取默认值。
+			if page, err := b.query.QueryCheckpoints(ctx, ListOptions{Limit: MaxQueryLimit}); err != nil || page.Items == nil {
+				t.Errorf("Limit=max: %v, %v", page.Items, err)
+			}
+			if page, err := b.query.QueryCheckpoints(ctx, ListOptions{}); err != nil || page.NextCursor != "" {
+				t.Errorf("默认页大小应一次取完 8 条: %v, %v", err, page.NextCursor)
+			}
+		})
+	}
+}
+
 func TestQueryInvalidCursor(t *testing.T) {
 	for _, store := range queryStores() {
 		t.Run(store.name, func(t *testing.T) {

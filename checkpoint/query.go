@@ -3,9 +3,10 @@ package checkpoint
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sort"
 	"time"
+
+	"github.com/jiujuan/goagent/internal/paging"
 )
 
 // Query and MetadataReader are the optional read-only views over a checkpointer
@@ -24,11 +25,11 @@ import (
 
 const (
 	// DefaultQueryLimit is the page size when ListOptions.Limit is not set.
-	DefaultQueryLimit = 50
+	DefaultQueryLimit = paging.DefaultLimit
 	// MaxQueryLimit is the largest page size a caller may ask for. Asking for more is an
 	// error rather than a silent clamp: a caller that believes it fetched 1000 rows and
 	// got 200 would compute a wrong answer, not a slow one.
-	MaxQueryLimit = 200
+	MaxQueryLimit = paging.MaxLimit
 )
 
 var (
@@ -181,13 +182,7 @@ func cloneCheckpointMetadata(metadata CheckpointMetadata) CheckpointMetadata {
 // normalizeQueryLimit turns an unset page size into the default and rejects one the protocol
 // does not allow.
 func normalizeQueryLimit(limit int) (int, error) {
-	if limit <= 0 {
-		return DefaultQueryLimit, nil
-	}
-	if limit > MaxQueryLimit {
-		return 0, fmt.Errorf("checkpoint: query limit %d exceeds the maximum %d: %w", limit, MaxQueryLimit, ErrInvalidQuery)
-	}
-	return limit, nil
+	return checkpointPaging.NormalizeLimit(limit)
 }
 
 func (o ListOptions) hasTimeBounds() bool {
@@ -262,94 +257,32 @@ func orderSessionSummaries(items []SessionSummary) {
 	})
 }
 
-// pinnedPage is where a page walk stands: which projection, under which filters, and how
-// many rows the caller has already received.
-type pinnedPage struct {
-	filter     string
-	generation uint64
-	offset     int
-}
-
 // pinnedList is the paging rule every store shares: the first call filters, orders and
 // freezes the result, and a later call resumes that same list. Building it only on the first
 // page is what keeps a walk free of repeats and gaps while the store keeps taking writes.
-func pinnedList[T any](cache *projectionCache, domain string, opts ListOptions, build func() ([]T, error)) ([]T, pinnedPage, error) {
-	filter := cursorFingerprint(domain, opts)
-	if opts.Cursor == "" {
-		items, err := build()
-		if err != nil {
-			return nil, pinnedPage{}, err
-		}
-		return items, pinnedPage{filter: filter, generation: cache.pin(items)}, nil
-	}
-	payload, err := decodeCursor(opts.Cursor)
-	if err != nil {
-		return nil, pinnedPage{}, err
-	}
-	if err := cursorFilterMatch(payload, filter); err != nil {
-		return nil, pinnedPage{}, err
-	}
-	pinned, err := cache.resolve(payload.Generation)
-	if err != nil {
-		return nil, pinnedPage{}, err
-	}
-	items, ok := pinned.items.([]T)
-	if !ok {
-		return nil, pinnedPage{}, fmt.Errorf("checkpoint: cursor generation %d pins %T, not the expected summary list: %w",
-			payload.Generation, pinned.items, ErrInvalidCursor)
-	}
-	return items, pinnedPage{filter: filter, generation: payload.Generation, offset: payload.Offset}, nil
+func pinnedList[T any](cache *projectionCache, domain string, opts ListOptions, build func() ([]T, error)) ([]T, paging.Page, error) {
+	return paging.Resume(cache.core, cache.now(), cursorFingerprint(domain, opts), opts.Cursor, build)
 }
 
 // checkpointMetadataPage slices a pinned list and hands back copies, so a caller that edits
 // a returned summary cannot rewrite what the next page reads.
-func checkpointMetadataPage(items []CheckpointMetadata, page pinnedPage, limit int) (MetadataPage, error) {
-	if page.offset > len(items) {
-		return MetadataPage{}, fmt.Errorf("checkpoint: cursor position %d is past the end of a %d-row projection: %w",
-			page.offset, len(items), ErrInvalidCursor)
+func checkpointMetadataPage(items []CheckpointMetadata, page paging.Page, limit int) (MetadataPage, error) {
+	out, nextCursor, err := paging.Slice(checkpointPaging, items, page, limit, cloneCheckpointMetadata)
+	if err != nil {
+		return MetadataPage{}, err
 	}
-	end := page.offset + limit
-	if end > len(items) {
-		end = len(items)
-	}
-	out := MetadataPage{Items: make([]CheckpointMetadata, 0, end-page.offset)}
-	for _, item := range items[page.offset:end] {
-		out.Items = append(out.Items, cloneCheckpointMetadata(item))
-	}
-	if end < len(items) {
-		out.NextCursor = encodeCursor(cursorPayload{
-			Version:    cursorFormatVersion,
-			Generation: page.generation,
-			Filter:     page.filter,
-			Offset:     end,
-		})
-	}
-	return out, nil
+	return MetadataPage{Items: out, NextCursor: nextCursor}, nil
 }
 
-func sessionSummaryPage(items []SessionSummary, page pinnedPage, limit int) (SessionPage, error) {
-	if page.offset > len(items) {
-		return SessionPage{}, fmt.Errorf("checkpoint: cursor position %d is past the end of a %d-row projection: %w",
-			page.offset, len(items), ErrInvalidCursor)
+func sessionSummaryPage(items []SessionSummary, page paging.Page, limit int) (SessionPage, error) {
+	out, nextCursor, err := paging.Slice(checkpointPaging, items, page, limit, cloneSessionSummary)
+	if err != nil {
+		return SessionPage{}, err
 	}
-	end := page.offset + limit
-	if end > len(items) {
-		end = len(items)
-	}
-	out := SessionPage{Items: make([]SessionSummary, 0, end-page.offset)}
-	for _, item := range items[page.offset:end] {
-		out.Items = append(out.Items, SessionSummary{
-			ThreadID: item.ThreadID,
-			Head:     cloneCheckpointMetadata(item.Head),
-		})
-	}
-	if end < len(items) {
-		out.NextCursor = encodeCursor(cursorPayload{
-			Version:    cursorFormatVersion,
-			Generation: page.generation,
-			Filter:     page.filter,
-			Offset:     end,
-		})
-	}
-	return out, nil
+	return SessionPage{Items: out, NextCursor: nextCursor}, nil
+}
+
+func cloneSessionSummary(summary SessionSummary) SessionSummary {
+	summary.Head = cloneCheckpointMetadata(summary.Head)
+	return summary
 }
