@@ -426,8 +426,10 @@ func TestManagedRunDuplicateDeliveryAcrossProcesses(t *testing.T) {
 	if loser.HandlerError != "" {
 		t.Fatalf("重复投递被当成失败: %q", loser.HandlerError)
 	}
-	if loser.Status != string(runstore.StatusSucceeded) {
-		t.Fatalf("重复投递看到的记录 = %s", loser.Status)
+	// 落败方看到的一定是"已被别人领走"的记录。它此刻是 running 还是 succeeded 取决于两条投递
+	// 谁先落盘，不是契约；这里能断言的只有它不可能再是排队态（记录只会往前推进）。
+	if loser.Status == string(runstore.StatusQueued) || loser.Status == string(runstore.StatusCancelled) {
+		t.Fatalf("重复投递看到的记录 = %s, 期望非排队/非取消", loser.Status)
 	}
 	if calls := managedModelCalls(t, dirs); calls != 1 {
 		t.Fatalf("重复投递后模型调用 %d 次, 期望 1", calls)
@@ -479,19 +481,20 @@ func TestManagedRunQueuedRecordAfterProducerCrash(t *testing.T) {
 		t.Fatalf("查询结果 = %+v", page.Items)
 	}
 
-	// 等待有边界：超时把记录原样交回来，等待本身不会推动它。
+	// 等待有边界：客户端不会替一条没人接的运行编结局，超时就是超时。超时点可能落在两次读之间
+	// （交回最后读到的记录），也可能落在读里面（存储把 ctx 的错误原样抛回来，此时交回空记录），
+	// 所以这里只认错误；"等待不推动运行"由磁盘上的记录自己证明。
 	client, err := NewRunClient(managedRunsOnDisk(t, dirs), WithRunPollInterval(2*time.Millisecond), WithRunPollMax(10*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	waited, err := client.WaitRun(waitCtx, ids.runID)
-	if !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := client.WaitRun(waitCtx, ids.runID); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("等待排队记录应超时: %v", err)
 	}
-	if waited.Status != runstore.StatusQueued || waited.Version != record.Version {
-		t.Fatalf("超时回报 = %+v", waited)
+	if after := managedRecordOnDisk(t, dirs, ids.runID); after.Status != runstore.StatusQueued || after.Version != record.Version {
+		t.Fatalf("等待之后的记录 = %s v%d, 期望 %s v%d", after.Status, after.Version, record.Status, record.Version)
 	}
 
 	// 没有执行证据时显式修复也拒绝动它。
