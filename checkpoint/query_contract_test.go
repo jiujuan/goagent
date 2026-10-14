@@ -42,7 +42,34 @@ type queryStore struct {
 }
 
 func queryStores() []queryStore {
-	return []queryStore{{name: "memory", open: openMemoryQueryBackend}}
+	return []queryStore{
+		{name: "memory", open: openMemoryQueryBackend},
+		{name: "file", open: openFileQueryBackend},
+	}
+}
+
+func openFileQueryBackend(t *testing.T) queryBackend {
+	t.Helper()
+	m, err := NewFile(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFile: %v", err)
+	}
+	setNow := func(t *testing.T, at time.Time) {
+		t.Helper()
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		m.now = func() time.Time { return at }
+		m.projections.now = func() time.Time { return at }
+	}
+	setNow(t, queryClockBase)
+	return queryBackend{
+		name:    "file",
+		durable: m,
+		query:   m,
+		reader:  m,
+		setNow:  setNow,
+		pinned:  func() int { return m.projections.count() },
+	}
 }
 
 func openMemoryQueryBackend(t *testing.T) queryBackend {

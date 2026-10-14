@@ -62,6 +62,32 @@ func (s *Session) GetHead(ctx context.Context) (*checkpoint.Checkpoint, error) {
 	return s.agent.store.Latest(ctx, s.threadID)
 }
 
+// History lists this session's committed snapshots as payload-free summaries: identity,
+// revision, lineage edge, timestamps and how a run ended — never the messages, the KV or the
+// file bytes behind them.
+//
+// The bound thread always wins, so a ListOptions naming another thread is ignored rather
+// than reading someone else's history. Paging follows the store's own rules: an empty Cursor
+// starts a walk and freezes the list, and the returned NextCursor resumes exactly that
+// frozen view, so a snapshot committed midway shows up only in a new query.
+//
+// A store that cannot answer lightweight queries reports ErrCapabilityUnavailable. History
+// does not fall back to loading and decoding every checkpoint of the thread: that is the
+// cost this method exists to avoid, and a caller deserves to know the store cannot pay less.
+func (s *Session) History(ctx context.Context, opts checkpoint.ListOptions) (checkpoint.MetadataPage, error) {
+	query, ok := s.agent.store.(checkpoint.Query)
+	if !ok {
+		return checkpoint.MetadataPage{}, fmt.Errorf(
+			"agent: session history on thread %q (store %T): %w", s.threadID, s.agent.store, checkpoint.ErrCapabilityUnavailable)
+	}
+	opts.ThreadID = s.threadID
+	page, err := query.QueryCheckpoints(ctx, opts)
+	if err != nil {
+		return checkpoint.MetadataPage{}, fmt.Errorf("agent: session history on thread %q: %w", s.threadID, err)
+	}
+	return page, nil
+}
+
 // ForkFrom starts a new thread off one of this session's committed checkpoints and
 // returns a session bound to it.
 //

@@ -2,7 +2,6 @@ package checkpoint
 
 import (
 	"context"
-	"fmt"
 	"sort"
 
 	"github.com/jiujuan/goagent/core"
@@ -28,30 +27,13 @@ func (m *Memory) QueryCheckpoints(_ context.Context, opts ListOptions) (Metadata
 	if err != nil {
 		return MetadataPage{}, err
 	}
-	filter := cursorFingerprint(cursorDomainCheckpoint, opts)
-	if opts.Cursor != "" {
-		payload, err := decodeCursor(opts.Cursor)
-		if err != nil {
-			return MetadataPage{}, err
-		}
-		if err := cursorFilterMatch(payload, filter); err != nil {
-			return MetadataPage{}, err
-		}
-		pinned, err := m.projections.resolve(payload.Generation)
-		if err != nil {
-			return MetadataPage{}, err
-		}
-		items, ok := pinned.items.([]CheckpointMetadata)
-		if !ok {
-			return MetadataPage{}, fmt.Errorf("checkpoint: cursor generation %d pins %T, not checkpoint summaries: %w",
-				payload.Generation, pinned.items, ErrInvalidCursor)
-		}
-		return checkpointMetadataPage(items, payload.Offset, limit, filter, payload.Generation)
+	items, page, err := pinnedList(m.projections, cursorDomainCheckpoint, opts, func() ([]CheckpointMetadata, error) {
+		return m.filteredCheckpointMetadata(opts), nil
+	})
+	if err != nil {
+		return MetadataPage{}, err
 	}
-
-	items := m.filteredCheckpointMetadata(opts)
-	generation := m.projections.pin(items)
-	return checkpointMetadataPage(items, 0, limit, filter, generation)
+	return checkpointMetadataPage(items, page, limit)
 }
 
 // ListSessions pages over the threads that have a visible snapshot, with each head summary
@@ -61,30 +43,13 @@ func (m *Memory) ListSessions(_ context.Context, opts ListOptions) (SessionPage,
 	if err != nil {
 		return SessionPage{}, err
 	}
-	filter := cursorFingerprint(cursorDomainSession, opts)
-	if opts.Cursor != "" {
-		payload, err := decodeCursor(opts.Cursor)
-		if err != nil {
-			return SessionPage{}, err
-		}
-		if err := cursorFilterMatch(payload, filter); err != nil {
-			return SessionPage{}, err
-		}
-		pinned, err := m.projections.resolve(payload.Generation)
-		if err != nil {
-			return SessionPage{}, err
-		}
-		items, ok := pinned.items.([]SessionSummary)
-		if !ok {
-			return SessionPage{}, fmt.Errorf("checkpoint: cursor generation %d pins %T, not session summaries: %w",
-				payload.Generation, pinned.items, ErrInvalidCursor)
-		}
-		return sessionSummaryPage(items, payload.Offset, limit, filter, payload.Generation)
+	items, page, err := pinnedList(m.projections, cursorDomainSession, opts, func() ([]SessionSummary, error) {
+		return m.filteredSessionSummaries(opts), nil
+	})
+	if err != nil {
+		return SessionPage{}, err
 	}
-
-	items := m.filteredSessionSummaries(opts)
-	generation := m.projections.pin(items)
-	return sessionSummaryPage(items, 0, limit, filter, generation)
+	return sessionSummaryPage(items, page, limit)
 }
 
 // ReadCheckpointMetadata looks one summary up by identity. Only the thread named in the Ref
@@ -180,57 +145,4 @@ func (m *Memory) summaryCountLocked() int {
 		total += len(index)
 	}
 	return total
-}
-
-// checkpointMetadataPage slices a pinned list, then hands back copies: a caller that edits a
-// returned summary must not be able to rewrite what the next page reads.
-func checkpointMetadataPage(items []CheckpointMetadata, offset, limit int, filter string, generation uint64) (MetadataPage, error) {
-	if offset > len(items) {
-		return MetadataPage{}, fmt.Errorf("checkpoint: cursor position %d is past the end of a %d-row projection: %w",
-			offset, len(items), ErrInvalidCursor)
-	}
-	end := offset + limit
-	if end > len(items) {
-		end = len(items)
-	}
-	page := MetadataPage{Items: make([]CheckpointMetadata, 0, end-offset)}
-	for _, item := range items[offset:end] {
-		page.Items = append(page.Items, cloneCheckpointMetadata(item))
-	}
-	if end < len(items) {
-		page.NextCursor = encodeCursor(cursorPayload{
-			Version:    cursorFormatVersion,
-			Generation: generation,
-			Filter:     filter,
-			Offset:     end,
-		})
-	}
-	return page, nil
-}
-
-func sessionSummaryPage(items []SessionSummary, offset, limit int, filter string, generation uint64) (SessionPage, error) {
-	if offset > len(items) {
-		return SessionPage{}, fmt.Errorf("checkpoint: cursor position %d is past the end of a %d-row projection: %w",
-			offset, len(items), ErrInvalidCursor)
-	}
-	end := offset + limit
-	if end > len(items) {
-		end = len(items)
-	}
-	page := SessionPage{Items: make([]SessionSummary, 0, end-offset)}
-	for _, item := range items[offset:end] {
-		page.Items = append(page.Items, SessionSummary{
-			ThreadID: item.ThreadID,
-			Head:     cloneCheckpointMetadata(item.Head),
-		})
-	}
-	if end < len(items) {
-		page.NextCursor = encodeCursor(cursorPayload{
-			Version:    cursorFormatVersion,
-			Generation: generation,
-			Filter:     filter,
-			Offset:     end,
-		})
-	}
-	return page, nil
 }

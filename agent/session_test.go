@@ -1,13 +1,15 @@
 package agent_test
 
-// SM-04（ADR-0034 D3）：Session 门面与原子 Fork。本文件只覆盖门面的边界与 Fork
-// 的一次性写入；轻量摘要分页（Session.History）按计划留到 SM-11。
+// SM-04（ADR-0034 D3）：Session 门面与原子 Fork。本文件覆盖门面的边界、Fork 的一次性
+// 写入，以及 SM-11 接上的轻量摘要分页 History。
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -716,5 +718,150 @@ func TestSessionForkConcurrent(t *testing.T) {
 	}
 	if hist[0].ParentRef == nil || hist[0].ParentRef.ThreadID != "fork-race-source" {
 		t.Fatalf("目标首条的归属不符: %+v", hist[0].ParentRef)
+	}
+}
+
+// --- SM-11：轻量摘要分页 History --------------------------------------------
+
+// historyBlindStore 只实现 Checkpointer：一个不支持轻量查询的第三方存储。
+type historyBlindStore struct {
+	inner        checkpoint.Checkpointer
+	historyCalls int
+	latestCalls  int
+}
+
+func (s *historyBlindStore) Save(ctx context.Context, cp *checkpoint.Checkpoint) error {
+	return s.inner.Save(ctx, cp)
+}
+
+func (s *historyBlindStore) Load(ctx context.Context, threadID, checkpointID string) (*checkpoint.Checkpoint, error) {
+	return s.inner.Load(ctx, threadID, checkpointID)
+}
+
+func (s *historyBlindStore) Latest(ctx context.Context, threadID string) (*checkpoint.Checkpoint, error) {
+	s.latestCalls++
+	return s.inner.Latest(ctx, threadID)
+}
+
+func (s *historyBlindStore) History(ctx context.Context, threadID string) ([]*checkpoint.Checkpoint, error) {
+	s.historyCalls++
+	return s.inner.History(ctx, threadID)
+}
+
+func TestSessionHistoryBoundToThread(t *testing.T) {
+	ctx := context.Background()
+	for _, name := range []string{"memory", "file"} {
+		t.Run(name, func(t *testing.T) {
+			var base checkpoint.Checkpointer
+			if name == "memory" {
+				base = checkpoint.NewMemory()
+			} else {
+				f, err := checkpoint.NewFile(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				base = f
+			}
+			a := terminalAgent(t, base, resultTextModel("m", "会话回答正文"))
+			bound, err := a.OpenSession(ctx, "history-bound-"+name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			other, err := a.OpenSession(ctx, "history-other-"+name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := bound.Send(ctx, "第一句"); err != nil {
+				t.Fatalf("第一次 Send: %v", err)
+			}
+			if _, err := bound.Send(ctx, "第二句"); err != nil {
+				t.Fatalf("第二次 Send: %v", err)
+			}
+			if _, err := other.Send(ctx, "别的话"); err != nil {
+				t.Fatalf("另一线程 Send: %v", err)
+			}
+
+			page, err := bound.History(ctx, checkpoint.ListOptions{})
+			if err != nil {
+				t.Fatalf("History: %v", err)
+			}
+			if len(page.Items) < 2 {
+				t.Fatalf("摘要条数 = %d, 期望至少 2", len(page.Items))
+			}
+			for _, item := range page.Items {
+				if item.Ref.ThreadID != bound.ThreadID() {
+					t.Errorf("History 串到了别的线程: %+v", item.Ref)
+				}
+			}
+
+			// 调用方塞进来的 ThreadID 不生效：绑定线程赢，与 Send 同一口径。
+			ignored, err := bound.History(ctx, checkpoint.ListOptions{ThreadID: other.ThreadID()})
+			if err != nil {
+				t.Fatalf("带 ThreadID 的 History: %v", err)
+			}
+			if len(ignored.Items) != len(page.Items) {
+				t.Errorf("忽略调用方 ThreadID 后条数 = %d, 期望 %d", len(ignored.Items), len(page.Items))
+			}
+
+			// 分页照常工作，续页拿到的是下一条。
+			first, err := bound.History(ctx, checkpoint.ListOptions{Limit: 1})
+			if err != nil {
+				t.Fatalf("分页首页: %v", err)
+			}
+			if len(first.Items) != 1 || first.NextCursor == "" {
+				t.Fatalf("首页 = %+v, cursor %q", first.Items, first.NextCursor)
+			}
+			second, err := bound.History(ctx, checkpoint.ListOptions{Limit: 1, Cursor: first.NextCursor})
+			if err != nil {
+				t.Fatalf("分页续页: %v", err)
+			}
+			if len(second.Items) != 1 || second.Items[0].Ref == first.Items[0].Ref {
+				t.Fatalf("续页 = %+v, 首页 = %+v", second.Items, first.Items)
+			}
+
+			// 摘要里没有会话正文。
+			encoded, err := json.Marshal(page.Items)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(encoded), "会话回答正文") {
+				t.Errorf("摘要页面里出现了运行正文: %s", encoded)
+			}
+		})
+	}
+}
+
+func TestSessionHistoryRequiresQueryCapability(t *testing.T) {
+	ctx := context.Background()
+	inner := checkpoint.NewMemory()
+	// 先放一条记录，确保失败原因不是"这条线程还没有任何快照"。
+	if err := inner.Save(ctx, &checkpoint.Checkpoint{ID: "cp-1", ThreadID: "history-blind", Step: 1}); err != nil {
+		t.Fatal(err)
+	}
+	blind := &historyBlindStore{inner: inner}
+	a := terminalAgent(t, blind, resultTextModel("m", "回答"))
+	session, err := a.OpenSession(ctx, "history-blind")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := session.History(ctx, checkpoint.ListOptions{})
+	if !errors.Is(err, checkpoint.ErrCapabilityUnavailable) {
+		t.Fatalf("缺少轻量查询能力应报 ErrCapabilityUnavailable, 实得 %v", err)
+	}
+	if len(page.Items) != 0 {
+		t.Errorf("失败时仍返回了条目: %+v", page.Items)
+	}
+	if blind.historyCalls != 0 {
+		t.Errorf("没有轻量查询能力时回退了全量 History: 调了 %d 次", blind.historyCalls)
+	}
+
+	// 既有能力不受影响。
+	head, err := session.GetHead(ctx)
+	if err != nil || head == nil || head.ID != "cp-1" {
+		t.Fatalf("GetHead = %+v, %v", head, err)
+	}
+	if blind.latestCalls == 0 {
+		t.Errorf("GetHead 没有走 Latest")
 	}
 }

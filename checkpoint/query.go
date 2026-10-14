@@ -42,6 +42,10 @@ var (
 	// ErrInvalidQuery means the options themselves are unusable, such as a page size
 	// above MaxQueryLimit.
 	ErrInvalidQuery = errors.New("checkpoint: invalid query")
+	// ErrCapabilityUnavailable means the configured store does not offer the lightweight
+	// summary views. A caller must say so rather than fall back to reading and decoding
+	// whole checkpoints, which is exactly the cost these views exist to avoid.
+	ErrCapabilityUnavailable = errors.New("checkpoint: lightweight summary query unavailable")
 )
 
 // CheckpointMetadata is the payload-free projection of one checkpoint. Every field is one
@@ -256,4 +260,96 @@ func orderSessionSummaries(items []SessionSummary) {
 		}
 		return items[i].Head.Revision < items[j].Head.Revision
 	})
+}
+
+// pinnedPage is where a page walk stands: which projection, under which filters, and how
+// many rows the caller has already received.
+type pinnedPage struct {
+	filter     string
+	generation uint64
+	offset     int
+}
+
+// pinnedList is the paging rule every store shares: the first call filters, orders and
+// freezes the result, and a later call resumes that same list. Building it only on the first
+// page is what keeps a walk free of repeats and gaps while the store keeps taking writes.
+func pinnedList[T any](cache *projectionCache, domain string, opts ListOptions, build func() ([]T, error)) ([]T, pinnedPage, error) {
+	filter := cursorFingerprint(domain, opts)
+	if opts.Cursor == "" {
+		items, err := build()
+		if err != nil {
+			return nil, pinnedPage{}, err
+		}
+		return items, pinnedPage{filter: filter, generation: cache.pin(items)}, nil
+	}
+	payload, err := decodeCursor(opts.Cursor)
+	if err != nil {
+		return nil, pinnedPage{}, err
+	}
+	if err := cursorFilterMatch(payload, filter); err != nil {
+		return nil, pinnedPage{}, err
+	}
+	pinned, err := cache.resolve(payload.Generation)
+	if err != nil {
+		return nil, pinnedPage{}, err
+	}
+	items, ok := pinned.items.([]T)
+	if !ok {
+		return nil, pinnedPage{}, fmt.Errorf("checkpoint: cursor generation %d pins %T, not the expected summary list: %w",
+			payload.Generation, pinned.items, ErrInvalidCursor)
+	}
+	return items, pinnedPage{filter: filter, generation: payload.Generation, offset: payload.Offset}, nil
+}
+
+// checkpointMetadataPage slices a pinned list and hands back copies, so a caller that edits
+// a returned summary cannot rewrite what the next page reads.
+func checkpointMetadataPage(items []CheckpointMetadata, page pinnedPage, limit int) (MetadataPage, error) {
+	if page.offset > len(items) {
+		return MetadataPage{}, fmt.Errorf("checkpoint: cursor position %d is past the end of a %d-row projection: %w",
+			page.offset, len(items), ErrInvalidCursor)
+	}
+	end := page.offset + limit
+	if end > len(items) {
+		end = len(items)
+	}
+	out := MetadataPage{Items: make([]CheckpointMetadata, 0, end-page.offset)}
+	for _, item := range items[page.offset:end] {
+		out.Items = append(out.Items, cloneCheckpointMetadata(item))
+	}
+	if end < len(items) {
+		out.NextCursor = encodeCursor(cursorPayload{
+			Version:    cursorFormatVersion,
+			Generation: page.generation,
+			Filter:     page.filter,
+			Offset:     end,
+		})
+	}
+	return out, nil
+}
+
+func sessionSummaryPage(items []SessionSummary, page pinnedPage, limit int) (SessionPage, error) {
+	if page.offset > len(items) {
+		return SessionPage{}, fmt.Errorf("checkpoint: cursor position %d is past the end of a %d-row projection: %w",
+			page.offset, len(items), ErrInvalidCursor)
+	}
+	end := page.offset + limit
+	if end > len(items) {
+		end = len(items)
+	}
+	out := SessionPage{Items: make([]SessionSummary, 0, end-page.offset)}
+	for _, item := range items[page.offset:end] {
+		out.Items = append(out.Items, SessionSummary{
+			ThreadID: item.ThreadID,
+			Head:     cloneCheckpointMetadata(item.Head),
+		})
+	}
+	if end < len(items) {
+		out.NextCursor = encodeCursor(cursorPayload{
+			Version:    cursorFormatVersion,
+			Generation: page.generation,
+			Filter:     page.filter,
+			Offset:     end,
+		})
+	}
+	return out, nil
 }

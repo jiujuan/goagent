@@ -32,7 +32,33 @@ type File struct {
 	// source of truth and a failed write never changes this map.
 	known map[string]map[string]bool
 	ops   fileOps
+	// metaOps is the write seam of the summary projection. It is separate from ops so a
+	// sidecar that cannot be written cannot be mistaken for a lost checkpoint.
+	metaOps fileOps
+	// projections holds the page walks in flight, bounded by age and count.
+	projections *projectionCache
+	// stats counts what the read paths did, so a test can prove a summary query never
+	// walked the full journal.
+	stats fileReadStats
 	now   func() time.Time
+}
+
+// fileReadStats counts the work each read path does. scans and stateDecodes are the
+// expensive ones: scanLocked decodes every record with its state, and readAll is the path
+// behind Load, Latest and History. A summary query must add to neither.
+type fileReadStats struct {
+	scans                int
+	stateDecodes         int
+	tailLines            int
+	rebuilds             int
+	sidecarWriteFailures int
+	refreshErrors        int
+}
+
+func (f *File) noteRebuildLocked()  { f.stats.rebuilds++ }
+func (f *File) noteTailLineLocked() { f.stats.tailLines++ }
+func (f *File) noteSidecarWriteFailureLocked() {
+	f.stats.sidecarWriteFailures++
 }
 
 type fileOps struct {
@@ -49,7 +75,15 @@ func NewFile(dir string) (*File, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("checkpoint: create dir: %w", err)
 	}
-	return &File{dir: dir, known: map[string]map[string]bool{}, ops: defaultFileOps(), now: time.Now}, nil
+	f := &File{
+		dir:     dir,
+		known:   map[string]map[string]bool{},
+		ops:     defaultFileOps(),
+		metaOps: defaultFileOps(),
+		now:     time.Now,
+	}
+	f.projections = newProjectionCache(CursorTTL, MaxPinnedProjections, f.nowTime)
+	return f, nil
 }
 
 func (f *File) nowTime() time.Time {
@@ -291,6 +325,12 @@ func (f *File) commitLocked(threadID string, st *fileState, req CommitRequest) (
 		st.blobs[h] = data
 	}
 	f.setKnownLocked(threadID, st.blobs)
+	// The summary projection is derived only now, after the append and Sync succeeded, and
+	// its own failure cannot undo a committed checkpoint: the journal is the source of
+	// truth and the next refresh re-reads the tail (ADR-0034 D7).
+	if _, err := f.refreshMetadataLocked(threadID); err != nil {
+		f.stats.refreshErrors++
+	}
 	req.Checkpoint.Revision = stored.Revision
 	if rec.ReleaseClaim {
 		claim = nil
@@ -494,6 +534,7 @@ func (f *File) ToolExecution(ctx context.Context, threadID, invocationID string)
 func (f *File) readAll(ctx context.Context, threadID string) ([]*Checkpoint, error) {
 	var out []*Checkpoint
 	err := f.withThread(ctx, threadID, func(st *fileState) error {
+		f.stats.stateDecodes++
 		if err := rebuild(st.checkpoints, st.blobs); err != nil {
 			return err
 		}
@@ -601,6 +642,7 @@ func (f *File) acquireProcessLock(ctx context.Context, threadID string) (func(),
 // newline as a recoverable tail; a malformed record that ended with a newline
 // is a middle-record corruption and is reported.
 func (f *File) scanLocked(threadID string) (*fileState, int64, error) {
+	f.stats.scans++
 	fp, err := f.path(threadID)
 	if err != nil {
 		return nil, -1, err
