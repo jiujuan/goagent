@@ -243,6 +243,8 @@ go run ./examples/quickstart
 | 示例 | 运行方式 | 展示内容 |
 | --- | --- | --- |
 | `persistent` | `go run ./examples/persistent` | 基于文件检查点的跨进程持久化运行；多次运行可见历史增长。 |
+| `session` | `go run ./examples/session`（加 `-dir ./tmp-session` 保留目录，换个进程还能读同一个线程） | 会话门面：`OpenSession`/`Send`/`GetHead`/`ForkFrom`/子分支再跑，以及不带正文的 `History` 摘要分页与 cursor 误用。 |
+| `managed-run` | `go run ./examples/managed-run`（`-dir` 保留共享目录；`-role submit\|worker\|status\|cancel` 配合 `-run`、`-redis` 分进程跑） | 受管任务：提交、worker 执行、只凭 RunID 重连等待、跨客户端取消、未知投递结果保持排队、显式修复与状态列表。 |
 | `background` | `go run ./examples/background` | 队列驱动的后台执行：入队任务由 Worker 处理。 |
 | `background-status` | `go run ./examples/background-status` | 后台运行的落盘与查询：`Handle.WaitRecorded` 确认终态记录、`Agent.RunStatus` 从文件存储读回状态与文件。 |
 | `redis` | `go run ./examples/redis` | 基于 Redis 的持久化后台队列（需先启动 Redis）。 |
@@ -291,6 +293,20 @@ go run ./examples/quickstart
 - `Agent.RunStatus(ctx, threadID)` 是纯读：不写、不取 claim、不续租。未知线程不是错误（`Exists=false`、`Latest=nil`），存储错误原样返回，非法线程 ID 在触达存储之前被拒。`Paused` 只说明 head 上有暂停或待办元数据，不保证 `Resume` 一定成功（审批、租约、恢复类型仍要过）。head 上的 `Completion` 属于写下它的那次运行：新一轮可能已经开始但还没提交任何东西，此时读到的还是上一轮的终态——不能读成"当前没有在跑"。
 
 保持不做：公开 detach API、事件重放、跨进程 agent job、"正在运行"登记表、整次运行的硬期限、前台路径自动写终态记录。
+
+其中"跨进程 agent job"与"按 RunID 查询"已由 [ADR-0034](docs/adr/ADR-0034-session-task-management.md) 以受管任务形态落地（版本化 Type/Payload + 独立任务记录 + 只读客户端）；本节其余各项仍不做，`EnqueueAgent` 的闭包路径与 `Agent.RunStatus` 的旧契约不变。
+
+### 会话门面与受管任务
+
+- 三个等待点分别回答三个问题。`Handle.Wait`（闭包路径）说"这次运行结束了"；`Handle.WaitRecorded` 还要等 worker 把终态快照写进检查点存储；`RunClient.WaitRun(ctx, runID)` 只看任务记录，任何拿着 RunID 的新进程都能用，它不驱动运行、不修复记录、不续租。
+- `WaitRun` 把 paused 也算作本次运行的结束：暂停的运行要继续时是新建一条记录，由建记录的一方用 `ResumeOfRunID` 指回旧的那条（存储把它当不可变身份），所以等待不会挂在等人审批上（`RunClient.GetRun` 同样只回报记录此刻的样子，租约过期不当失败也不当取消）。
+- 执行结局与记账事实是两条独立记录：任务记录的 `Error` 说运行本身，`RecordError` 说终态快照没写成功（错误码 `completion_record_failed`，可重试）。运行 succeeded 而 `RecordError` 非空是合法组合，`RunSummary` 两个错误码都带。
+- 投递结果不确定时不猜：队列错误不证明拒收就保持 `queued` 并挂 `dispatch_unknown`，RunID 照样还给调用方；只有明确拒收才写 `failed/enqueue_failed`。重复投递由领取那一次 compare-and-swap 挡住，不会第二次调模型和工具；副作用已经发生而结果未知时，框架不自动重放，也不替它编结局。
+- 崩溃之后的修复是显式入口的活：`ReconcileRun` 只认这条 RunID 已提交的终态快照，凭它补齐任务记录；找不到匹配证据就报 `stale_no_completion` 并原样保留记录，证据互相矛盾就报 `contradictory_evidence` 拒绝修。陈旧记录不会被任何读取或等待自动重启。
+- 摘要分页不带正文：`Session.History`、`QueryCheckpoints`、`ListRuns` 返回身份、状态、时间和引用，不含消息、KV 或文件字节。第一次查询冻结投影，续页读同一代，所以边走边写不会重复或漏项；新写入只对新建的查询可见。token 被改内容、换过滤条件复用会报 `ErrInvalidCursor`，投影过期（15 分钟或超出 128 份缓存）报 `ErrCursorExpired`——处置方式是重起一次查询，不是重试旧 token。
+- 能力缺失就明确拒绝：只实现 `checkpoint.Checkpointer` 四个方法的外部存储仍可跑普通与受管执行，但 `Session.History` 报 `ErrCapabilityUnavailable`、`Session.ForkFrom` 与终态记录报 `ErrDurableUnavailable`，`NewRunReconciler` 在构造期就拒。框架不会退化成"把整个线程读一遍"。
+- 外部托管的文件后端不随作业搬运、也不随快照回滚：`AgentResolver` 在每个 worker 进程重建 agent 与后端，运行级选项 `agent.WithRunFiles` 由要用它的那次执行自己带上。
+- 本批按单个可信存储目录设计，不接收客户端自带的 tenant 字符串当作隔离手段；多租户要靠上层认证后选择独立目录/存储，完整 namespace 能力与服务端鉴权另立 ADR。
 
 ## 目录概览
 
