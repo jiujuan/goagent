@@ -324,13 +324,15 @@ func runRecoveryChild(t *testing.T, dir, runID, worker, action string) runRecove
 		t.Fatalf("解析子进程结果 %q: %v", data, err)
 	}
 
-	// 写完就停的那一方必须被杀掉：它留在原地，父进程才有"前任已死"这个前提。
-	_ = stdin.Close()
-	if cmd.ProcessState == nil {
+	// 写完就停的那一方必须被杀掉：它留在原地，父进程才有"前任已死"这个前提。先杀再关
+	// stdin——反过来会先放它自己退出，而 Windows 上 TerminateProcess 打在一个已退出的
+	// 进程上返回 Access is denied。错误结局的写完就走，本来就不需要杀。
+	if outcome.Err == "" && action != runRecoveryActionRestate {
 		if err := cmd.Process.Kill(); err != nil {
 			t.Fatalf("杀掉子进程: %v", err)
 		}
 	}
+	_ = stdin.Close()
 	if err := cmd.Wait(); err != nil {
 		var exit *exec.ExitError
 		if !errors.As(err, &exit) {
