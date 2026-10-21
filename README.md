@@ -235,6 +235,7 @@ go run ./examples/quickstart
 | --- | --- | --- |
 | `middleware` | `go run ./examples/middleware` | 中间件教程：重试、限流、压缩、steering、RAG 等横切策略。 |
 | `middleware-hooks` | `go run ./examples/middleware-hooks` | 把循环的六个阶段作为显式钩子逐一观察。 |
+| `step-view` | `go run ./examples/step-view` | 每步冻结执行视图：同名注入同时替换 schema 与实现，AfterModel 读取本步模型实际看到的工具、设置与摘要。 |
 | `mcp` | `go run ./examples/mcp` | 连接 MCP 服务并把远程工具提供给 Agent。 |
 | `websearch` | `go run ./examples/websearch` | `web_search` 与 `web_fetch` 工具教程（默认离线）。 |
 
