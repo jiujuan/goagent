@@ -28,6 +28,19 @@ type Ref struct {
 	CheckpointID string `json:"checkpoint_id"`
 }
 
+// StepSnapshot records the model-visible step view that was current when a
+// checkpoint was written. It deliberately keeps only names and digests: no
+// schemas and no messages, so it is a fingerprint of what the model saw rather
+// than a second copy of the request. Records written before it existed read
+// back nil.
+type StepSnapshot struct {
+	Step           int      `json:"step"`
+	Advertised     []string `json:"advertised,omitempty"`
+	ToolDigest     string   `json:"tool_digest,omitempty"`
+	SettingsDigest string   `json:"settings_digest,omitempty"`
+	Model          string   `json:"model,omitempty"`
+}
+
 // Checkpoint is one snapshot of a run's state.
 type Checkpoint struct {
 	ID       string `json:"id"`
@@ -50,6 +63,12 @@ type Checkpoint struct {
 	// readable. Pending pauses use RecoveryResumeTools; model hook pauses use
 	// RecoveryReplayModel and deliberately contain no model reply to continue.
 	Pause *Pause `json:"pause,omitempty"`
+
+	// Snapshot is the step view that was current when this checkpoint was
+	// written: the advertised tool names and the digests of the tools and
+	// settings that formed the model request. nil on records written before it
+	// existed and on checkpoints written before a view was frozen.
+	Snapshot *StepSnapshot `json:"step_snapshot,omitempty"`
 
 	// Completion records the terminal outcome of one finished run on this
 	// snapshot: which run ended, whether it completed or failed, and the frozen

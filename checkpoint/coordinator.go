@@ -47,6 +47,9 @@ type commitDigestCheckpoint struct {
 	State    commitDigestState        `json:"state"`
 	Pending  *commitDigestPendingHITL `json:"pending,omitempty"`
 	Pause    *Pause                   `json:"pause,omitempty"`
+	// Snapshot is omitted while absent, so commits recorded before the step view
+	// was persisted keep producing the same digest bytes.
+	Snapshot *StepSnapshot `json:"step_snapshot,omitempty"`
 	// Completion is omitted when absent, so records committed before the terminal
 	// field keep producing the same digest as before it was added.
 	Completion *commitDigestCompletion `json:"completion,omitempty"`
@@ -176,6 +179,7 @@ func commitRequestDigest(cp *Checkpoint, ackMessageIDs []string, claim *Claim, e
 			State:        state,
 			Pending:      makeCommitDigestPending(cp.Pending),
 			Pause:        cp.Pause,
+			Snapshot:     cp.Snapshot,
 			Completion:   completion,
 			ParentRef:    cp.ParentRef,
 			RunID:        cp.RunID,

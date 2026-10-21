@@ -40,6 +40,7 @@ func cloneCheckpoint(cp *Checkpoint) (*Checkpoint, error) {
 	out.State = state
 	out.Pending = clonePending(cp.Pending)
 	out.Pause = clonePause(cp.Pause)
+	out.Snapshot = cloneStepSnapshot(cp.Snapshot)
 	out.ParentRef = cloneRef(cp.ParentRef)
 	out.Completion, err = cloneCompletion(cp.Completion)
 	if err != nil {
@@ -70,6 +71,18 @@ func clonePause(in *Pause) *Pause {
 		return nil
 	}
 	out := *in
+	return &out
+}
+
+func cloneStepSnapshot(in *StepSnapshot) *StepSnapshot {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	if in.Advertised != nil {
+		out.Advertised = make([]string, len(in.Advertised))
+		copy(out.Advertised, in.Advertised)
+	}
 	return &out
 }
 

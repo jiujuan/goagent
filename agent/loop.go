@@ -91,7 +91,7 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		rlc := &LoopContext{RunContext: rc, Step: rb.step, MaxTurns: l.maxTurns, History: history}
 		rlc.view = l.resumeStepView(rb)
 		if err := l.mw.CheckToolPolicy(rlc, rb.calls); err != nil {
-			return l.fail(rc, rb.step, history, err)
+			return l.fail(rc, rb.step, history, rb.snapshot, err)
 		}
 		resumed := l.runResumed(rb, rlc)
 		// The rejected calls in a resumed batch are reported here rather than inside
@@ -99,17 +99,21 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		// step's: batch joined, snapshot not yet written.
 		l.mw.ToolReject(rlc, resumed.rejects)
 		if resumed.pause {
-			return l.interrupt(rc, rb.step, history, rb.calls, "before_tool", resumed.reason, checkpoint.RecoveryResumeTools)
+			return l.interrupt(rc, rb.step, history, rb.snapshot, rb.calls, "before_tool", resumed.reason, checkpoint.RecoveryResumeTools)
 		}
 		if len(resumed.parts) > 0 {
 			history = append(history, core.Message{Role: core.RoleTool, Parts: resumed.parts})
 		}
 		if resumed.err != nil {
-			return l.fail(rc, rb.step, history, resumed.err)
+			return l.fail(rc, rb.step, history, rb.snapshot, resumed.err)
 		}
 		if len(resumed.parts) > 0 || resumed.control.Kind != core.Continue {
 			rc.State.Messages = history
-			if err := l.checkpoint(rc, rb.step, nil, nil, resumed.control.Kind != core.Continue); err != nil {
+			if err := l.checkpoint(rc, commitOptions{
+				Step:     rb.step,
+				Snapshot: rb.snapshot,
+				Release:  resumed.control.Kind != core.Continue,
+			}); err != nil {
 				return runOutcome{Err: err}
 			}
 		}
@@ -135,7 +139,7 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 			Tools:     l.tools,
 		})
 		if err != nil {
-			return l.fail(rc, -1, history, err)
+			return l.fail(rc, -1, history, nil, err)
 		}
 		system = s
 	}
@@ -151,7 +155,7 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		if durable, ok := rc.durableStore(); ok {
 			inbox, err := durable.Inbox(rc, rc.ThreadID)
 			if err != nil {
-				return l.fail(rc, step, history, err)
+				return l.fail(rc, step, history, nil, err)
 			}
 			if len(inbox) > 0 {
 				ids := make([]string, 0, len(inbox))
@@ -169,14 +173,14 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		history = l.mw.CompactHistory(lc, history)
 		lc.History = history
 		if d, err := l.mw.BeforeModel(lc); err != nil {
-			return l.fail(rc, step, history, err)
+			return l.fail(rc, step, history, lc.viewSnapshot(), err)
 		} else {
 			switch d.Kind {
 			case core.Interrupt:
-				return l.interrupt(rc, step, history, nil, "before_model", d.Reason, checkpoint.RecoveryReplayModel)
+				return l.interrupt(rc, step, history, lc.viewSnapshot(), nil, "before_model", d.Reason, checkpoint.RecoveryReplayModel)
 			case core.Stop, core.Escalate, core.Transfer:
 				rc.State.Messages = history
-				if err := l.checkpoint(rc, step, nil, nil, true); err != nil {
+				if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: true}); err != nil {
 					return runOutcome{Err: err}
 				}
 				return runOutcome{Control: d}
@@ -192,11 +196,11 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		req.Options.Apply(l.modelOpts...)
 		lc.Request = req
 		if err := l.mw.ModifyRequest(lc, req); err != nil {
-			return l.fail(rc, step, history, err)
+			return l.fail(rc, step, history, lc.viewSnapshot(), err)
 		}
 		view, err := l.freezeStepView(lc, req)
 		if err != nil {
-			return l.fail(rc, step, history, err)
+			return l.fail(rc, step, history, lc.viewSnapshot(), err)
 		}
 		lc.view = view
 
@@ -208,22 +212,22 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 
 		finalResp, ok, err := l.streamModel(genCtx, rc, lc, req)
 		if !ok {
-			return l.fail(rc, step, history, err)
+			return l.fail(rc, step, history, lc.viewSnapshot(), err)
 		}
 		final := finalResp.Message
 
 		if d, err := l.mw.AfterModel(lc, finalResp); err != nil {
-			return l.fail(rc, step, history, err)
+			return l.fail(rc, step, history, lc.viewSnapshot(), err)
 		} else {
 			switch d.Kind {
 			case core.Interrupt:
 				// Persist the model-request boundary, not final: a resumed run must
 				// re-ask the model rather than continue an uncheckpointed reply.
-				return l.interrupt(rc, step, history, nil, "after_model", d.Reason, checkpoint.RecoveryReplayModel)
+				return l.interrupt(rc, step, history, lc.viewSnapshot(), nil, "after_model", d.Reason, checkpoint.RecoveryReplayModel)
 			case core.Stop, core.Escalate, core.Transfer:
 				history = append(history, final)
 				rc.State.Messages = history
-				if err := l.checkpoint(rc, step, nil, nil, true); err != nil {
+				if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: true}); err != nil {
 					return runOutcome{Err: err}
 				}
 				return runOutcome{Result: core.Result{Message: final}, Control: d}
@@ -238,7 +242,7 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 				rc.State.Apply(core.StateOp{Kind: core.OpSetKV, Key: l.outputKey, Value: final.Text()})
 			}
 			rc.State.Messages = history
-			if err := l.checkpoint(rc, step, nil, nil, true); err != nil {
+			if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: true}); err != nil {
 				return runOutcome{Err: err}
 			}
 			rc.publish(core.TurnDone{Step: step})
@@ -253,7 +257,7 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		if finalResp.StopReason == llm.StopMaxTokens {
 			history = append(history, core.Message{Role: core.RoleTool, Parts: truncatedResults(rc, calls)})
 			rc.State.Messages = history
-			if err := l.checkpoint(rc, step, nil, nil, false); err != nil {
+			if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot()}); err != nil {
 				return runOutcome{Err: err}
 			}
 			rc.publish(core.TurnDone{Step: step})
@@ -265,23 +269,23 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		// (not from a tool's worker) and before this step's snapshot is what lets a
 		// ToolRejecter write State.KV without locking and have the write checkpointed.
 		if err := l.mw.CheckToolPolicy(lc, calls); err != nil {
-			return l.fail(rc, step, history, err)
+			return l.fail(rc, step, history, lc.viewSnapshot(), err)
 		}
 		for i := range calls {
 			d, err := l.mw.BeforeTool(lc, &calls[i])
 			if err != nil {
-				return l.fail(rc, step, history, err)
+				return l.fail(rc, step, history, lc.viewSnapshot(), err)
 			}
 			switch d.Kind {
 			case core.Interrupt:
 				// No handler has started yet. Save the whole original batch: calls
 				// checked before this gate were only preflighted, not executed.
-				return l.interrupt(rc, step, history, calls, "before_tool", d.Reason, checkpoint.RecoveryResumeTools)
+				return l.interrupt(rc, step, history, lc.viewSnapshot(), calls, "before_tool", d.Reason, checkpoint.RecoveryResumeTools)
 			case core.Stop, core.Escalate, core.Transfer:
 				// A gate denied/redirected before any tool ran; end this unit with
 				// that control directive.
 				rc.State.Messages = history
-				if err := l.checkpoint(rc, step, nil, nil, true); err != nil {
+				if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: true}); err != nil {
 					return runOutcome{Err: err}
 				}
 				return runOutcome{Result: core.Result{Message: final}, Control: d}
@@ -294,13 +298,13 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 			history = append(history, core.Message{Role: core.RoleTool, Parts: results})
 		}
 		if execErr != nil {
-			return l.fail(rc, step, history, execErr)
+			return l.fail(rc, step, history, lc.viewSnapshot(), execErr)
 		}
 
 		// Phase 4 — Checkpoint the step's state.
 		rc.State.Messages = history
 		next := core.Resolve(dirs...)
-		if err := l.checkpoint(rc, step, nil, nil, next.Kind != core.Continue); err != nil {
+		if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: next.Kind != core.Continue}); err != nil {
 			return runOutcome{Err: err}
 		}
 		rc.publish(core.TurnDone{Step: step})
@@ -314,7 +318,7 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 
 	// The budget ran out mid-conversation: the seam is still worth keeping, so
 	// Resume can continue the thread with a larger budget instead of rewinding.
-	return l.fail(rc, startStep+l.maxTurns-1, history, ErrMaxTurnsExceeded)
+	return l.fail(rc, startStep+l.maxTurns-1, history, nil, ErrMaxTurnsExceeded)
 }
 
 // streamModel runs one model call, publishing MessageDelta for partials and
@@ -342,12 +346,24 @@ func (l *AgentLoop) streamModel(genCtx context.Context, rc *RunContext, lc *Loop
 	return final, true, nil
 }
 
+// commitOptions is one checkpoint write. Snapshot is the frozen step view the
+// write belongs to, or nil when the event happened before a view existed (or
+// where no view describes the write, such as a resumed legacy batch).
+type commitOptions struct {
+	Step       int
+	Pending    *checkpoint.PendingHITL
+	Pause      *checkpoint.Pause
+	Snapshot   *checkpoint.StepSnapshot
+	Release    bool
+	Executions []checkpoint.ToolExecution
+}
+
 // checkpoint snapshots the current State for resume/branch/time-travel. A nil
 // Store is allowed for ordinary best-effort computation, but never for a
 // recoverable pause.
-func (l *AgentLoop) checkpoint(rc *RunContext, step int, pending *checkpoint.PendingHITL, pause *checkpoint.Pause, releaseClaim bool, extra ...checkpoint.ToolExecution) error {
+func (l *AgentLoop) checkpoint(rc *RunContext, opts commitOptions) error {
 	if rc.Store == nil {
-		if pending != nil || pause != nil {
+		if opts.Pending != nil || opts.Pause != nil {
 			return ErrCheckpointUnavailable
 		}
 		return nil
@@ -355,21 +371,29 @@ func (l *AgentLoop) checkpoint(rc *RunContext, step int, pending *checkpoint.Pen
 	return rc.commitCheckpoint(&checkpoint.Checkpoint{
 		ID:       core.NewID("cp"),
 		ThreadID: rc.ThreadID,
-		Step:     step,
+		Step:     opts.Step,
 		State:    *rc.State,
-		Pending:  pending,
-		Pause:    pause,
-	}, releaseClaim, extra...)
+		Pending:  opts.Pending,
+		Pause:    opts.Pause,
+		Snapshot: opts.Snapshot,
+	}, opts.Release, opts.Executions...)
 }
 
-func (l *AgentLoop) interrupt(rc *RunContext, step int, history []core.Message, pending []core.ToolCall, phase, reason, recovery string) runOutcome {
+func (l *AgentLoop) interrupt(rc *RunContext, step int, history []core.Message, snapshot *checkpoint.StepSnapshot, pending []core.ToolCall, phase, reason, recovery string) runOutcome {
 	rc.State.Messages = history
 	var hitl *checkpoint.PendingHITL
 	if len(pending) > 0 {
 		hitl = &checkpoint.PendingHITL{Step: step, Pending: pending}
 	}
 	pause := &checkpoint.Pause{ID: core.NewID("pause"), Phase: phase, Reason: reason, Recovery: recovery}
-	if err := l.checkpoint(rc, step, hitl, pause, true, pendingExecutions(rc.ThreadID, step, pending)...); err != nil {
+	if err := l.checkpoint(rc, commitOptions{
+		Step:       step,
+		Pending:    hitl,
+		Pause:      pause,
+		Snapshot:   snapshot,
+		Release:    true,
+		Executions: pendingExecutions(rc.ThreadID, step, pending),
+	}); err != nil {
 		return runOutcome{Err: err}
 	}
 	return runOutcome{
@@ -390,13 +414,13 @@ func (l *AgentLoop) interrupt(rc *RunContext, step int, history []core.Message, 
 // The RunFailed event deliberately stays unchanged: the snapshot belongs to the
 // checkpointer, recovery is a call to Agent.Resume(thread), and the error on the
 // wire remains a single value.
-func (l *AgentLoop) fail(rc *RunContext, step int, history []core.Message, err error) runOutcome {
+func (l *AgentLoop) fail(rc *RunContext, step int, history []core.Message, snapshot *checkpoint.StepSnapshot, err error) runOutcome {
 	if err == nil {
 		return runOutcome{}
 	}
 	if step >= 0 {
 		rc.State.Messages = seam(history)
-		if checkpointErr := l.checkpoint(rc, step, nil, nil, true); checkpointErr != nil {
+		if checkpointErr := l.checkpoint(rc, commitOptions{Step: step, Snapshot: snapshot, Release: true}); checkpointErr != nil {
 			err = errors.Join(err, checkpointErr)
 		}
 	}

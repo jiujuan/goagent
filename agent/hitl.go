@@ -178,7 +178,9 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		run.rc.State.Messages = append(run.rc.State.Messages, core.Message{Role: core.RoleTool, Parts: parts})
 		return run, nil
 	}
-	run.rc.resumed = newResumeBatch(cp.Pending.Step, cp.Pending.Pending, allApprovals, lastAssistant(state.Messages))
+	batch := newResumeBatch(cp.Pending.Step, cp.Pending.Pending, allApprovals, lastAssistant(state.Messages))
+	batch.snapshot = cloneStepSnapshot(cp.Snapshot)
+	run.rc.resumed = batch
 	return run, nil
 }
 
@@ -204,11 +206,12 @@ func validatePause(cp *checkpoint.Checkpoint) error {
 // resumeBatch is the pending tool-call batch a HITL pause left behind, carried
 // into the resumed run so the loop runs it before its next model call.
 type resumeBatch struct {
-	step   int             // loop step the run paused at
-	calls  []core.ToolCall // pending calls, in the model's original order
-	decide map[string]Approval
-	ids    map[string]int
-	final  core.Message // assistant message that issued the calls, if a call ends the run
+	step     int             // loop step the run paused at
+	calls    []core.ToolCall // pending calls, in the model's original order
+	decide   map[string]Approval
+	ids      map[string]int
+	final    core.Message             // assistant message that issued the calls, if a call ends the run
+	snapshot *checkpoint.StepSnapshot // view frozen at the pause, nil on legacy checkpoints
 }
 
 func newResumeBatch(step int, calls []core.ToolCall, approvals []Approval, final core.Message) *resumeBatch {

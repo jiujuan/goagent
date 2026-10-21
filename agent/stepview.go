@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 
+	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/llm"
 	"github.com/jiujuan/goagent/tool"
@@ -128,6 +129,40 @@ func (v *StepView) Digest() StepDigest {
 	out := v.digest
 	out.Advertised = slices.Clone(v.digest.Advertised)
 	return out
+}
+
+// snapshot returns the durable summary of this view, or nil when no view was
+// frozen. The checkpoint stores the same names and digests the model request
+// produced, never the view itself.
+func (v *StepView) snapshot() *checkpoint.StepSnapshot {
+	if v == nil {
+		return nil
+	}
+	return &checkpoint.StepSnapshot{
+		Step:           v.step,
+		Advertised:     slices.Clone(v.digest.Advertised),
+		ToolDigest:     v.digest.ToolDigest,
+		SettingsDigest: v.digest.SettingsDigest,
+		Model:          v.model,
+	}
+}
+
+// viewSnapshot is the checkpoint-facing form of View(): nil before the view is
+// frozen and on a nil context.
+func (lc *LoopContext) viewSnapshot() *checkpoint.StepSnapshot {
+	if lc == nil {
+		return nil
+	}
+	return lc.view.snapshot()
+}
+
+func cloneStepSnapshot(in *checkpoint.StepSnapshot) *checkpoint.StepSnapshot {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Advertised = slices.Clone(in.Advertised)
+	return &out
 }
 
 // Schemas returns a copy of the advertised schemas. The parameter bytes are
