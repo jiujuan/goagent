@@ -118,6 +118,24 @@ func (rc *RunContext) addInboxAcks(ids []string) {
 	}
 }
 
+// pendingInboxAcks snapshots the inbox message IDs this run has appended to its
+// history but not yet committed as acknowledged. The final-turn check reads it
+// so a message this step already consumed is not mistaken for new input before
+// the step's checkpoint makes the acknowledgement visible.
+func (rc *RunContext) pendingInboxAcks() map[string]struct{} {
+	d := rc.ensureDurableState()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.ackMessageIDs) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(d.ackMessageIDs))
+	for _, id := range d.ackMessageIDs {
+		out[id] = struct{}{}
+	}
+	return out
+}
+
 func (rc *RunContext) addCompletedTool(ex checkpoint.ToolExecution) {
 	if ex.InvocationID == "" {
 		return

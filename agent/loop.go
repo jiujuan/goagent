@@ -93,10 +93,16 @@ type taskState struct {
 	usePrompt bool
 }
 
-func (l *AgentLoop) run(rc *RunContext) runOutcome {
-	st, out, ok := l.prepareRun(rc)
+func (l *AgentLoop) run(rc *RunContext) (out runOutcome) {
+	if rc.topLevel {
+		// This context owns the queue. Once the task loop returns, no step can
+		// deliver a message, so close it with the run's ending reason. The close
+		// is idempotent, so an earlier close keeps its own reason.
+		defer func() { rc.steering.close(ErrRunClosed) }()
+	}
+	st, prep, ok := l.prepareRun(rc)
 	if !ok {
-		return out
+		return prep
 	}
 	return l.runTask(rc, st)
 }
@@ -191,6 +197,48 @@ func (l *AgentLoop) runTask(rc *RunContext, st taskState) runOutcome {
 	// The budget ran out mid-conversation: the seam is still worth keeping, so
 	// Resume can continue the thread with a larger budget instead of rewinding.
 	return l.fail(rc, st.maxStep-1, st.history, nil, ErrMaxTurnsExceeded)
+}
+
+// settleTurn decides whether a final answer ends the run or another turn starts
+// because input arrived while the model was answering. The order is deliberate:
+// a spent budget ends the turn before anything can be queued for a step that
+// will never run; volatile messages force the next turn without touching the
+// (possibly slow) inbox; and the last drain-or-close is one atomic step, so a
+// message racing with the close is either delivered or refused, never stranded.
+func (l *AgentLoop) settleTurn(rc *RunContext, st taskState, history []core.Message) (nextHistory []core.Message, entries []steerEntry, continuing bool, err error) {
+	if st.step+1 >= st.maxStep {
+		settleUndelivered(rc.steering.drain(), ErrMaxTurnsExceeded)
+		rc.steering.close(ErrRunClosed)
+		return history, nil, false, nil
+	}
+	if entries := rc.steering.drain(); len(entries) > 0 {
+		for _, e := range entries {
+			history = append(history, e.msg)
+		}
+		return history, entries, true, nil
+	}
+	if durable, ok := rc.durableStore(); ok {
+		inbox, err := durable.Inbox(rc, rc.ThreadID)
+		if err != nil {
+			return history, nil, false, err
+		}
+		pending := rc.pendingInboxAcks()
+		for _, msg := range inbox {
+			if _, consumed := pending[msg.ID]; consumed {
+				continue
+			}
+			// The next turn's PrepareTurn delivers it and registers the ack.
+			return history, nil, true, nil
+		}
+	}
+	late, _ := rc.steering.drainOrClose(ErrRunClosed)
+	if len(late) > 0 {
+		for _, e := range late {
+			history = append(history, e.msg)
+		}
+		return history, late, true, nil
+	}
+	return history, nil, false, nil
 }
 
 // runStep runs one PrepareTurn → CallModel → ExecuteTools → Checkpoint →
@@ -304,11 +352,41 @@ func (l *AgentLoop) runStep(rc *RunContext, st taskState) (runOutcome, taskState
 		if l.outputKey != "" {
 			rc.State.Apply(core.StateOp{Kind: core.OpSetKV, Key: l.outputKey, Value: final.Text()})
 		}
-		rc.State.Messages = history
-		if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: true}); err != nil {
+
+		if !rc.topLevel {
+			// A workflow member keeps single-turn semantics: its final answer
+			// returns from this unit, and the shared queue stays open for the next
+			// member or loop round.
+			rc.State.Messages = history
+			if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: true}); err != nil {
+				return runOutcome{Err: err}, st, false
+			}
+			rc.publish(core.TurnDone{Step: step})
+			return runOutcome{Result: core.Result{Message: final}}, st, false
+		}
+
+		nextHistory, entries, continuing, err := l.settleTurn(rc, st, history)
+		if err != nil {
+			return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
+		}
+		rc.State.Messages = nextHistory
+		if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: !continuing}); err != nil {
+			settleUndelivered(entries, ErrRunClosed)
 			return runOutcome{Err: err}, st, false
 		}
+		if continuing {
+			settleDelivered(entries, step+1)
+		}
 		rc.publish(core.TurnDone{Step: step})
+		if continuing {
+			return runOutcome{}, taskState{
+				step:      step + 1,
+				maxStep:   st.maxStep,
+				history:   nextHistory,
+				system:    st.system,
+				usePrompt: st.usePrompt,
+			}, true
+		}
 		return runOutcome{Result: core.Result{Message: final}}, st, false
 	}
 

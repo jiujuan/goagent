@@ -41,6 +41,10 @@ func (o runOutcome) terminal() bool {
 	return o.Err != nil || o.Control.Kind == core.Interrupt
 }
 
+// inputCloseReason maps how a unit ended to the reason its steering queue
+// closes with.
+func (o runOutcome) inputCloseReason() error { return ErrRunClosed }
+
 // runChild drives a derived child environment (transfer target, parallel
 // branch, DAG node, planner) and closes its steering queue before returning.
 // Such contexts each own a fresh queue that no outside caller can reach after
