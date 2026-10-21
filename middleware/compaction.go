@@ -111,10 +111,39 @@ func (c *compaction) CompactHistory(lc *agent.LoopContext, history []core.Messag
 	if !ok {
 		return history
 	}
-	if lc.Bus != nil {
-		lc.Bus.Publish(lc.Topic, core.HistoryCompacted{Dropped: cut, Kept: len(out) - 1, EstTokens: est, Step: lc.Step})
-	}
+	publishCompacted(lc, est, cut, len(out)-1)
 	return out
+}
+
+// RecoverContext force-summarizes the history after the provider rejected it as
+// too long. Unlike the normal path it ignores MaxTokens and KeepRecent: the
+// provider's rejection is the trigger, and the cut is chosen to land well under
+// the reported limit. It declines when it cannot make the history strictly
+// shorter, so the loop never retries the identical request.
+func (c *compaction) RecoverContext(lc *agent.LoopContext, history []core.Message, overflow *llm.ContextLengthError) ([]core.Message, bool) {
+	if c.model == nil || len(history) <= 1 {
+		return history, false
+	}
+	before := c.calibratedEstimate(lc, history)
+	target := compactionRecoveryTarget(before, overflow.Limit)
+	if target <= 0 || target >= before {
+		return history, false
+	}
+	cut := forceCut(c, lc, history, target)
+	if cut <= 0 {
+		return history, false
+	}
+	summary, err := c.summarize(lc.Context, history[:cut])
+	if err != nil || summary == "" {
+		return history, false
+	}
+	note := core.Message{Role: core.RoleUser, Parts: []core.Part{core.Text{Text: summaryMark + summary}}}
+	out := append([]core.Message{note}, history[cut:]...)
+	if len(out) >= len(history) || c.calibratedEstimate(lc, out) >= before {
+		return history, false
+	}
+	publishCompacted(lc, before, cut, len(out)-1)
+	return out, true
 }
 
 // compact returns the summarized history and the cut index, or ok=false when no
@@ -149,6 +178,41 @@ func safeCut(msgs []core.Message, keep int) int {
 		cut--
 	}
 	return cut
+}
+
+// compactionRecoveryTarget is the token budget a recovered history should stay
+// under: a little below the provider's limit when it reports one, and never
+// more than half the rejected history.
+func compactionRecoveryTarget(before, limit int) int {
+	if limit > 0 {
+		return min(limit*3/4, before/2)
+	}
+	return before / 2
+}
+
+// forceCut finds the largest suffix that fits comfortably under target/2,
+// backing off tool results to a user/assistant boundary. It falls back to
+// safeCut(msgs, 1) when no suffix fits, and returns 0 when even that leaves an
+// orphaned tool result.
+func forceCut(c *compaction, lc *agent.LoopContext, msgs []core.Message, target int) int {
+	for keep := len(msgs) - 1; keep >= 1; keep-- {
+		cut := safeCut(msgs, keep)
+		if cut > 0 && c.calibratedEstimate(lc, msgs[cut:]) <= target/2 {
+			return cut
+		}
+	}
+	return safeCut(msgs, 1)
+}
+
+// publishCompacted reports a durable history rewrite. Normal compaction and
+// overflow recovery share it so the event fields cannot drift apart.
+func publishCompacted(lc *agent.LoopContext, before, cut, kept int) {
+	if lc.Bus == nil {
+		return
+	}
+	lc.Bus.Publish(lc.Topic, core.HistoryCompacted{
+		Dropped: cut, Kept: kept, EstTokens: before, Step: lc.Step,
+	})
 }
 
 // AfterModel calibrates the estimator against the provider's real input-token
@@ -305,3 +369,4 @@ func isWideRune(r rune) bool {
 
 var _ agent.Middleware = (*compaction)(nil)
 var _ agent.HistoryCompacter = (*compaction)(nil)
+var _ agent.ContextOverflowRecoverer = (*compaction)(nil)

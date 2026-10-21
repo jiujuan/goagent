@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jiujuan/goagent/agent"
@@ -792,6 +793,163 @@ func TestContextOverflowRunBudgetWrapUp(t *testing.T) {
 	}
 	if got := strings.Count(reqs[1].System, middleware.WarnMarkerBudget); got != 1 {
 		t.Fatalf("retried system has %d budget markers, want 1: %q", got, reqs[1].System)
+	}
+}
+
+// perMessageCounter charges a fixed price per message so a test can predict
+// exactly where the compaction cut lands.
+func perMessageCounter(n int) middleware.TokenCounter {
+	return func(msgs []core.Message) int { return len(msgs) * n }
+}
+
+func orphanToolResults(msgs []core.Message) []string {
+	calls := map[string]bool{}
+	for _, m := range msgs {
+		for _, p := range m.Parts {
+			if c, ok := p.(core.ToolCall); ok {
+				calls[c.ID] = true
+			}
+		}
+	}
+	var orphans []string
+	for _, m := range msgs {
+		for _, p := range m.Parts {
+			if r, ok := p.(core.ToolResult); ok && !calls[r.CallID] {
+				orphans = append(orphans, r.CallID)
+			}
+		}
+	}
+	return orphans
+}
+
+func TestContextOverflowCompactionRecovery(t *testing.T) {
+	ctx := context.Background()
+	big := strings.Repeat("x", 200)
+	toolPair := func(id string) []core.Message {
+		return []core.Message{
+			{Role: core.RoleAssistant, Parts: []core.Part{core.ToolCall{ID: id, Name: "fetch", Args: []byte("{}")}}},
+			{Role: core.RoleTool, Parts: []core.Part{core.ToolResult{CallID: id, Name: "fetch", Content: []core.Part{core.Text{Text: big}}}}},
+		}
+	}
+	seed := []core.Message{core.UserText("user-0 " + big)}
+	seed = append(seed, toolPair("call-1")...)
+	seed = append(seed, core.UserText("user-3 "+big))
+	seed = append(seed, toolPair("call-2")...)
+	seed = append(seed, core.UserText("user-6 "+big), core.UserText("user-7 "+big))
+	if len(seed) != 8 {
+		t.Fatalf("seed has %d messages, want 8", len(seed))
+	}
+
+	var summaryCalls int32
+	sum := mock.New("sum", func(*llm.Request) *llm.Response {
+		atomic.AddInt32(&summaryCalls, 1)
+		return mock.Text("COMPACTED")
+	})
+	store := seededStore(t, seed)
+	var (
+		mu      sync.Mutex
+		during  *checkpoint.Checkpoint
+		duringE error
+	)
+	m := &scriptModel{}
+	m.pick = func(call int, _ *llm.Request) (*llm.Response, error) {
+		if call == 1 {
+			return nil, overflowError(100, 300)
+		}
+		cp, err := store.Latest(context.Background(), overflowThread)
+		mu.Lock()
+		during, duringE = cp, err
+		mu.Unlock()
+		return mock.Text("done"), nil
+	}
+	a, err := agent.New(
+		agent.WithModel(m),
+		agent.WithMiddleware(middleware.Compaction(middleware.CompactionOptions{
+			Model: sum, MaxTokens: 1 << 30, KeepRecent: 2, Counter: perMessageCounter(10),
+		})),
+		agent.WithCheckpointer(store),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events, runErr := phase1Drain(t, a.Stream(ctx, "go", agent.OnThread(overflowThread)))
+	if runErr != nil {
+		t.Fatalf("run error: %v", runErr)
+	}
+	if got := m.calls(); got != 2 {
+		t.Fatalf("model calls = %d, want 2", got)
+	}
+	if got := atomic.LoadInt32(&summaryCalls); got != 1 {
+		t.Fatalf("summary calls = %d, want 1", got)
+	}
+	reqs := m.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("recorded requests = %d, want 2", len(reqs))
+	}
+	if got := len(reqs[0].Messages); got != 9 {
+		t.Fatalf("first request has %d messages, want 9", got)
+	}
+	if got, first := len(reqs[1].Messages), len(reqs[0].Messages); got >= first {
+		t.Fatalf("retried request has %d messages, first had %d", got, first)
+	}
+	head := reqs[1].Messages[0]
+	if head.Role != core.RoleUser || !strings.HasPrefix(head.Text(), "[earlier conversation summary]") {
+		t.Fatalf("retried history starts with %q/%q, want a summary note", head.Role, head.Text())
+	}
+	if out := orphanToolResults(reqs[1].Messages); len(out) != 0 {
+		t.Fatalf("retried request carries orphan tool results: %v", out)
+	}
+
+	var compactedAt, retriedAt = -1, -1
+	var compacted core.HistoryCompacted
+	for i, ev := range events {
+		switch e := ev.(type) {
+		case core.HistoryCompacted:
+			if compactedAt < 0 {
+				compactedAt, compacted = i, e
+			}
+		case core.ContextOverflowRetried:
+			if retriedAt < 0 {
+				retriedAt = i
+			}
+		}
+	}
+	if compactedAt < 0 || retriedAt < 0 {
+		t.Fatalf("events missing HistoryCompacted (%d) or ContextOverflowRetried (%d)", compactedAt, retriedAt)
+	}
+	if compactedAt > retriedAt {
+		t.Fatalf("HistoryCompacted at %d came after ContextOverflowRetried at %d", compactedAt, retriedAt)
+	}
+	if compacted.Dropped != 7 || compacted.Kept != 2 || compacted.EstTokens != 90 || compacted.Step != 0 {
+		t.Fatalf("HistoryCompacted = %+v, want Dropped 7, Kept 2, EstTokens 90, Step 0", compacted)
+	}
+
+	mu.Lock()
+	mid, midErr := during, duringE
+	mu.Unlock()
+	if midErr != nil || mid == nil {
+		t.Fatalf("checkpoint visible to the retried call: %v (nil=%v)", midErr, mid == nil)
+	}
+	if mid.ID == "seed" {
+		t.Fatal("the retry did not persist the recovered history before calling the model")
+	}
+	if !strings.HasPrefix(mid.State.Messages[0].Text(), "[earlier conversation summary]") {
+		t.Fatalf("checkpoint at retry starts with %q, want the summary note", mid.State.Messages[0].Text())
+	}
+	if out := orphanToolResults(mid.State.Messages); len(out) != 0 {
+		t.Fatalf("checkpoint at retry carries orphan tool results: %v", out)
+	}
+
+	cp, err := store.Latest(ctx, overflowThread)
+	if err != nil || cp == nil {
+		t.Fatalf("latest checkpoint: %v (nil=%v)", err, cp == nil)
+	}
+	if !strings.HasPrefix(cp.State.Messages[0].Text(), "[earlier conversation summary]") {
+		t.Fatalf("durable history starts with %q, want the summary note", cp.State.Messages[0].Text())
+	}
+	if out := orphanToolResults(cp.State.Messages); len(out) != 0 {
+		t.Fatalf("durable history carries orphan tool results: %v", out)
 	}
 }
 
