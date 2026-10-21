@@ -839,3 +839,204 @@ func TestSessionSendWaitsForContinuation(t *testing.T) {
 		t.Fatalf("model calls = %d, want 2", m.calls())
 	}
 }
+
+// stopAfterModel ends every run right after its model reply.
+type stopAfterModel struct{ agent.BaseMiddleware }
+
+func (stopAfterModel) AfterModel(*agent.LoopContext, *llm.Response) (core.Directive, error) {
+	return core.Directive{Kind: core.Stop, Reason: "test stop"}, nil
+}
+
+func TestPauseSettlesSteeringAsInterrupted(t *testing.T) {
+	ctx := context.Background()
+	store := checkpoint.NewMemory()
+	first := newModelGate()
+	releaseGates(t, first)
+	model := &scriptModel{pick: func(call int, req *llm.Request) (*llm.Response, error) {
+		if call == 1 {
+			close(first.started)
+			<-first.released
+			return mock.CallTool("c1", "blocked", `{}`), nil
+		}
+		return mock.Text("resumed done"), nil
+	}}
+	a, err := agent.New(
+		agent.WithModel(model),
+		agent.WithTools(blockedTool()),
+		agent.WithMiddleware(terminalGate{}),
+		agent.WithCheckpointer(store),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	run := a.Stream(ctx, "go", agent.OnThread("tl04_pause"))
+	tickets := steerWhenStarted(t, run, first, "late")
+	if _, err := run.Wait(); err != nil {
+		t.Fatalf("paused Wait: %v", err)
+	}
+	if !run.Paused() {
+		t.Fatal("the run did not pause")
+	}
+	if out := awaitTicket(t, tickets).Outcome(); out.Delivered || !errors.Is(out.Err, agent.ErrRunInterrupted) {
+		t.Fatalf("ticket outcome = %+v, want undelivered ErrRunInterrupted", out)
+	}
+	if _, err := run.Steer(core.UserText("after pause")); !errors.Is(err, agent.ErrRunInterrupted) {
+		t.Fatalf("Steer after pause = %v, want ErrRunInterrupted", err)
+	}
+
+	cp, err := store.Latest(ctx, run.ThreadID)
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+	if cp == nil {
+		t.Fatal("the pause wrote no checkpoint")
+	}
+	for _, m := range cp.State.Messages {
+		if m.Text() == "late" {
+			t.Fatalf("the paused checkpoint kept the undelivered message: %s", digest(cp.State.Messages))
+		}
+	}
+
+	resumed, err := a.Resume(ctx, run.ThreadID)
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	resumedTicket, err := resumed.Steer(core.UserText("after resume"))
+	if err != nil {
+		t.Fatalf("Steer on the resumed run: %v", err)
+	}
+	res, err := resumed.Wait()
+	if err != nil {
+		t.Fatalf("resumed Wait: %v", err)
+	}
+	if got := res.Message.Text(); got != "resumed done" {
+		t.Fatalf("resumed result = %q, want resumed done", got)
+	}
+	if out := resumedTicket.Outcome(); !out.Delivered || out.Step != 1 {
+		t.Fatalf("resumed ticket outcome = %+v, want delivered at step 1", out)
+	}
+}
+
+func TestStopSettlesSteeringAsStopped(t *testing.T) {
+	gate := newModelGate()
+	releaseGates(t, gate)
+	m := &turnGatedModel{gates: []*modelGate{gate}, answers: []string{"first"}}
+	a, err := agent.New(agent.WithModel(m), agent.WithMiddleware(stopAfterModel{}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	run := a.Stream(context.Background(), "start")
+	tickets := steerWhenStarted(t, run, gate, "late")
+	if _, err := run.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if out := awaitTicket(t, tickets).Outcome(); out.Delivered || !errors.Is(out.Err, agent.ErrRunStopped) {
+		t.Fatalf("ticket outcome = %+v, want undelivered ErrRunStopped", out)
+	}
+	if _, err := run.Steer(core.UserText("after stop")); !errors.Is(err, agent.ErrRunStopped) {
+		t.Fatalf("Steer after stop = %v, want ErrRunStopped", err)
+	}
+}
+
+func TestTransferSettlesParentSteering(t *testing.T) {
+	ctx := context.Background()
+	parentGate := newModelGate()
+	targetGate := newModelGate()
+	releaseGates(t, parentGate, targetGate)
+	parentModel := &scriptModel{pick: func(int, *llm.Request) (*llm.Response, error) {
+		close(parentGate.started)
+		<-parentGate.released
+		return mock.CallTool("t1", "transfer_to_agent", `{"agent":"target"}`), nil
+	}}
+	targetModel := &turnGatedModel{gates: []*modelGate{targetGate}, answers: []string{"delegated"}}
+	target, err := agent.New(agent.WithName("target"), agent.WithModel(targetModel))
+	if err != nil {
+		t.Fatalf("New target: %v", err)
+	}
+	parent, err := agent.New(agent.WithModel(parentModel), agent.WithSubAgents(target))
+	if err != nil {
+		t.Fatalf("New parent: %v", err)
+	}
+
+	run := parent.Stream(ctx, "go")
+	waited := make(chan struct {
+		res core.Result
+		err error
+	}, 1)
+	go func() {
+		res, err := run.Wait()
+		waited <- struct {
+			res core.Result
+			err error
+		}{res, err}
+	}()
+	tickets := steerWhenStarted(t, run, parentGate, "parent late")
+	ticket := awaitTicket(t, tickets)
+	select {
+	case <-targetGate.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the transfer target never started")
+	}
+	select {
+	case <-ticket.Done():
+	default:
+		t.Fatal("the parent ticket was not settled before the target started")
+	}
+	if out := ticket.Outcome(); out.Delivered || !errors.Is(out.Err, agent.ErrRunStopped) {
+		t.Fatalf("parent ticket outcome = %+v, want undelivered ErrRunStopped", out)
+	}
+	if _, err := run.Steer(core.UserText("after transfer")); !errors.Is(err, agent.ErrRunStopped) {
+		t.Fatalf("Steer after transfer = %v, want ErrRunStopped", err)
+	}
+
+	targetGate.release()
+	select {
+	case out := <-waited:
+		if out.err != nil {
+			t.Fatalf("Wait: %v", out.err)
+		}
+		if got := out.res.Message.Text(); got != "delegated" {
+			t.Fatalf("result = %q, want delegated", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the transferred run never finished")
+	}
+}
+
+func TestWorkflowRootClosesSteering(t *testing.T) {
+	gate := newModelGate()
+	releaseGates(t, gate)
+	first, err := agent.New(agent.WithModel(mock.New("first", func(*llm.Request) *llm.Response {
+		return mock.Text("alpha")
+	})))
+	if err != nil {
+		t.Fatalf("New first: %v", err)
+	}
+	second, err := agent.New(agent.WithModel(mock.New("second", func(*llm.Request) *llm.Response {
+		close(gate.started)
+		<-gate.released
+		return mock.Text("beta")
+	})))
+	if err != nil {
+		t.Fatalf("New second: %v", err)
+	}
+
+	flow := agent.Sequential("flow", first, second)
+	run := flow.Stream(context.Background(), "go")
+	tickets := steerWhenStarted(t, run, gate, "late")
+	res, err := run.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got := res.Message.Text(); got != "beta" {
+		t.Fatalf("workflow result = %q, want beta", got)
+	}
+	if out := awaitTicket(t, tickets).Outcome(); out.Delivered || !errors.Is(out.Err, agent.ErrRunClosed) {
+		t.Fatalf("ticket outcome = %+v, want undelivered ErrRunClosed", out)
+	}
+	if _, err := run.Steer(core.UserText("after workflow")); !errors.Is(err, agent.ErrRunClosed) {
+		t.Fatalf("Steer after workflow = %v, want ErrRunClosed", err)
+	}
+}

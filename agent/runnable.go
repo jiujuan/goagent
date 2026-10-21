@@ -43,7 +43,20 @@ func (o runOutcome) terminal() bool {
 
 // inputCloseReason maps how a unit ended to the reason its steering queue
 // closes with.
-func (o runOutcome) inputCloseReason() error { return ErrRunClosed }
+func (o runOutcome) inputCloseReason() error {
+	switch {
+	case o.Err != nil:
+		return ErrRunClosed
+	case o.Control.Kind == core.Interrupt:
+		return ErrRunInterrupted
+	case o.Control.Kind == core.Stop,
+		o.Control.Kind == core.Escalate,
+		o.Control.Kind == core.Transfer:
+		return ErrRunStopped
+	default:
+		return ErrRunClosed
+	}
+}
 
 // runChild drives a derived child environment (transfer target, parallel
 // branch, DAG node, planner) and closes its steering queue before returning.
@@ -53,6 +66,6 @@ func (o runOutcome) inputCloseReason() error { return ErrRunClosed }
 // directly, not through runChild.
 func runChild(rc *RunContext, r Runnable) runOutcome {
 	out := r.run(rc)
-	rc.steering.close(ErrRunClosed)
+	rc.steering.close(out.inputCloseReason())
 	return out
 }

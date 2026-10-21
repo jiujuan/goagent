@@ -19,8 +19,9 @@ type RunStarted struct {
 	ThreadID string
 }
 
-// RunDone is the terminal success event; Result summarizes the outcome. Stream
-// adapters treat it as end-of-stream.
+// RunDone is the terminal success event; Result summarizes the outcome. A run
+// emits exactly one RunDone, after its last turn, and stream adapters treat it as
+// end-of-stream. TurnDone is not a run-end signal: one run can emit many.
 type RunDone struct {
 	Result Result
 }
@@ -36,7 +37,8 @@ type RunFailed struct {
 // TurnStarted marks the start of one model-call step (0-indexed).
 type TurnStarted struct{ Step int }
 
-// TurnDone marks the end of one step.
+// TurnDone marks the end of one turn. A run can emit it several times when
+// steering or inbox input continues the conversation; only RunDone ends the run.
 type TurnDone struct{ Step int }
 
 // MessageDelta is a streaming increment of the assistant message, for live

@@ -260,7 +260,7 @@ func (r *Run) drive() {
 				r.bus.Publish(r.topic, ev)
 			}
 			out := r.runnable.run(r.rc)
-			r.rc.steering.close(ErrRunClosed)
+			r.rc.steering.close(out.inputCloseReason())
 			// The boundary is captured while the claim is still held, and the
 			// outcome is frozen with it before any terminal event goes out.
 			boundaryID, boundaryRev, boundaryOK := r.rc.committedBoundary()

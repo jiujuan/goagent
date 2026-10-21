@@ -98,7 +98,7 @@ func (l *AgentLoop) run(rc *RunContext) (out runOutcome) {
 		// This context owns the queue. Once the task loop returns, no step can
 		// deliver a message, so close it with the run's ending reason. The close
 		// is idempotent, so an earlier close keeps its own reason.
-		defer func() { rc.steering.close(ErrRunClosed) }()
+		defer func() { rc.steering.close(out.inputCloseReason()) }()
 	}
 	st, prep, ok := l.prepareRun(rc)
 	if !ok {
