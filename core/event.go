@@ -120,9 +120,11 @@ type BudgetExceeded struct {
 }
 
 // HistoryCompacted is emitted when the Compaction middleware rewrites the
-// conversation history itself (persist mode): Dropped leading messages are
-// replaced by one summary note, Kept trailing messages survive verbatim, and
-// EstTokens is the calibrated estimate of the history size that triggered it.
+// conversation history itself: persist mode on a normal threshold hit, or the
+// context-overflow recovery path (even in request mode, because the recovery is
+// persisted before the retry). Dropped leading messages are replaced by one
+// summary note, Kept trailing messages survive verbatim, and EstTokens is the
+// calibrated estimate of the history size that triggered the rewrite.
 type HistoryCompacted struct {
 	Dropped   int
 	Kept      int
@@ -132,18 +134,38 @@ type HistoryCompacted struct {
 
 // WindowTrimmed is emitted by the Window middleware each time it evicts message
 // units from what a step would otherwise send. Strategy names the policy
-// ("recent_n" | "sliding_window" | "importance_weighted"), Dropped and Kept
-// count messages (not units) after the pairing repair, EstTokens is the
-// calibrated estimate of the history before eviction, and Step is the loop step.
-// Unlike HistoryCompacted — which fires only when a durable summarization
-// rewrote the history — this fires per actual eviction, so a request-mode window
-// emits one for each step it trimmed, distinguishable by Step.
+// ("recent_n" | "sliding_window" | "importance_weighted" | "overflow_tail"),
+// where "overflow_tail" is the emergency tail eviction used to recover from a
+// typed context-length overflow. Dropped and Kept count messages (not units)
+// after the pairing repair, EstTokens is the calibrated estimate of the history
+// before eviction, and Step is the loop step. Unlike HistoryCompacted — which
+// fires only when a durable summarization rewrote the history — this fires per
+// actual eviction, so a request-mode window emits one for each step it trimmed,
+// distinguishable by Step.
 type WindowTrimmed struct {
 	Strategy  string
 	Dropped   int
 	Kept      int
 	EstTokens int
 	Step      int
+}
+
+// ContextOverflowRetried is emitted after the agent loop recovered from a typed
+// context-length overflow and persisted the shortened history, immediately
+// before the retried model call in the same step. Attempt counts recovery rounds
+// within the step starting at 1. Model is the frozen view's model, while
+// Provider, Limit and Requested come from the failed call's typed error and stay
+// empty or zero when unknown. MessagesBefore and MessagesAfter count the working
+// history around the recovery.
+type ContextOverflowRetried struct {
+	Step           int
+	Attempt        int
+	Model          string
+	Provider       string
+	Limit          int
+	Requested      int
+	MessagesBefore int
+	MessagesAfter  int
 }
 
 // ArgRejected is emitted by the argument-guard middleware each time a tool call is
@@ -179,27 +201,28 @@ type StepViewDrifted struct {
 
 // --- Marker -----------------------------------------------------------------
 
-func (RunStarted) isEvent()       {}
-func (RunDone) isEvent()          {}
-func (RunFailed) isEvent()        {}
-func (TurnStarted) isEvent()      {}
-func (TurnDone) isEvent()         {}
-func (MessageDelta) isEvent()     {}
-func (MessageDone) isEvent()      {}
-func (ToolStarted) isEvent()      {}
-func (ToolUpdate) isEvent()       {}
-func (ToolDone) isEvent()         {}
-func (ApprovalDecided) isEvent()  {}
-func (Interrupted) isEvent()      {}
-func (Progress) isEvent()         {}
-func (PlanNodeStarted) isEvent()  {}
-func (PlanNodeDone) isEvent()     {}
-func (StuckDetected) isEvent()    {}
-func (BudgetExceeded) isEvent()   {}
-func (HistoryCompacted) isEvent() {}
-func (WindowTrimmed) isEvent()    {}
-func (ArgRejected) isEvent()      {}
-func (StepViewDrifted) isEvent()  {}
+func (RunStarted) isEvent()             {}
+func (RunDone) isEvent()                {}
+func (RunFailed) isEvent()              {}
+func (TurnStarted) isEvent()            {}
+func (TurnDone) isEvent()               {}
+func (MessageDelta) isEvent()           {}
+func (MessageDone) isEvent()            {}
+func (ToolStarted) isEvent()            {}
+func (ToolUpdate) isEvent()             {}
+func (ToolDone) isEvent()               {}
+func (ApprovalDecided) isEvent()        {}
+func (Interrupted) isEvent()            {}
+func (Progress) isEvent()               {}
+func (PlanNodeStarted) isEvent()        {}
+func (PlanNodeDone) isEvent()           {}
+func (StuckDetected) isEvent()          {}
+func (BudgetExceeded) isEvent()         {}
+func (HistoryCompacted) isEvent()       {}
+func (WindowTrimmed) isEvent()          {}
+func (ContextOverflowRetried) isEvent() {}
+func (ArgRejected) isEvent()            {}
+func (StepViewDrifted) isEvent()        {}
 
 // --- Payload types ----------------------------------------------------------
 

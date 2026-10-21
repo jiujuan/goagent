@@ -1,6 +1,9 @@
 package core
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestStuckDetectedEventRoundTrip(t *testing.T) {
 	in := StuckDetected{Rule: "repeat_call", Reason: "tool fetch called twice", Step: 7}
@@ -102,5 +105,56 @@ func TestStepViewDriftedEventRoundTrip(t *testing.T) {
 	got, ok := out.(StepViewDrifted)
 	if !ok || got != in {
 		t.Fatalf("round trip = %#v, want %#v", out, in)
+	}
+}
+
+func TestContextOverflowRetriedEventRoundTrip(t *testing.T) {
+	in := ContextOverflowRetried{
+		Step:           4,
+		Attempt:        2,
+		Model:          "claude-sonnet",
+		Provider:       "anthropic",
+		Limit:          200000,
+		Requested:      210000,
+		MessagesBefore: 12,
+		MessagesAfter:  6,
+	}
+	data, err := MarshalEvent(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := out.(ContextOverflowRetried)
+	if !ok || got != in {
+		t.Fatalf("round trip = %#v, want %#v", out, in)
+	}
+}
+
+func TestContextOverflowRetriedEventOmitsUnknownFields(t *testing.T) {
+	in := ContextOverflowRetried{Step: 3}
+	data, err := MarshalEvent(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{
+		"attempt", "model", "provider", "limit", "requested",
+		"messages_before", "messages_after",
+	} {
+		if _, ok := raw[key]; ok {
+			t.Errorf("zero-valued %q should be omitted from %s", key, data)
+		}
+	}
+}
+
+func TestUnmarshalEventRejectsUnknownType(t *testing.T) {
+	if _, err := UnmarshalEvent([]byte(`{"type":"context_overflow_retry"}`)); err == nil {
+		t.Fatal("unknown event type should still fail")
 	}
 }

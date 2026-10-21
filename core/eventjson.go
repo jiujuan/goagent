@@ -47,6 +47,14 @@ type eventWire struct {
 	ActualToolDigest       string `json:"actual_tool_digest,omitempty"`
 	ExpectedSettingsDigest string `json:"expected_settings_digest,omitempty"`
 	ActualSettingsDigest   string `json:"actual_settings_digest,omitempty"`
+
+	Attempt        int    `json:"attempt,omitempty"`
+	Model          string `json:"model,omitempty"`
+	Provider       string `json:"provider,omitempty"`
+	Limit          int    `json:"limit,omitempty"`
+	Requested      int    `json:"requested,omitempty"`
+	MessagesBefore int    `json:"messages_before,omitempty"`
+	MessagesAfter  int    `json:"messages_after,omitempty"`
 }
 
 // MarshalEvent encodes an Event to tagged JSON.
@@ -105,6 +113,11 @@ func MarshalEvent(ev Event) ([]byte, error) {
 		w.Type, w.Dropped, w.Kept, w.EstTok, w.Step = "history_compacted", e.Dropped, e.Kept, e.EstTokens, e.Step
 	case WindowTrimmed:
 		w.Type, w.Strategy, w.Dropped, w.Kept, w.EstTok, w.Step = "window_trimmed", e.Strategy, e.Dropped, e.Kept, e.EstTokens, e.Step
+	case ContextOverflowRetried:
+		w.Type, w.Step, w.Attempt = "context_overflow_retried", e.Step, e.Attempt
+		w.Model, w.Provider = e.Model, e.Provider
+		w.Limit, w.Requested = e.Limit, e.Requested
+		w.MessagesBefore, w.MessagesAfter = e.MessagesBefore, e.MessagesAfter
 	case ArgRejected:
 		w.Type, w.Tool, w.Class, w.Count, w.Step = "arg_rejected", e.Tool, e.Class, e.Count, e.Step
 	case StepViewDrifted:
@@ -169,6 +182,17 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		return HistoryCompacted{Dropped: w.Dropped, Kept: w.Kept, EstTokens: w.EstTok, Step: w.Step}, nil
 	case "window_trimmed":
 		return WindowTrimmed{Strategy: w.Strategy, Dropped: w.Dropped, Kept: w.Kept, EstTokens: w.EstTok, Step: w.Step}, nil
+	case "context_overflow_retried":
+		return ContextOverflowRetried{
+			Step:           w.Step,
+			Attempt:        w.Attempt,
+			Model:          w.Model,
+			Provider:       w.Provider,
+			Limit:          w.Limit,
+			Requested:      w.Requested,
+			MessagesBefore: w.MessagesBefore,
+			MessagesAfter:  w.MessagesAfter,
+		}, nil
 	case "arg_rejected":
 		return ArgRejected{Tool: w.Tool, Class: w.Class, Count: w.Count, Step: w.Step}, nil
 	case "step_view_drifted":
