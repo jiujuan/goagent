@@ -65,11 +65,17 @@ func twoCallModel(once *llm.Response) *mock.Model {
 	})
 }
 
-func TestSequentialToolDowngradesWholeBatch(t *testing.T) {
-	o := &overlap{}
-	plain := slowTool(t, "plain", o)
-	base := slowTool(t, "seq", o)
+func TestSequentialToolSerializesItselfOnly(t *testing.T) {
+	group := newGateGroup(2)
+	t.Cleanup(group.open)
+	var seqActive atomic.Int32
+	base := tool.New("seq", "must run alone", func(*tool.Context, struct{}) (string, error) {
+		seqActive.Store(int32(group.act.current()))
+		return "ok", nil
+	})
 	seq := tool.AsSequential(base)
+	p1 := group.tool("p1")
+	p2 := group.tool("p2")
 
 	// The wrapper must remain fully transparent besides the capability.
 	if seq.Name() != base.Name() || seq.Description() != base.Description() || string(seq.Schema()) != string(base.Schema()) {
@@ -78,19 +84,39 @@ func TestSequentialToolDowngradesWholeBatch(t *testing.T) {
 	if _, ok := seq.(tool.SequentialTool); !ok {
 		t.Fatal("AsSequential result does not implement SequentialTool")
 	}
-	if _, ok := plain.(tool.SequentialTool); ok {
+	if _, ok := p1.(tool.SequentialTool); ok {
 		t.Fatal("plain tool must not implement SequentialTool")
 	}
 
-	a, err := agent.New(agent.WithModel(twoCallModel(callTwo("plain", "seq"))), agent.WithTools(plain, seq))
+	a, err := agent.New(
+		agent.WithModel(segmentCallModel(
+			segmentCall("c1", "p1"),
+			segmentCall("c2", "p2"),
+			segmentCall("c3", "seq"),
+		)),
+		agent.WithTools(p1, p2, seq),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	coordErr := make(chan error, 1)
+	go func() {
+		err := waitSegmentStarts(group.started, 2, "parallel calls before seq")
+		group.open()
+		coordErr <- err
+	}()
+
 	if _, err := a.Run(context.Background(), "go"); err != nil {
 		t.Fatal(err)
 	}
-	if p := o.peak.Load(); p != 1 {
-		t.Fatalf("peak concurrency = %d, want 1 (one sequential tool must serialize the batch)", p)
+	awaitSegmentCoordinator(t, coordErr)
+
+	if p := group.act.peakValue(); p != 2 {
+		t.Fatalf("peak concurrency = %d, want 2 (a sequential tool only serializes its own call)", p)
+	}
+	if got := seqActive.Load(); got != 0 {
+		t.Fatalf("seq saw %d handlers in flight, want 0", got)
 	}
 }
 

@@ -526,9 +526,10 @@ func TestAddToolPhaseVisibility(t *testing.T) {
 	}
 }
 
-// TestInjectedSequentialToolReplacingStaticDowngradesBatch: the sequential flag
-// follows the winning implementation.
-func TestInjectedSequentialToolReplacingStaticDowngradesBatch(t *testing.T) {
+// TestInjectedSequentialToolReplacingStaticSerializes: the sequential flag
+// follows the winning implementation, so both calls run in their own serial
+// segments.
+func TestInjectedSequentialToolReplacingStaticSerializes(t *testing.T) {
 	o := &overlap{}
 	static := slowTool(t, "both", o)
 	injected := tool.AsSequential(slowTool(t, "both", o))

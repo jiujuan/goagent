@@ -18,14 +18,17 @@ import (
 // execTools runs a step's tool calls and returns their results in the model's
 // original call order, plus the directives gathered from each tool's
 // Result.Control and the AfterTool middleware. State mutations a tool requests
-// (Result.State) are applied to the run State immediately. Execution is
-// concurrent by default (WithToolExecution); ToolSequential forces serial, and
-// so does any tool declaring the SequentialTool capability (tool.AsSequential),
-// which downgrades the whole batch it appears in.
+// (Result.State) are applied to the run State immediately. Calls run in
+// segments planned by buildToolCallSegments: consecutive calls run concurrently
+// (the default WithToolExecution), while ToolSequential makes every call serial
+// and a tool declaring the SequentialTool capability (tool.AsSequential) gives
+// its own call a serial segment — consecutive calls around it still run
+// concurrently within their own segments.
 //
-// ToolStarted is published in call order; ToolDone as each result lands. The
-// Bus is concurrency-safe, so parallel publishes do not race. State mutations
-// from parallel tools are serialized under a mutex.
+// ToolStarted is published in call order; ToolDone as each result lands, and a
+// serial call's ToolDone is published before the next segment's ToolStarted.
+// The Bus is concurrency-safe, so parallel publishes do not race. State
+// mutations from parallel tools are serialized under a mutex.
 //
 // A call bounded by WithToolTimeout (or by a middleware context bound) stops
 // being waited for when its deadline passes: the loop reports a timeout result
@@ -143,45 +146,40 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 		rc.publish(core.ToolDone{Result: tr})
 	}
 
-	// Serial if the agent forces it globally, or if any call in this batch
-	// targets a tool whose frozen implementation declares the SequentialTool
-	// capability — one such tool downgrades the whole batch, keeping the model's
-	// call order. A same-name injection counts by its own implementation.
-	needSeq := l.toolExec == ToolSequential
-	if !needSeq {
-		for _, c := range calls {
-			if lc.view.Tools().Sequential(c.Name) {
-				needSeq = true
-				break
-			}
+	segments := buildToolCallSegments(calls, lc.view.Tools(), l.toolExec)
+	dispatchStopped := false
+	for _, seg := range segments {
+		if dispatchStopped {
+			break
 		}
-	}
-	if needSeq {
-		for i := range calls {
+
+		if seg.serial {
+			i := seg.indexes[0]
 			if err := rc.checkWriteAccess(); err != nil {
 				recordRunErr(err)
 				break
 			}
 			rc.publish(core.ToolStarted{Call: calls[i]})
 			run(i, calls[i])
+			continue
 		}
-		return reportedToolResults(results, reported), dirs, rejects, errors.Join(append(afterErrs, runErrs...)...)
-	}
 
-	var wg sync.WaitGroup
-	for i := range calls {
-		if err := rc.checkWriteAccess(); err != nil {
-			recordRunErr(err)
-			break
+		var wg sync.WaitGroup
+		for _, i := range seg.indexes {
+			if err := rc.checkWriteAccess(); err != nil {
+				recordRunErr(err)
+				dispatchStopped = true
+				break
+			}
+			rc.publish(core.ToolStarted{Call: calls[i]})
+			wg.Add(1)
+			go func(i int, c core.ToolCall) {
+				defer wg.Done()
+				run(i, c)
+			}(i, calls[i])
 		}
-		rc.publish(core.ToolStarted{Call: calls[i]})
-		wg.Add(1)
-		go func(i int, c core.ToolCall) {
-			defer wg.Done()
-			run(i, c)
-		}(i, calls[i])
+		wg.Wait()
 	}
-	wg.Wait()
 	return reportedToolResults(results, reported), dirs, rejects, errors.Join(append(afterErrs, runErrs...)...)
 }
 

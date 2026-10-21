@@ -7,7 +7,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/jiujuan/goagent/agent"
 	"github.com/jiujuan/goagent/core"
@@ -265,31 +264,16 @@ func TestInjectionDoesNotLeakAcrossRuns(t *testing.T) {
 	}
 }
 
-// TestInjectedSequentialToolDowngradesBatch: a tool injected for a run carries the
-// same execution contract as a static one — declaring the SequentialTool
-// capability serializes the whole batch it appears in, even when the agent was
-// built with the default parallel mode.
-func TestInjectedSequentialToolDowngradesBatch(t *testing.T) {
-	var mu sync.Mutex
-	active, peak := 0, 0
-	track := func() {
-		mu.Lock()
-		active++
-		if active > peak {
-			peak = active
-		}
-		mu.Unlock()
-		time.Sleep(15 * time.Millisecond)
-		mu.Lock()
-		active--
-		mu.Unlock()
-	}
-	greedy := tool.New("greedy", "parallel-safe", func(_ *tool.Context, _ struct{}) (string, error) {
-		track()
-		return "g", nil
-	})
+// TestInjectedSequentialToolSerializesItsOwnSegment: a tool injected for a run
+// carries the same execution contract as a static one — declaring the
+// SequentialTool capability gives its own call a serial segment, while the
+// plain calls before it still run concurrently in their own segment.
+func TestInjectedSequentialToolSerializesItsOwnSegment(t *testing.T) {
+	group := newGateGroup(2)
+	t.Cleanup(group.open)
+	var seqActive atomic.Int32
 	serial := tool.AsSequential(tool.New("serial", "must not overlap", func(_ *tool.Context, _ struct{}) (string, error) {
-		track()
+		seqActive.Store(int32(group.act.current()))
 		return "s", nil
 	}))
 
@@ -299,15 +283,16 @@ func TestInjectedSequentialToolDowngradesBatch(t *testing.T) {
 		}
 		return &llm.Response{
 			Message: core.Message{Role: core.RoleAssistant, Parts: []core.Part{
-				core.ToolCall{ID: "c1", Name: "greedy", Args: json.RawMessage(`{}`)},
-				core.ToolCall{ID: "c2", Name: "serial", Args: json.RawMessage(`{}`)},
+				core.ToolCall{ID: "c1", Name: "greedy1", Args: json.RawMessage(`{}`)},
+				core.ToolCall{ID: "c2", Name: "greedy2", Args: json.RawMessage(`{}`)},
+				core.ToolCall{ID: "c3", Name: "serial", Args: json.RawMessage(`{}`)},
 			}},
 			StopReason: llm.StopToolUse,
 		}
 	})
-	a, _ := agent.New(
+	a, err := agent.New(
 		agent.WithModel(model),
-		agent.WithTools(greedy),
+		agent.WithTools(group.tool("greedy1"), group.tool("greedy2")),
 		agent.WithMiddleware(&injector{make: func(lc *agent.LoopContext) tool.Tool {
 			if lc.Step != 0 {
 				return nil
@@ -315,13 +300,27 @@ func TestInjectedSequentialToolDowngradesBatch(t *testing.T) {
 			return serial
 		}}),
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	coordErr := make(chan error, 1)
+	go func() {
+		err := waitSegmentStarts(group.started, 2, "plain calls")
+		group.open()
+		coordErr <- err
+	}()
+
 	if _, err := a.Stream(context.Background(), "go").Wait(); err != nil {
 		t.Fatal(err)
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if peak != 1 {
-		t.Fatalf("peak concurrent tools = %d, want 1: the injected tool's capability was not honored", peak)
+	awaitSegmentCoordinator(t, coordErr)
+
+	if peak := group.act.peakValue(); peak != 2 {
+		t.Fatalf("peak concurrent tools = %d, want 2: plain calls before the serial one must overlap", peak)
+	}
+	if got := seqActive.Load(); got != 0 {
+		t.Fatalf("serial tool saw %d handlers in flight, want 0", got)
 	}
 }
 
