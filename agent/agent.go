@@ -45,6 +45,11 @@ func New(opts ...Option) (*Agent, error) {
 	if c.claimLease <= 0 {
 		return nil, fmt.Errorf("agent: claim lease must be positive, got %v", c.claimLease)
 	}
+	switch c.stepSnapshotPolicy {
+	case StepSnapshotWarn, StepSnapshotStrict, StepSnapshotOff:
+	default:
+		return nil, fmt.Errorf("agent: unknown step snapshot policy %d", c.stepSnapshotPolicy)
+	}
 	if c.bus == nil {
 		c.bus = bus.New()
 	}

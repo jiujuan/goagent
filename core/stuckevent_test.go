@@ -81,3 +81,26 @@ func TestWindowTrimmedEventRoundTrip(t *testing.T) {
 		t.Fatalf("round trip = %#v, want %#v", out, in)
 	}
 }
+
+func TestStepViewDriftedEventRoundTrip(t *testing.T) {
+	in := StepViewDrifted{
+		Step:                   0,
+		BaselineStep:           3,
+		ExpectedToolDigest:     "old-tools",
+		ActualToolDigest:       "new-tools",
+		ExpectedSettingsDigest: "old-settings",
+		ActualSettingsDigest:   "new-settings",
+	}
+	data, err := MarshalEvent(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := out.(StepViewDrifted)
+	if !ok || got != in {
+		t.Fatalf("round trip = %#v, want %#v", out, in)
+	}
+}

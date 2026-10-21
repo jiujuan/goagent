@@ -60,6 +60,12 @@ func (r *Run) Resume(ctx context.Context) (*Run, error) {
 // only: a schema that changed since the pause surfaces when argument validation
 // runs the approved call.
 //
+// A resume with no pending batch records the checkpoint's step snapshot as its
+// replay baseline (unless the policy is StepSnapshotOff): the first view it
+// freezes is compared with that snapshot, and StepSnapshotPolicy decides whether
+// a difference is reported, rejected, or ignored. A pending batch does not set a
+// baseline; it executes first, and the step after it is a new view by design.
+//
 // It is also how a failed run is recovered: the loop checkpoints the last
 // replayable seam when a model call or a gate errors, so resuming continues the
 // conversation where it stopped instead of rewinding to the last completed step.
@@ -176,6 +182,12 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 	}
 
 	if cp.Pending == nil || len(cp.Pending.Pending) == 0 {
+		// The next step is a fresh model call, so the checkpoint's view is the
+		// replay baseline. A pending batch instead runs before any new view
+		// freezes, which makes the batch's step the wrong thing to compare.
+		if a.cfg.stepSnapshotPolicy != StepSnapshotOff && cp.Snapshot != nil {
+			run.rc.replayBaseline = cloneStepSnapshot(cp.Snapshot)
+		}
 		return run, nil
 	}
 	if a.loop == nil {

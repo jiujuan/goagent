@@ -33,6 +33,27 @@ var ErrToolNotAdvertised = errors.New("agent: tool was not advertised at the pau
 // are not persisted, so a batch that paused on one cannot be resumed.
 var ErrToolUnavailable = errors.New("agent: tool is no longer available")
 
+// ErrStepViewDrift is returned by StepSnapshotStrict when the first step frozen
+// after a resume differs from the step view the resumed checkpoint recorded.
+var ErrStepViewDrift = errors.New("agent: step view drifted from the resumed checkpoint")
+
+// StepSnapshotPolicy selects what a resume does when its first frozen step no
+// longer matches the step view the resumed checkpoint recorded. A mismatch is
+// usually a diagnosis — a system prompt that embeds a clock, a reworded tool
+// description — not a reason to refuse work, so the default only reports it.
+type StepSnapshotPolicy int
+
+const (
+	// StepSnapshotWarn publishes core.StepViewDrifted and continues (default).
+	StepSnapshotWarn StepSnapshotPolicy = iota
+	// StepSnapshotStrict fails with ErrStepViewDrift before the model call. The
+	// failure checkpoint carries the current view, so the next resume compares
+	// against what actually ran.
+	StepSnapshotStrict
+	// StepSnapshotOff skips the comparison entirely.
+	StepSnapshotOff
+)
+
 // StepView is one step's frozen, read-only view. The loop creates it once the
 // request is final (after ModifyRequest) and every later phase — the model call,
 // tool approval, tool execution and the step digest — reads the same data.
@@ -405,6 +426,38 @@ func (l *AgentLoop) freezeStepView(lc *LoopContext, req *llm.Request) (*StepView
 		},
 	}
 	return view, nil
+}
+
+// checkReplayDrift compares the first view frozen after a resume with the
+// checkpoint's snapshot and consumes the baseline: later steps belong to the
+// resumed run's own settings, not to the paused view. A nil baseline (pending
+// batch, legacy checkpoint, off policy) does nothing. An empty baseline digest
+// skips that half of the comparison, so a hand-built snapshot cannot produce a
+// false positive.
+func (l *AgentLoop) checkReplayDrift(lc *LoopContext, view *StepView) error {
+	base := lc.replayBaseline
+	lc.replayBaseline = nil
+	if base == nil || l.stepSnapshotPolicy == StepSnapshotOff {
+		return nil
+	}
+	toolDrift := base.ToolDigest != "" && view.digest.ToolDigest != "" && base.ToolDigest != view.digest.ToolDigest
+	settingsDrift := base.SettingsDigest != "" && view.digest.SettingsDigest != "" && base.SettingsDigest != view.digest.SettingsDigest
+	if !toolDrift && !settingsDrift {
+		return nil
+	}
+	if l.stepSnapshotPolicy == StepSnapshotStrict {
+		return fmt.Errorf("%w: step %d differs from baseline step %d (tools changed: %t, settings changed: %t)",
+			ErrStepViewDrift, view.step, base.Step, toolDrift, settingsDrift)
+	}
+	lc.publish(core.StepViewDrifted{
+		Step:                   view.step,
+		BaselineStep:           base.Step,
+		ExpectedToolDigest:     base.ToolDigest,
+		ActualToolDigest:       view.digest.ToolDigest,
+		ExpectedSettingsDigest: base.SettingsDigest,
+		ActualSettingsDigest:   view.digest.SettingsDigest,
+	})
+	return nil
 }
 
 // upsertSchema replaces the schema of an existing name in place and appends a

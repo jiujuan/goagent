@@ -34,6 +34,13 @@ type RunContext struct {
 	// and consumed once by the loop before its first model call (see hitl.go).
 	resumed *resumeBatch
 
+	// replayBaseline is the step snapshot a resume without a pending batch
+	// compares its first frozen step against; the loop takes it once. It is
+	// deliberately not copied by deeper, subRun or forBranch: a derived run
+	// freezes its own view, and the parent's baseline describes a conversation
+	// the child does not share.
+	replayBaseline *checkpoint.StepSnapshot
+
 	// durable holds state that must travel with a resumed execution until its
 	// next checkpoint commit. It is shared by nested contexts so a child cannot
 	// bypass the parent's inbox acknowledgements or resume fencing token.

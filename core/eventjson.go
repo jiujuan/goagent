@@ -41,6 +41,12 @@ type eventWire struct {
 	Recovery  string            `json:"recovery,omitempty"`
 	Approval  *ApprovalDecision `json:"approval,omitempty"`
 	Duplicate bool              `json:"duplicate,omitempty"`
+
+	BaselineStep           int    `json:"baseline_step,omitempty"`
+	ExpectedToolDigest     string `json:"expected_tool_digest,omitempty"`
+	ActualToolDigest       string `json:"actual_tool_digest,omitempty"`
+	ExpectedSettingsDigest string `json:"expected_settings_digest,omitempty"`
+	ActualSettingsDigest   string `json:"actual_settings_digest,omitempty"`
 }
 
 // MarshalEvent encodes an Event to tagged JSON.
@@ -101,6 +107,10 @@ func MarshalEvent(ev Event) ([]byte, error) {
 		w.Type, w.Strategy, w.Dropped, w.Kept, w.EstTok, w.Step = "window_trimmed", e.Strategy, e.Dropped, e.Kept, e.EstTokens, e.Step
 	case ArgRejected:
 		w.Type, w.Tool, w.Class, w.Count, w.Step = "arg_rejected", e.Tool, e.Class, e.Count, e.Step
+	case StepViewDrifted:
+		w.Type, w.Step, w.BaselineStep = "step_view_drifted", e.Step, e.BaselineStep
+		w.ExpectedToolDigest, w.ActualToolDigest = e.ExpectedToolDigest, e.ActualToolDigest
+		w.ExpectedSettingsDigest, w.ActualSettingsDigest = e.ExpectedSettingsDigest, e.ActualSettingsDigest
 	default:
 		return nil, fmt.Errorf("core: cannot marshal event of type %T", ev)
 	}
@@ -161,6 +171,15 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		return WindowTrimmed{Strategy: w.Strategy, Dropped: w.Dropped, Kept: w.Kept, EstTokens: w.EstTok, Step: w.Step}, nil
 	case "arg_rejected":
 		return ArgRejected{Tool: w.Tool, Class: w.Class, Count: w.Count, Step: w.Step}, nil
+	case "step_view_drifted":
+		return StepViewDrifted{
+			Step:                   w.Step,
+			BaselineStep:           w.BaselineStep,
+			ExpectedToolDigest:     w.ExpectedToolDigest,
+			ActualToolDigest:       w.ActualToolDigest,
+			ExpectedSettingsDigest: w.ExpectedSettingsDigest,
+			ActualSettingsDigest:   w.ActualSettingsDigest,
+		}, nil
 	default:
 		return nil, fmt.Errorf("core: unknown event type %q", w.Type)
 	}

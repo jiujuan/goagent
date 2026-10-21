@@ -43,6 +43,8 @@ type AgentLoop struct {
 	byName      map[string]tool.Tool
 	schemas     []llm.ToolSchema
 	maxTurns    int
+
+	stepSnapshotPolicy StepSnapshotPolicy
 }
 
 func newLoop(c config) *AgentLoop {
@@ -65,6 +67,8 @@ func newLoop(c config) *AgentLoop {
 		byName:      tool.ByName(c.tools),
 		schemas:     tool.Schemas(c.tools),
 		maxTurns:    ms,
+
+		stepSnapshotPolicy: c.stepSnapshotPolicy,
 	}
 }
 
@@ -203,6 +207,9 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 			return l.fail(rc, step, history, lc.viewSnapshot(), err)
 		}
 		lc.view = view
+		if err := l.checkReplayDrift(lc, view); err != nil {
+			return l.fail(rc, step, history, view.snapshot(), err)
+		}
 
 		// Derive the context for this model call. An observability middleware
 		// (ModelContexter) injects its span here so the provider call — and any

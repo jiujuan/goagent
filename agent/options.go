@@ -29,6 +29,7 @@ type config struct {
 	modelOpts                 []llm.Option
 	outputKey                 string
 	requireThreadCoordination bool
+	stepSnapshotPolicy        StepSnapshotPolicy
 
 	// delegation toggles (see transfer.go)
 	noTransfer       bool
@@ -117,6 +118,16 @@ func WithToolTimeout(d time.Duration) Option { return func(c *config) { c.toolTi
 // queue.ManagedRunWorker. A heartbeat on the task record never renews this claim, and this
 // claim's renewal never writes a task record (ADR-0034 D6).
 func WithClaimLease(d time.Duration) Option { return func(c *config) { c.claimLease = d } }
+
+// WithStepSnapshotPolicy selects how a resume reacts when its first frozen step
+// differs from the step view recorded by the resumed checkpoint. The default
+// StepSnapshotWarn publishes core.StepViewDrifted and continues;
+// StepSnapshotStrict fails with ErrStepViewDrift before the model call;
+// StepSnapshotOff skips the comparison. A resume that carries a pending tool
+// batch never compares, because the batch executes before any new view freezes.
+func WithStepSnapshotPolicy(p StepSnapshotPolicy) Option {
+	return func(c *config) { c.stepSnapshotPolicy = p }
+}
 
 // WithOutputKey writes this agent's final answer text into State.KV under key,
 // for inter-stage coordination in a workflow. Later stages reference it in their

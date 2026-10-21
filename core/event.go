@@ -159,6 +159,22 @@ type ArgRejected struct {
 	Step  int
 }
 
+// StepViewDrifted is emitted by the default step-snapshot policy when the first
+// step frozen after a resume differs from the view the resumed checkpoint
+// recorded. Tool and settings digests are reported separately so the change is
+// attributable; an empty expected digest means that half was not compared (a
+// legacy or hand-built snapshot). The run continues: this is a diagnosis, not a
+// veto — StepSnapshotStrict turns the same difference into ErrStepViewDrift
+// before the model is called.
+type StepViewDrifted struct {
+	Step                   int
+	BaselineStep           int
+	ExpectedToolDigest     string
+	ActualToolDigest       string
+	ExpectedSettingsDigest string
+	ActualSettingsDigest   string
+}
+
 // --- Marker -----------------------------------------------------------------
 
 func (RunStarted) isEvent()       {}
@@ -181,6 +197,7 @@ func (BudgetExceeded) isEvent()   {}
 func (HistoryCompacted) isEvent() {}
 func (WindowTrimmed) isEvent()    {}
 func (ArgRejected) isEvent()      {}
+func (StepViewDrifted) isEvent()  {}
 
 // --- Payload types ----------------------------------------------------------
 
