@@ -52,6 +52,14 @@ func (r *Run) Resume(ctx context.Context) (*Run, error) {
 // approved calls execute, rejected (or undecided) calls become error
 // ToolResults reported to the model.
 //
+// Before taking the resume claim it checks the pending batch against the paused
+// step view: every call must name a tool that view advertised
+// (ErrToolNotAdvertised) and that the current tool table still resolves
+// (ErrToolUnavailable). Runtime-injected tools are not persisted, so a batch
+// that paused on one cannot resume. The check compares names and resolvability
+// only: a schema that changed since the pause surfaces when argument validation
+// runs the approved call.
+//
 // It is also how a failed run is recovered: the loop checkpoints the last
 // replayable seam when a model call or a gate errors, so resuming continues the
 // conversation where it stopped instead of rewinding to the last completed step.
@@ -74,6 +82,9 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		return nil, fmt.Errorf("agent: no checkpoint to resume for thread %q", threadID)
 	}
 	if err := validatePause(cp); err != nil {
+		return nil, err
+	}
+	if err := a.preflightResumeTools(cp); err != nil {
 		return nil, err
 	}
 	var (
@@ -199,6 +210,37 @@ func validatePause(cp *checkpoint.Checkpoint) error {
 		}
 	default:
 		return fmt.Errorf("agent: unsupported checkpoint pause recovery %q", cp.Pause.Recovery)
+	}
+	return nil
+}
+
+// preflightResumeTools rejects a paused batch before a resume claim is taken.
+// With a paused snapshot every call must name a tool that snapshot advertised;
+// without one (legacy checkpoints) only resolvability is checked. In both cases
+// the name must resolve in the current static table, because runtime-injected
+// tools are scoped to one run and are not restored across resume. Only names
+// and resolvability are checked here: a schema that changed since the pause is
+// caught by argument validation when the approved call executes.
+func (a *Agent) preflightResumeTools(cp *checkpoint.Checkpoint) error {
+	if a.loop == nil || cp.Pending == nil || len(cp.Pending.Pending) == 0 {
+		return nil
+	}
+	var advertised map[string]struct{}
+	if cp.Snapshot != nil {
+		advertised = make(map[string]struct{}, len(cp.Snapshot.Advertised))
+		for _, name := range cp.Snapshot.Advertised {
+			advertised[name] = struct{}{}
+		}
+	}
+	for _, call := range cp.Pending.Pending {
+		if advertised != nil {
+			if _, ok := advertised[call.Name]; !ok {
+				return fmt.Errorf("%w: thread %q call %q requested tool %q", ErrToolNotAdvertised, cp.ThreadID, call.ID, call.Name)
+			}
+		}
+		if _, ok := a.loop.byName[call.Name]; !ok {
+			return fmt.Errorf("%w: thread %q call %q requested tool %q; runtime-injected tools do not survive resume", ErrToolUnavailable, cp.ThreadID, call.ID, call.Name)
+		}
 	}
 	return nil
 }

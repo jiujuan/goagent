@@ -23,6 +23,16 @@ import (
 // tools cannot spend a request on a table execution could not honor.
 var ErrToolViewInvalid = errors.New("agent: step view invalid")
 
+// ErrToolNotAdvertised is returned when a resumed batch names a tool the paused
+// step never advertised. The batch was approved against that advertisement, so
+// resuming under a different one would silently swap what the human approved.
+var ErrToolNotAdvertised = errors.New("agent: tool was not advertised at the pause")
+
+// ErrToolUnavailable is returned when a resumed batch names a tool the current
+// static table cannot resolve. Runtime-injected tools are scoped to one run and
+// are not persisted, so a batch that paused on one cannot be resumed.
+var ErrToolUnavailable = errors.New("agent: tool is no longer available")
+
 // StepView is one step's frozen, read-only view. The loop creates it once the
 // request is final (after ModifyRequest) and every later phase — the model call,
 // tool approval, tool execution and the step digest — reads the same data.
@@ -300,11 +310,12 @@ func (l *AgentLoop) snapshotTools(rc *RunContext) runToolTable {
 	return table
 }
 
-// resumeStepView builds the view a resumed batch executes under. Without a
-// paused snapshot (every checkpoint until snapshots are persisted) the names
-// come from the batch itself and the digest is empty. Tools the current static
-// table no longer has stay advertised by name but cannot resolve; the restore
-// preflight added later rejects that case before execution.
+// resumeStepView builds the view a resumed batch executes under. With a paused
+// snapshot the advertised names, digests and model come from it; without one
+// (legacy checkpoints) the names come from the batch itself and the digest is
+// empty. Implementations resolve through the current static table in both
+// cases: runtime-injected tools were never persisted, and preflightResumeTools
+// has already rejected a paused batch that cannot resolve.
 func (l *AgentLoop) resumeStepView(rb *resumeBatch) *StepView {
 	tv := ToolView{
 		byName:     make(map[string]tool.Tool, len(rb.calls)),
@@ -314,23 +325,40 @@ func (l *AgentLoop) resumeStepView(rb *resumeBatch) *StepView {
 	for name := range l.byName {
 		tv.known[name] = struct{}{}
 	}
-	seen := make(map[string]struct{}, len(rb.calls))
-	for _, c := range rb.calls {
-		if _, ok := seen[c.Name]; ok {
-			continue
+	view := &StepView{step: rb.step}
+
+	var names []string
+	if rb.snapshot != nil {
+		names = rb.snapshot.Advertised
+		view.model = rb.snapshot.Model
+		view.digest = StepDigest{
+			ToolDigest:     rb.snapshot.ToolDigest,
+			SettingsDigest: rb.snapshot.SettingsDigest,
+			Advertised:     slices.Clone(rb.snapshot.Advertised),
 		}
-		seen[c.Name] = struct{}{}
-		tv.names = append(tv.names, c.Name)
-		t, ok := l.byName[c.Name]
+	} else {
+		seen := make(map[string]struct{}, len(rb.calls))
+		for _, c := range rb.calls {
+			if _, ok := seen[c.Name]; ok {
+				continue
+			}
+			seen[c.Name] = struct{}{}
+			names = append(names, c.Name)
+		}
+	}
+	for _, name := range names {
+		tv.names = append(tv.names, name)
+		t, ok := l.byName[name]
 		if !ok {
 			continue
 		}
-		tv.byName[c.Name] = t
-		tv.sequential[c.Name] = isSequentialTool(t)
-		tv.known[c.Name] = struct{}{}
+		tv.byName[name] = t
+		tv.sequential[name] = isSequentialTool(t)
+		tv.known[name] = struct{}{}
 		tv.advertised = append(tv.advertised, tool.SchemaOf(t))
 	}
-	return &StepView{step: rb.step, tools: tv}
+	view.tools = tv
+	return view
 }
 
 // freezeStepView validates the final request against the runtime tool tables

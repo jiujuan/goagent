@@ -691,16 +691,29 @@ func TestResumeBatchHasFallbackView(t *testing.T) {
 		}
 		return mock.CallTool("c1", "danger", `{}`)
 	})
+	store := checkpoint.NewMemory()
 	a, err := agent.New(
 		agent.WithModel(model),
 		agent.WithTools(danger),
 		agent.WithMiddleware(&gateOnce{}, spy),
-		agent.WithCheckpointer(checkpoint.NewMemory()),
+		agent.WithCheckpointer(store),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	run, pending := pauseOn(t, a, ctx, "go")
+	// Pauses persist a snapshot since SV-02; strip it to reproduce the legacy
+	// record this fallback covers.
+	paused, err := store.Latest(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := *paused
+	legacy.ID = "legacy-fallback"
+	legacy.Snapshot = nil
+	if err := store.Save(ctx, &legacy); err != nil {
+		t.Fatal(err)
+	}
 	run.Decide(agent.Allow(pending[0].CallID))
 	cont, err := run.Resume(ctx)
 	if err != nil {
