@@ -73,7 +73,7 @@ type StepView struct {
 }
 
 // ToolView is the frozen tool table: what this step advertised, what each name
-// resolves to, and which implementations force a serial batch.
+// resolves to, and which implementations require a serial segment.
 type ToolView struct {
 	advertised []llm.ToolSchema
 	byName     map[string]tool.Tool
@@ -235,8 +235,8 @@ func (tv *ToolView) Resolve(name string) (tool.Tool, bool) {
 	return t, ok
 }
 
-// Sequential reports whether the implementation behind name forces its batch to
-// run one call at a time.
+// Sequential reports whether the implementation behind name requires its own
+// call to run alone.
 func (tv *ToolView) Sequential(name string) bool {
 	if tv == nil {
 		return false

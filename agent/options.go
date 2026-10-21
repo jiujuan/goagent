@@ -93,13 +93,14 @@ func WithoutTransfer() Option { return func(c *config) { c.noTransfer = true } }
 func WithMaxTurns(n int) Option { return func(c *config) { c.maxTurns = n } }
 
 // WithToolExecution selects concurrent (default) or sequential tool execution.
-// Note: a tool wrapped with tool.AsSequential downgrades its whole batch to
-// serial regardless of this mode.
+// Note: a tool wrapped with tool.AsSequential still gives its own call a serial
+// segment regardless of this mode; the consecutive calls around it remain
+// concurrent in their own segments.
 func WithToolExecution(m ToolExecMode) Option { return func(c *config) { c.toolExec = m } }
 
 // WithToolTimeout bounds how long a single tool call may run (default 0 = no
-// bound). It is per call, not per batch: a sequential batch of N slow tools can
-// each use the full duration. When it fires, the context handed to the tool is
+// bound). It is per call, not per segment: each slow call in a serial segment
+// can use the full duration. When it fires, the context handed to the tool is
 // cancelled, so a tool that watches its context returns early; Go cannot stop a
 // function that is already running, so a tool that ignores the context keeps
 // executing. Total wall-clock for a whole run is RunBudget.MaxDuration's job,

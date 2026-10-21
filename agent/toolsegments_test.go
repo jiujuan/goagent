@@ -141,9 +141,9 @@ func segmentCallModel(calls ...core.ToolCall) *mock.Model {
 	})
 }
 
-// assertToolResultOrder finds the last tool-role message in the latest
-// checkpoint and asserts the results kept the model's call order.
-func assertToolResultOrder(t *testing.T, store checkpoint.Checkpointer, thread string, want ...string) {
+// latestToolResults finds the last tool-role message in the latest checkpoint
+// and returns its results.
+func latestToolResults(t *testing.T, store checkpoint.Checkpointer, thread string) []core.ToolResult {
 	t.Helper()
 	cp, err := store.Latest(context.Background(), thread)
 	if err != nil {
@@ -162,14 +162,31 @@ func assertToolResultOrder(t *testing.T, store checkpoint.Checkpointer, thread s
 	if last == nil {
 		t.Fatalf("checkpoint has no tool message: %+v", cp.State.Messages)
 	}
-	if len(last.Parts) != len(want) {
-		t.Fatalf("tool message has %d results, want %d: %+v", len(last.Parts), len(want), last.Parts)
-	}
-	for i, name := range want {
-		tr, ok := last.Parts[i].(core.ToolResult)
-		if !ok || tr.Name != name {
-			t.Fatalf("tool result[%d] = %#v, want %q", i, last.Parts[i], name)
+	results := make([]core.ToolResult, len(last.Parts))
+	for i, p := range last.Parts {
+		tr, ok := p.(core.ToolResult)
+		if !ok {
+			t.Fatalf("tool message part[%d] = %#v, want core.ToolResult", i, p)
 		}
+		results[i] = tr
+	}
+	return results
+}
+
+func toolResultNames(results []core.ToolResult) []string {
+	names := make([]string, len(results))
+	for i, tr := range results {
+		names[i] = tr.Name
+	}
+	return names
+}
+
+// assertToolResultOrder asserts the model-visible results kept its call order.
+func assertToolResultOrder(t *testing.T, store checkpoint.Checkpointer, thread string, want ...string) {
+	t.Helper()
+	results := latestToolResults(t, store, thread)
+	if got := toolResultNames(results); !slices.Equal(got, want) {
+		t.Fatalf("tool result order = %v, want %v", got, want)
 	}
 }
 

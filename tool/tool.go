@@ -86,13 +86,15 @@ type ArgumentPreparer interface {
 }
 
 // SequentialTool is an optional capability: a tool that must not run alongside
-// other tools in the same batch (rate-limited API, non-reentrant resource,
-// order-sensitive side effects). If any call in a parallel batch targets such a
-// tool, the whole batch executes one at a time, in the model's call order.
+// other calls in the same step (rate-limited API, non-reentrant resource,
+// order-sensitive side effects). Its own call gets a serial segment and runs
+// alone; consecutive calls around it still run concurrently in their own
+// segments, and every segment keeps the model's call order.
 type SequentialTool interface{ SequentialExecution() bool }
 
-// AsSequential marks any tool as sequential-executing, forcing its batches to
-// run one at a time regardless of the agent's ToolExecMode.
+// AsSequential marks any tool as sequential-executing: its own call runs in a
+// separate serial segment regardless of the agent's ToolExecMode, without
+// changing the concurrency of the consecutive calls around it.
 func AsSequential(t Tool) Tool { return sequentialTool{t} }
 
 type sequentialTool struct{ Tool }

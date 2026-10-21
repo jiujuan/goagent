@@ -17,7 +17,7 @@ import (
 // loop folds a phase's directives by precedence (core.Resolve). Embed
 // BaseMiddleware to get no-op defaults and override only the hooks you need.
 //
-// AfterTool may run concurrently across a parallel tool batch, so its
+// AfterTool may run concurrently across a parallel segment, so its
 // implementation must be goroutine-safe.
 type Middleware interface {
 	BeforeModel(*LoopContext) (core.Directive, error)
