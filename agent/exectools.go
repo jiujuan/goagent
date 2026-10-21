@@ -37,6 +37,9 @@ import (
 // batch has settled, so completed results are still available for the failure
 // checkpoint instead of silently disappearing with the hook error.
 func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.ToolCall) ([]core.Part, []core.Directive, []ToolRejection, error) {
+	if lc.view == nil {
+		return nil, nil, nil, errors.New("agent: tool execution requires a frozen step view")
+	}
 	if err := rc.checkWriteAccess(); err != nil {
 		return nil, nil, nil, err
 	}
@@ -141,13 +144,13 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 	}
 
 	// Serial if the agent forces it globally, or if any call in this batch
-	// targets a tool declaring the SequentialTool capability — one such tool
-	// downgrades the whole batch, keeping the model's call order. Tools injected
-	// for this run count the same way (isSequential).
+	// targets a tool whose frozen implementation declares the SequentialTool
+	// capability — one such tool downgrades the whole batch, keeping the model's
+	// call order. A same-name injection counts by its own implementation.
 	needSeq := l.toolExec == ToolSequential
 	if !needSeq {
 		for _, c := range calls {
-			if l.isSequential(rc, c.Name) {
+			if lc.view.Tools().Sequential(c.Name) {
 				needSeq = true
 				break
 			}
@@ -300,18 +303,27 @@ func cancelledResult(c core.ToolCall) core.ToolResult {
 
 // callOne dispatches a single tool call, returning its result plus any control
 // directive and state ops the tool requested. The name resolves against the
-// run's injected tools first, then the agent's own table. Unknown tools, rejected
-// or schema-invalid arguments, and handler errors all become error ToolResults
-// reported back to the model — the handler never runs for a bad call — and each
-// one carries the rejection class alongside, which is what ToolRejecter observes.
+// step's frozen view: a tool that was not advertised is refused, and an
+// advertised name runs the implementation frozen with it. Unknown tools,
+// rejected or schema-invalid arguments, and handler errors all become error
+// ToolResults reported back to the model — the handler never runs for a bad
+// call — and each one carries the rejection class alongside, which is what
+// ToolRejecter observes.
 func (l *AgentLoop) callOne(lc *LoopContext, callCtx context.Context, c core.ToolCall) toolOutcome {
-	// Run-scoped injections resolve first, so a middleware can replace an
-	// agent-level tool by name or supply one the agent was built without.
-	t, ok := lc.dynamic.lookup(c.Name)
-	if !ok {
-		t, ok = l.byName[c.Name]
+	// The frozen view is the single source of truth: only a tool this step
+	// advertised may run, and it runs the implementation frozen for that name.
+	tv := lc.view.Tools()
+	if !tv.Advertised(c.Name) {
+		if tv.knownName(c.Name) {
+			return rejected(c, RejectNotAdvertised, fmt.Sprintf(
+				"tool %q is not advertised in this step, so it cannot be called; use only the tools listed for this step", c.Name))
+		}
+		return rejected(c, RejectUnknownTool, "unknown tool: "+c.Name)
 	}
+	t, ok := tv.Resolve(c.Name)
 	if !ok {
+		// Only a legacy resumed batch can advertise a name whose implementation
+		// has since disappeared. Restore preflight rejects that before it runs.
 		return rejected(c, RejectUnknownTool, "unknown tool: "+c.Name)
 	}
 	raw := c.Args
@@ -507,18 +519,3 @@ func (rc *RunContext) UpdateTool(callID string, p core.Part) {
 }
 
 var _ tool.Updater = (*RunContext)(nil)
-
-// isSequential reports whether the tool behind name must not share a batch with others.
-// Both tables count: the agent's own capability flags recorded at construction,
-// and the run's injected tools resolved by name.
-func (l *AgentLoop) isSequential(rc *RunContext, name string) bool {
-	if l.seqTool[name] {
-		return true
-	}
-	t, ok := rc.dynamic.lookup(name)
-	if !ok {
-		return false
-	}
-	s, ok := t.(tool.SequentialTool)
-	return ok && s.SequentialExecution()
-}

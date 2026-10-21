@@ -36,11 +36,12 @@ type Middleware interface {
 type RejectClass int
 
 const (
-	RejectUnknownTool   RejectClass = iota // name not in either tool table
+	RejectUnknownTool   RejectClass = iota // name not in the frozen runtime tool table
 	RejectPrepareFailed                    // ArgumentPreparer rejected the args
 	RejectSchemaInvalid                    // tool.Validate rejected the args
 	RejectHandlerError                     // the handler returned a Go error
 	RejectTimedOut                         // abandoned at its bound (ADR-0029)
+	RejectNotAdvertised                    // in the runtime table, but not advertised in this step
 )
 
 func (k RejectClass) String() string {
@@ -55,6 +56,8 @@ func (k RejectClass) String() string {
 		return "handler_error"
 	case RejectTimedOut:
 		return "timed_out"
+	case RejectNotAdvertised:
+		return "not_advertised"
 	default:
 		return "unknown"
 	}
@@ -70,7 +73,8 @@ type ToolRejection struct {
 }
 
 // ToolRejecter is an optional middleware capability for observing rejected tool
-// calls: unknown names, rejected arguments, handler errors, abandoned timeouts.
+// calls: unknown names, names this step did not advertise, rejected arguments,
+// handler errors, abandoned timeouts.
 // The loop dispatches a batch's rejections after execTools returns and before the
 // step is checkpointed, so the hook runs serially on the loop's goroutine — unlike
 // AfterTool it needs no goroutine safety, and State.KV writes it makes are

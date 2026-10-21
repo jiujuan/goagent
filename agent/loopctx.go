@@ -17,6 +17,7 @@ type LoopContext struct {
 	MaxTurns int // the loop's step cap, for budget/wrap-up middleware to observe
 	Request  *llm.Request
 	History  []core.Message
+	view     *StepView
 	approved map[toolApprovalKey]struct{}
 }
 
@@ -53,10 +54,17 @@ func toolApprovalKeyFor(c core.ToolCall) toolApprovalKey {
 // is rendered once per run before the first step, so it still describes the
 // agent's original tools; call this from ModifyRequest, where the advertisement
 // is picked up for that step and every later one.
+//
+// The step's frozen view is immutable. Until the view is frozen (BeforeModel,
+// ModifyRequest and before) a call also updates the request being built, so the
+// tool is advertised and callable in the current step. After the freeze
+// (AfterModel, CheckToolPolicy, BeforeTool, AfterTool and later) it only writes
+// the run's injection table: the current step keeps the tools it froze, and the
+// injection takes effect from the next step.
 func (lc *LoopContext) AddTool(t tool.Tool) {
 	lc.RunContext.dynamic.set(t)
-	if lc.Request == nil {
+	if lc.view != nil || lc.Request == nil {
 		return
 	}
-	lc.Request.Tools = mergeSchema(lc.Request.Tools, tool.SchemaOf(t))
+	lc.Request.Tools = upsertSchema(lc.Request.Tools, tool.SchemaOf(t))
 }

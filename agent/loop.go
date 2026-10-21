@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"errors"
-	"slices"
 	"time"
 
 	"github.com/jiujuan/goagent/checkpoint"
@@ -42,7 +41,6 @@ type AgentLoop struct {
 	mw          *Stack
 	tools       []tool.Tool
 	byName      map[string]tool.Tool
-	seqTool     map[string]bool // tools declaring the SequentialTool capability
 	schemas     []llm.ToolSchema
 	maxTurns    int
 }
@@ -51,12 +49,6 @@ func newLoop(c config) *AgentLoop {
 	ms := c.maxTurns
 	if ms <= 0 {
 		ms = defaultMaxTurns
-	}
-	seq := make(map[string]bool, len(c.tools))
-	for _, t := range c.tools {
-		if s, ok := t.(tool.SequentialTool); ok && s.SequentialExecution() {
-			seq[t.Name()] = true
-		}
 	}
 	return &AgentLoop{
 		model:       c.model,
@@ -71,7 +63,6 @@ func newLoop(c config) *AgentLoop {
 		mw:          NewStack(c.middleware...),
 		tools:       c.tools,
 		byName:      tool.ByName(c.tools),
-		seqTool:     seq,
 		schemas:     tool.Schemas(c.tools),
 		maxTurns:    ms,
 	}
@@ -80,36 +71,11 @@ func newLoop(c config) *AgentLoop {
 var _ Runnable = (*AgentLoop)(nil)
 
 // addTool registers an extra tool (e.g. the synthetic transfer_to_agent) after
-// construction, advertising it to the model.
+// construction, advertising it to the model. A name registered twice keeps one
+// slot and the last implementation.
 func (l *AgentLoop) addTool(t tool.Tool) {
 	l.byName[t.Name()] = t
-	if s, ok := t.(tool.SequentialTool); ok && s.SequentialExecution() {
-		l.seqTool[t.Name()] = true
-	}
-	l.schemas = mergeSchema(l.schemas, tool.SchemaOf(t))
-}
-
-// advertised lists the tools offered to the model for one step: the agent's own,
-// then any tool the run's middleware injected. An injected name is never listed
-// twice; if the agent already had a tool of that name the static slot stays and
-// callOne resolves the call against the injected tool instead (see exectools.go).
-func (l *AgentLoop) advertised(rc *RunContext) []llm.ToolSchema {
-	out := slices.Clone(l.schemas)
-	for _, s := range rc.dynamic.advertised() {
-		out = mergeSchema(out, s)
-	}
-	return out
-}
-
-// mergeSchema appends s unless a schema of that name is already listed, so a tool
-// injected mid-run keeps exactly one advertisement slot across steps.
-func mergeSchema(list []llm.ToolSchema, s llm.ToolSchema) []llm.ToolSchema {
-	for _, have := range list {
-		if have.Name == s.Name {
-			return list
-		}
-	}
-	return append(list, s)
+	l.schemas = upsertSchema(l.schemas, tool.SchemaOf(t))
 }
 
 func (l *AgentLoop) run(rc *RunContext) runOutcome {
@@ -123,6 +89,7 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 	if rb := rc.resumed; rb != nil {
 		rc.resumed = nil
 		rlc := &LoopContext{RunContext: rc, Step: rb.step, MaxTurns: l.maxTurns, History: history}
+		rlc.view = l.resumeStepView(rb)
 		if err := l.mw.CheckToolPolicy(rlc, rb.calls); err != nil {
 			return l.fail(rc, rb.step, history, err)
 		}
@@ -221,12 +188,17 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		if !usePrompt {
 			sys = renderTemplate(l.instruction, rc.State.KV)
 		}
-		req := &llm.Request{System: sys, Messages: history, Tools: l.advertised(rc)}
+		req := &llm.Request{System: sys, Messages: history, Tools: l.snapshotTools(rc).schemas}
 		req.Options.Apply(l.modelOpts...)
 		lc.Request = req
 		if err := l.mw.ModifyRequest(lc, req); err != nil {
 			return l.fail(rc, step, history, err)
 		}
+		view, err := l.freezeStepView(lc, req)
+		if err != nil {
+			return l.fail(rc, step, history, err)
+		}
+		lc.view = view
 
 		// Derive the context for this model call. An observability middleware
 		// (ModelContexter) injects its span here so the provider call — and any

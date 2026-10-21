@@ -2,13 +2,11 @@ package agent
 
 import (
 	"context"
-	"slices"
 	"sync"
 
 	"github.com/jiujuan/goagent/bus"
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
-	"github.com/jiujuan/goagent/llm"
 	"github.com/jiujuan/goagent/tool"
 )
 
@@ -167,22 +165,18 @@ func (d *dynamicTools) lookup(name string) (tool.Tool, bool) {
 	return t, ok
 }
 
-// advertised lists every injected tool for the model, in name order so the
-// advertisement is stable across steps and runs.
-func (d *dynamicTools) advertised() []llm.ToolSchema {
+// snapshot copies the injected table so one step builds its tool view from a
+// consistent read while other goroutines may still write injections for later
+// steps.
+func (d *dynamicTools) snapshot() map[string]tool.Tool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if len(d.byName) == 0 {
 		return nil
 	}
-	names := make([]string, 0, len(d.byName))
-	for name := range d.byName {
-		names = append(names, name)
-	}
-	slices.Sort(names)
-	out := make([]llm.ToolSchema, 0, len(names))
-	for _, name := range names {
-		out = append(out, tool.SchemaOf(d.byName[name]))
+	out := make(map[string]tool.Tool, len(d.byName))
+	for name, t := range d.byName {
+		out[name] = t
 	}
 	return out
 }
