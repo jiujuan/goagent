@@ -53,6 +53,12 @@ func (m *scriptModel) history() [][]core.Message {
 	return out
 }
 
+func (m *scriptModel) requests() []*llm.Request {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]*llm.Request(nil), m.reqs...)
+}
+
 func (m *scriptModel) calls() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()

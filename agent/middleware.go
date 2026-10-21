@@ -159,6 +159,17 @@ type HistoryCompacter interface {
 	CompactHistory(lc *LoopContext, history []core.Message) []core.Message
 }
 
+// ContextOverflowRecoverer is an optional middleware capability for surviving a
+// typed context-length overflow inside the step that hit it. The loop consults
+// it only when the failed call emitted nothing, the run context is still live
+// and the step's recovery budget has a round left. The returned history replaces
+// the working history and the request is rebuilt from the frozen step view, so
+// no BeforeModel/ModifyRequest rewrite runs a second time. changed=true with an
+// empty or non-shrinking result is ignored: the fold requires strict shrink.
+type ContextOverflowRecoverer interface {
+	RecoverContext(lc *LoopContext, history []core.Message, overflow *llm.ContextLengthError) ([]core.Message, bool)
+}
+
 // BaseMiddleware provides no-op defaults (every hook returns Continue, nil).
 // Embed it so a concrete middleware overrides only the hooks it cares about.
 type BaseMiddleware struct{}
@@ -276,6 +287,26 @@ func (s *Stack) CompactHistory(lc *LoopContext, history []core.Message) []core.M
 		}
 	}
 	return history
+}
+
+// RecoverContext folds the optional ContextOverflowRecoverer capability across
+// the stack in registration order and returns the first result that actually
+// shrinks the history. The strict-shrink check lives here, not in each
+// recoverer: changed=true alone is not trusted, and an empty or equal-length
+// result falls through to the next implementer. With no implementer, or none
+// that shrinks, it returns the original history and false.
+func (s *Stack) RecoverContext(lc *LoopContext, history []core.Message, overflow *llm.ContextLengthError) ([]core.Message, bool) {
+	for _, m := range s.mws {
+		r, ok := m.(ContextOverflowRecoverer)
+		if !ok {
+			continue
+		}
+		out, changed := r.RecoverContext(lc, history, overflow)
+		if changed && len(out) > 0 && len(out) < len(history) {
+			return out, true
+		}
+	}
+	return history, false
 }
 
 func (s *Stack) AfterModel(lc *LoopContext, resp *llm.Response) (core.Directive, error) {

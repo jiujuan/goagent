@@ -44,7 +44,8 @@ type AgentLoop struct {
 	schemas     []llm.ToolSchema
 	maxTurns    int
 
-	stepSnapshotPolicy StepSnapshotPolicy
+	contextOverflowRetry int
+	stepSnapshotPolicy   StepSnapshotPolicy
 }
 
 func newLoop(c config) *AgentLoop {
@@ -68,7 +69,8 @@ func newLoop(c config) *AgentLoop {
 		schemas:     tool.Schemas(c.tools),
 		maxTurns:    ms,
 
-		stepSnapshotPolicy: c.stepSnapshotPolicy,
+		contextOverflowRetry: c.contextOverflowRetry,
+		stepSnapshotPolicy:   c.stepSnapshotPolicy,
 	}
 }
 
@@ -321,11 +323,74 @@ func (l *AgentLoop) runStep(rc *RunContext, st taskState) (runOutcome, taskState
 	// genCtx == rc.Context.
 	genCtx := l.mw.ModelContext(lc, rc.Context)
 
-	finalResp, ok, err := l.streamModel(genCtx, rc, lc, req)
-	if !ok {
-		return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
+	// A typed context-length overflow may be recovered inside this step. The
+	// retry request is rebuilt from the frozen view (only Messages changes), so
+	// request rewrites run once. Nothing is retried after output was emitted, on
+	// a cancelled run, or once the step's recovery budget is spent.
+	attempts := 0
+	var (
+		finalResp *llm.Response
+		final     core.Message
+	)
+	for {
+		resp, _, emitted, err := l.streamModel(genCtx, rc, lc, req)
+		if err == nil {
+			finalResp = resp
+			final = resp.Message
+			break
+		}
+
+		var cle *llm.ContextLengthError
+		isOverflow := errors.As(err, &cle)
+		if !isOverflow || genCtx.Err() != nil || emitted || attempts >= l.contextOverflowRetry {
+			return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
+		}
+
+		before := len(history)
+		recovered, changed := l.mw.RecoverContext(lc, history, cle)
+		if !changed {
+			return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
+		}
+
+		retryReq := &llm.Request{
+			System:   view.System(),
+			Messages: recovered,
+			Tools:    view.Tools().Schemas(),
+			Options:  view.Options(),
+		}
+		retryView, ferr := l.freezeStepView(lc, retryReq)
+		if ferr != nil {
+			return l.fail(rc, step, history, lc.viewSnapshot(), errors.Join(err, ferr)), st, false
+		}
+
+		history = recovered
+		lc.History = history
+		lc.Request = retryReq
+		req = retryReq
+		rc.State.Messages = history
+		if cerr := l.checkpoint(rc, commitOptions{
+			Step:     step,
+			Snapshot: retryView.snapshot(),
+			Release:  false,
+		}); cerr != nil {
+			return l.fail(rc, step, history, retryView.snapshot(), errors.Join(err, cerr)), st, false
+		}
+
+		view = retryView
+		lc.view = view
+		attempts++
+		rc.publish(core.ContextOverflowRetried{
+			Step:           step,
+			Attempt:        attempts,
+			Model:          view.Model(),
+			Provider:       cle.Provider,
+			Limit:          cle.Limit,
+			Requested:      cle.Requested,
+			MessagesBefore: before,
+			MessagesAfter:  len(history),
+		})
+		genCtx = l.mw.ModelContext(lc, rc.Context)
 	}
-	final := finalResp.Message
 
 	if d, err := l.mw.AfterModel(lc, finalResp); err != nil {
 		return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
@@ -473,27 +538,31 @@ func (l *AgentLoop) runStep(rc *RunContext, st taskState) (runOutcome, taskState
 
 // streamModel runs one model call, publishing MessageDelta for partials and
 // MessageDone for the final message. ok is false (with err) if the model errored.
-// genCtx is the (possibly span-carrying) context to invoke the provider with;
-// rc remains the run environment for publishing and state. It returns the final
-// *llm.Response (carrying Usage and StopReason) so AfterModel can observe them.
-func (l *AgentLoop) streamModel(genCtx context.Context, rc *RunContext, lc *LoopContext, req *llm.Request) (*llm.Response, bool, error) {
+// emitted reports whether any response was already published, so a caller can
+// refuse to replay a call whose output the subscriber has seen. genCtx is the
+// (possibly span-carrying) context to invoke the provider with; rc remains the
+// run environment for publishing and state. It returns the final *llm.Response
+// (carrying Usage and StopReason) so AfterModel can observe them.
+func (l *AgentLoop) streamModel(genCtx context.Context, rc *RunContext, lc *LoopContext, req *llm.Request) (final *llm.Response, ok bool, emitted bool, err error) {
 	if err := rc.checkWriteAccess(); err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
-	final := &llm.Response{}
+	final = &llm.Response{}
 	for resp, err := range l.model.Generate(genCtx, req) {
 		if err != nil {
 			_, _ = l.mw.OnError(lc, err) // retry middleware consulted; real retry lands later
-			return nil, false, err
+			return nil, false, emitted, err
 		}
 		if resp.Partial {
+			emitted = true
 			rc.publish(core.MessageDelta{Delta: resp.Message})
 			continue
 		}
 		final = resp
+		emitted = true
 		rc.publish(core.MessageDone{Message: resp.Message, Usage: resp.Usage})
 	}
-	return final, true, nil
+	return final, true, emitted, nil
 }
 
 // commitOptions is one checkpoint write. Snapshot is the frozen step view the

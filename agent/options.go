@@ -23,6 +23,7 @@ type config struct {
 	middleware                []Middleware
 	subAgents                 []*Agent
 	maxTurns                  int
+	contextOverflowRetry      int
 	toolExec                  ToolExecMode
 	toolTimeout               time.Duration
 	claimLease                time.Duration
@@ -91,6 +92,19 @@ func WithoutTransfer() Option { return func(c *config) { c.noTransfer = true } }
 //
 //	agent.Loop("refine", 3, drafter, critic)   // run up to 3 rounds
 func WithMaxTurns(n int) Option { return func(c *config) { c.maxTurns = n } }
+
+// WithContextOverflowRetry bounds how many recovery rounds one step may run
+// after a typed context-length overflow. The default is 1; 0 disables recovery.
+// Values above 1 allow that many compression rounds in the same step; each
+// round must shrink the history further. Negative values are treated as 0.
+func WithContextOverflowRetry(n int) Option {
+	return func(c *config) {
+		if n < 0 {
+			n = 0
+		}
+		c.contextOverflowRetry = n
+	}
+}
 
 // WithToolExecution selects concurrent (default) or sequential tool execution.
 // Note: a tool wrapped with tool.AsSequential still gives its own call a serial
