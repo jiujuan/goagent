@@ -184,6 +184,7 @@ go run ./examples/quickstart
 | 示例 | 运行方式 | 展示内容 |
 | --- | --- | --- |
 | `quickstart` | `go run ./examples/quickstart` | 离线冒烟测试：mock 模型上的类型化工具调用与流式事件。 |
+| `task-loop` | `go run ./examples/task-loop` | 终稿后的追加消息与投递票据：一次运行两个回合，`TurnDone` 可出现多次、`RunDone` 只出现一次。 |
 | `quickstart-chat` | `go run ./examples/quickstart-chat` | 真实模型的最小聊天启动模板。 |
 | `quickstart-tool` | `go run ./examples/quickstart-tool` | 真实模型调用一个类型化工具的启动模板。 |
 | `quickstart-stream` | `go run ./examples/quickstart-stream` | 流式接收真实模型输出的启动模板。 |
@@ -273,6 +274,16 @@ go run ./examples/quickstart
 4. 有知识库需求时，用 `memory.NewRetriever(...)` 配合 `middleware.RAG(...)` 自动注入，或提供检索工具让模型按需调用。
 5. 业务步骤固定时用 `Sequential` / `Parallel` / `Loop` / `Pipeline`；带依赖的复杂任务用 `agent.NewPlan`；需要领域专家协作时配置 `WithSubAgents` 或 `AsTool`。
 6. 对外部命令、删除、支付等高风险动作，同时使用 `sandbox` 与 `middleware.Permission(...)`。
+
+### 终稿后的追加与运行结束
+
+- 运行中追加临时消息用 `Run.Steer`，它返回一张票据；`Steer` 成功只表示消息被队列接受，不表示已经进入模型上下文。
+- 票据只保证进入某一步的模型上下文：`Delivered` 与 `Step` 说明哪一步会看到它，不表示检查点已经提交。模型给出终稿后才到达的消息进入下一回合，`Step` 是下一步。
+- 一次运行可以有多个回合：`TurnDone` 会重复出现，`RunDone` 只在运行结束时出现一次。判断运行结束以 `RunDone` 或 `Run.Wait` 为准，不要把 `TurnDone` 当成结束信号。
+- `Sequential`/`Loop` 等工作流内部的成员不启用终稿续跑，追加消息由共享队列按原有轮次处理。
+- 跨进程、跨暂停的输入不能依赖内存队列，改用持久收件箱（`Durable.Deliver`/`Inbox`）。
+
+完整可运行示例见 `go run ./examples/task-loop`。
 
 ### 会话快照与并发
 
