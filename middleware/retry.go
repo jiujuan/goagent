@@ -61,7 +61,9 @@ func (r *retryModel) Generate(ctx context.Context, req *llm.Request) iter.Seq2[*
 			if failed == nil {
 				return // success
 			}
-			if yielded || attempt >= r.max-1 {
+			// A typed context-length overflow is the agent loop's to recover by
+			// compressing history; resending the same request cannot succeed.
+			if yielded || llm.IsContextLength(failed) || attempt >= r.max-1 {
 				yield(nil, failed) // mid-stream failure or out of attempts
 				return
 			}

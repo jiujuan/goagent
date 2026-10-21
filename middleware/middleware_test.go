@@ -117,6 +117,40 @@ func TestRetryModelGivesUp(t *testing.T) {
 	}
 }
 
+// contextLengthFirst fails the first call with a typed overflow, then succeeds.
+type contextLengthFirst struct {
+	calls int
+}
+
+func (m *contextLengthFirst) Name() string { return "context-length-first" }
+func (m *contextLengthFirst) Generate(_ context.Context, _ *llm.Request) iter.Seq2[*llm.Response, error] {
+	return func(yield func(*llm.Response, error) bool) {
+		m.calls++
+		if m.calls == 1 {
+			yield(nil, llm.NewStatusError("test", 400, "maximum context length is 10 tokens, however you requested 20 tokens"))
+			return
+		}
+		yield(mock.Text("ok"), nil)
+	}
+}
+
+func TestRetryModelDoesNotRetryContextLength(t *testing.T) {
+	m := &contextLengthFirst{}
+	var got error
+	for _, err := range middleware.RetryModel(m, middleware.RetryOptions{MaxAttempts: 3, BaseDelay: time.Millisecond}).Generate(context.Background(), &llm.Request{}) {
+		if err != nil {
+			got = err
+		}
+	}
+	if m.calls != 1 {
+		t.Fatalf("model calls = %d, want 1 (context overflow must not be retried)", m.calls)
+	}
+	var cle *llm.ContextLengthError
+	if !errors.As(got, &cle) {
+		t.Fatalf("error = %v (%T), want *llm.ContextLengthError", got, got)
+	}
+}
+
 func TestCompactionShrinksHistory(t *testing.T) {
 	summarizer := mock.New("s", func(*llm.Request) *llm.Response { return mock.Text("SUMMARY") })
 	mw := middleware.Compaction(middleware.CompactionOptions{Model: summarizer, MaxTokens: 1, KeepRecent: 2})

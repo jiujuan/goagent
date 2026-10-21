@@ -86,7 +86,7 @@ func (m *Model) Generate(ctx context.Context, req *llm.Request) iter.Seq2[*llm.R
 
 		if resp.StatusCode != http.StatusOK {
 			data, _ := io.ReadAll(resp.Body)
-			yield(nil, &llm.StatusError{Provider: "openaicompat", Code: resp.StatusCode, Body: string(data)})
+			yield(nil, llm.NewStatusError("openaicompat", resp.StatusCode, string(data)))
 			return
 		}
 

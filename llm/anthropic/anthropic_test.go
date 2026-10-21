@@ -1,6 +1,11 @@
 package anthropic
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -94,5 +99,28 @@ func TestRoundTripWireMessages(t *testing.T) {
 	}
 	if wire[2].Content[0].ToolUseID != "x" {
 		t.Fatalf("tool_use_id not preserved: %+v", wire[2].Content[0])
+	}
+}
+
+func TestGenerateClassifiesContextLength(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}`)
+	}))
+	defer srv.Close()
+
+	m := New("claude", "k", WithBaseURL(srv.URL))
+	var got error
+	for _, err := range m.Generate(context.Background(), &llm.Request{Messages: []core.Message{core.UserText("hi")}}) {
+		if err != nil {
+			got = err
+		}
+	}
+	var cle *llm.ContextLengthError
+	if !errors.As(got, &cle) {
+		t.Fatalf("error = %v (%T), want *llm.ContextLengthError", got, got)
+	}
+	if cle.Limit != 200000 || cle.Requested != 210000 {
+		t.Fatalf("limit/requested = %d/%d, want 200000/210000", cle.Limit, cle.Requested)
 	}
 }

@@ -1,9 +1,15 @@
 package openaicompat
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/llm"
 )
 
@@ -56,5 +62,28 @@ func TestParseStream(t *testing.T) {
 	}
 	if final.Usage == nil || final.Usage.InputTokens != 10 || final.Usage.OutputTokens != 5 {
 		t.Fatalf("usage = %+v", final.Usage)
+	}
+}
+
+func TestGenerateClassifiesContextLength(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"error":{"message":"This model's maximum context length is 8192 tokens, however you requested 9000 tokens","type":"invalid_request_error","code":"context_length_exceeded"}}`)
+	}))
+	defer srv.Close()
+
+	m := New(Config{BaseURL: srv.URL, APIKey: "k", Model: "m"})
+	var got error
+	for _, err := range m.Generate(context.Background(), &llm.Request{Messages: []core.Message{core.UserText("hi")}}) {
+		if err != nil {
+			got = err
+		}
+	}
+	var cle *llm.ContextLengthError
+	if !errors.As(got, &cle) {
+		t.Fatalf("error = %v (%T), want *llm.ContextLengthError", got, got)
+	}
+	if cle.Limit != 8192 || cle.Requested != 9000 {
+		t.Fatalf("limit/requested = %d/%d, want 8192/9000", cle.Limit, cle.Requested)
 	}
 }
