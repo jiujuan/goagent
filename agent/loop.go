@@ -82,7 +82,29 @@ func (l *AgentLoop) addTool(t tool.Tool) {
 	l.schemas = upsertSchema(l.schemas, tool.SchemaOf(t))
 }
 
+// taskState is one task's execution state. The step budget is fixed when the
+// task starts, so every step — including one that continues a resumed batch —
+// shares the same maxStep.
+type taskState struct {
+	step      int
+	maxStep   int
+	history   []core.Message
+	system    string
+	usePrompt bool
+}
+
 func (l *AgentLoop) run(rc *RunContext) runOutcome {
+	st, out, ok := l.prepareRun(rc)
+	if !ok {
+		return out
+	}
+	return l.runTask(rc, st)
+}
+
+// prepareRun does the work before the first step: replay a resumed tool batch,
+// render the system prompt, and fix the step budget. ok is false when the
+// resumed batch already ended the run.
+func (l *AgentLoop) prepareRun(rc *RunContext) (taskState, runOutcome, bool) {
 	history := append([]core.Message(nil), rc.State.Messages...)
 	startStep := 0
 
@@ -95,7 +117,7 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		rlc := &LoopContext{RunContext: rc, Step: rb.step, MaxTurns: l.maxTurns, History: history}
 		rlc.view = l.resumeStepView(rb)
 		if err := l.mw.CheckToolPolicy(rlc, rb.calls); err != nil {
-			return l.fail(rc, rb.step, history, rb.snapshot, err)
+			return taskState{}, l.fail(rc, rb.step, history, rb.snapshot, err), false
 		}
 		resumed := l.runResumed(rb, rlc)
 		// The rejected calls in a resumed batch are reported here rather than inside
@@ -103,13 +125,13 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 		// step's: batch joined, snapshot not yet written.
 		l.mw.ToolReject(rlc, resumed.rejects)
 		if resumed.pause {
-			return l.interrupt(rc, rb.step, history, rb.snapshot, rb.calls, "before_tool", resumed.reason, checkpoint.RecoveryResumeTools)
+			return taskState{}, l.interrupt(rc, rb.step, history, rb.snapshot, rb.calls, "before_tool", resumed.reason, checkpoint.RecoveryResumeTools), false
 		}
 		if len(resumed.parts) > 0 {
 			history = append(history, core.Message{Role: core.RoleTool, Parts: resumed.parts})
 		}
 		if resumed.err != nil {
-			return l.fail(rc, rb.step, history, rb.snapshot, resumed.err)
+			return taskState{}, l.fail(rc, rb.step, history, rb.snapshot, resumed.err), false
 		}
 		if len(resumed.parts) > 0 || resumed.control.Kind != core.Continue {
 			rc.State.Messages = history
@@ -118,11 +140,11 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 				Snapshot: rb.snapshot,
 				Release:  resumed.control.Kind != core.Continue,
 			}); err != nil {
-				return runOutcome{Err: err}
+				return taskState{}, runOutcome{Err: err}, false
 			}
 		}
 		if resumed.control.Kind != core.Continue {
-			return runOutcome{Result: core.Result{Message: rb.final}, Control: resumed.control}
+			return taskState{}, runOutcome{Result: core.Result{Message: rb.final}, Control: resumed.control}, false
 		}
 		// The recovered batch belongs to rb.step. Start fresh model work at the
 		// next logical step so a provider that reuses a tool-call ID cannot replay
@@ -143,192 +165,232 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 			Tools:     l.tools,
 		})
 		if err != nil {
-			return l.fail(rc, -1, history, nil, err)
+			return taskState{}, l.fail(rc, -1, history, nil, err), false
 		}
 		system = s
 	}
 
-	for step := startStep; step < startStep+l.maxTurns; step++ {
-		lc := &LoopContext{RunContext: rc, Step: step, MaxTurns: l.maxTurns, History: history}
-		rc.publish(core.TurnStarted{Step: step})
+	return taskState{
+		step:      startStep,
+		maxStep:   startStep + l.maxTurns,
+		history:   history,
+		system:    system,
+		usePrompt: usePrompt,
+	}, runOutcome{}, true
+}
 
-		// Phase 1 — PrepareTurn: drain volatile steering, then the durable inbox.
-		if steers := rc.steering.drain(); len(steers) > 0 {
-			for _, e := range steers {
-				history = append(history, e.msg)
-			}
-			settleDelivered(steers, step)
+// runTask drives steps until one ends the task or the budget runs out.
+func (l *AgentLoop) runTask(rc *RunContext, st taskState) runOutcome {
+	for st.step < st.maxStep {
+		out, next, again := l.runStep(rc, st)
+		if !again {
+			return out
 		}
-		if durable, ok := rc.durableStore(); ok {
-			inbox, err := durable.Inbox(rc, rc.ThreadID)
-			if err != nil {
-				return l.fail(rc, step, history, nil, err)
-			}
-			if len(inbox) > 0 {
-				ids := make([]string, 0, len(inbox))
-				for _, msg := range inbox {
-					history = append(history, msg.Message)
-					ids = append(ids, msg.ID)
-				}
-				rc.addInboxAcks(ids)
-			}
-		}
-		// Let history-compacters (durable compaction) rewrite the working history
-		// before the model is consulted. The replacement flows into this step's
-		// request and, at step end, its checkpoint. A no-op when no middleware
-		// implements HistoryCompacter.
-		history = l.mw.CompactHistory(lc, history)
-		lc.History = history
-		if d, err := l.mw.BeforeModel(lc); err != nil {
-			return l.fail(rc, step, history, lc.viewSnapshot(), err)
-		} else {
-			switch d.Kind {
-			case core.Interrupt:
-				return l.interrupt(rc, step, history, lc.viewSnapshot(), nil, "before_model", d.Reason, checkpoint.RecoveryReplayModel)
-			case core.Stop, core.Escalate, core.Transfer:
-				rc.State.Messages = history
-				if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: true}); err != nil {
-					return runOutcome{Err: err}
-				}
-				return runOutcome{Control: d}
-			}
-		}
+		st = next
+	}
+	// The budget ran out mid-conversation: the seam is still worth keeping, so
+	// Resume can continue the thread with a larger budget instead of rewinding.
+	return l.fail(rc, st.maxStep-1, st.history, nil, ErrMaxTurnsExceeded)
+}
 
-		// Phase 2 — CallModel: ModifyRequest → stream → AfterModel.
-		sys := system
-		if !usePrompt {
-			sys = renderTemplate(l.instruction, rc.State.KV)
+// runStep runs one PrepareTurn → CallModel → ExecuteTools → Checkpoint →
+// ApplyDirectives step. again reports whether the task has another step, with
+// next carrying the advanced state when it does.
+func (l *AgentLoop) runStep(rc *RunContext, st taskState) (runOutcome, taskState, bool) {
+	step := st.step
+	history := st.history
+	system := st.system
+	usePrompt := st.usePrompt
+
+	lc := &LoopContext{RunContext: rc, Step: step, MaxTurns: l.maxTurns, History: history}
+	rc.publish(core.TurnStarted{Step: step})
+
+	// Phase 1 — PrepareTurn: drain volatile steering, then the durable inbox.
+	if steers := rc.steering.drain(); len(steers) > 0 {
+		for _, e := range steers {
+			history = append(history, e.msg)
 		}
-		req := &llm.Request{System: sys, Messages: history, Tools: l.snapshotTools(rc).schemas}
-		req.Options.Apply(l.modelOpts...)
-		lc.Request = req
-		if err := l.mw.ModifyRequest(lc, req); err != nil {
-			return l.fail(rc, step, history, lc.viewSnapshot(), err)
-		}
-		view, err := l.freezeStepView(lc, req)
+		settleDelivered(steers, step)
+	}
+	if durable, ok := rc.durableStore(); ok {
+		inbox, err := durable.Inbox(rc, rc.ThreadID)
 		if err != nil {
-			return l.fail(rc, step, history, lc.viewSnapshot(), err)
+			return l.fail(rc, step, history, nil, err), st, false
 		}
-		lc.view = view
-		if err := l.checkReplayDrift(lc, view); err != nil {
-			return l.fail(rc, step, history, view.snapshot(), err)
-		}
-
-		// Derive the context for this model call. An observability middleware
-		// (ModelContexter) injects its span here so the provider call — and any
-		// downstream traceparent — nests under it. With no such middleware,
-		// genCtx == rc.Context.
-		genCtx := l.mw.ModelContext(lc, rc.Context)
-
-		finalResp, ok, err := l.streamModel(genCtx, rc, lc, req)
-		if !ok {
-			return l.fail(rc, step, history, lc.viewSnapshot(), err)
-		}
-		final := finalResp.Message
-
-		if d, err := l.mw.AfterModel(lc, finalResp); err != nil {
-			return l.fail(rc, step, history, lc.viewSnapshot(), err)
-		} else {
-			switch d.Kind {
-			case core.Interrupt:
-				// Persist the model-request boundary, not final: a resumed run must
-				// re-ask the model rather than continue an uncheckpointed reply.
-				return l.interrupt(rc, step, history, lc.viewSnapshot(), nil, "after_model", d.Reason, checkpoint.RecoveryReplayModel)
-			case core.Stop, core.Escalate, core.Transfer:
-				history = append(history, final)
-				rc.State.Messages = history
-				if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: true}); err != nil {
-					return runOutcome{Err: err}
-				}
-				return runOutcome{Result: core.Result{Message: final}, Control: d}
+		if len(inbox) > 0 {
+			ids := make([]string, 0, len(inbox))
+			for _, msg := range inbox {
+				history = append(history, msg.Message)
+				ids = append(ids, msg.ID)
 			}
+			rc.addInboxAcks(ids)
 		}
-
-		history = append(history, final)
-
-		calls := final.ToolCalls()
-		if len(calls) == 0 {
-			if l.outputKey != "" {
-				rc.State.Apply(core.StateOp{Kind: core.OpSetKV, Key: l.outputKey, Value: final.Text()})
-			}
+	}
+	// Let history-compacters (durable compaction) rewrite the working history
+	// before the model is consulted. The replacement flows into this step's
+	// request and, at step end, its checkpoint. A no-op when no middleware
+	// implements HistoryCompacter.
+	history = l.mw.CompactHistory(lc, history)
+	lc.History = history
+	if d, err := l.mw.BeforeModel(lc); err != nil {
+		return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
+	} else {
+		switch d.Kind {
+		case core.Interrupt:
+			return l.interrupt(rc, step, history, lc.viewSnapshot(), nil, "before_model", d.Reason, checkpoint.RecoveryReplayModel), st, false
+		case core.Stop, core.Escalate, core.Transfer:
 			rc.State.Messages = history
 			if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: true}); err != nil {
-				return runOutcome{Err: err}
+				return runOutcome{Err: err}, st, false
 			}
-			rc.publish(core.TurnDone{Step: step})
-			return runOutcome{Result: core.Result{Message: final}}
-		}
-
-		// A max_tokens stop means the reply was cut off by the output cap, so
-		// every tool call in it may carry silently truncated arguments (they can
-		// still parse). None are safe to execute — and none reach the BeforeTool
-		// gate, so a truncated call never enters HITL approval — instead each
-		// becomes an error result asking the model to re-issue it.
-		if finalResp.StopReason == llm.StopMaxTokens {
-			history = append(history, core.Message{Role: core.RoleTool, Parts: truncatedResults(rc, calls)})
-			rc.State.Messages = history
-			if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot()}); err != nil {
-				return runOutcome{Err: err}
-			}
-			rc.publish(core.TurnDone{Step: step})
-			continue
-		}
-
-		// Phase 3 — ExecuteTools: BeforeTool gate (HITL/permission) first, then the
-		// batch, then the rejections it collected. Reporting them after the batch joined
-		// (not from a tool's worker) and before this step's snapshot is what lets a
-		// ToolRejecter write State.KV without locking and have the write checkpointed.
-		if err := l.mw.CheckToolPolicy(lc, calls); err != nil {
-			return l.fail(rc, step, history, lc.viewSnapshot(), err)
-		}
-		for i := range calls {
-			d, err := l.mw.BeforeTool(lc, &calls[i])
-			if err != nil {
-				return l.fail(rc, step, history, lc.viewSnapshot(), err)
-			}
-			switch d.Kind {
-			case core.Interrupt:
-				// No handler has started yet. Save the whole original batch: calls
-				// checked before this gate were only preflighted, not executed.
-				return l.interrupt(rc, step, history, lc.viewSnapshot(), calls, "before_tool", d.Reason, checkpoint.RecoveryResumeTools)
-			case core.Stop, core.Escalate, core.Transfer:
-				// A gate denied/redirected before any tool ran; end this unit with
-				// that control directive.
-				rc.State.Messages = history
-				if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: true}); err != nil {
-					return runOutcome{Err: err}
-				}
-				return runOutcome{Result: core.Result{Message: final}, Control: d}
-			}
-		}
-
-		results, dirs, rejects, execErr := l.execTools(rc, lc, calls)
-		l.mw.ToolReject(lc, rejects)
-		if len(results) > 0 {
-			history = append(history, core.Message{Role: core.RoleTool, Parts: results})
-		}
-		if execErr != nil {
-			return l.fail(rc, step, history, lc.viewSnapshot(), execErr)
-		}
-
-		// Phase 4 — Checkpoint the step's state.
-		rc.State.Messages = history
-		next := core.Resolve(dirs...)
-		if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: next.Kind != core.Continue}); err != nil {
-			return runOutcome{Err: err}
-		}
-		rc.publish(core.TurnDone{Step: step})
-
-		// Phase 5 — ApplyDirectives. A tool/AfterTool directive (Stop/Escalate/
-		// Transfer) ends this unit and propagates up via the outcome.
-		if next.Kind != core.Continue {
-			return runOutcome{Result: core.Result{Message: final}, Control: next}
+			return runOutcome{Control: d}, st, false
 		}
 	}
 
-	// The budget ran out mid-conversation: the seam is still worth keeping, so
-	// Resume can continue the thread with a larger budget instead of rewinding.
-	return l.fail(rc, startStep+l.maxTurns-1, history, nil, ErrMaxTurnsExceeded)
+	// Phase 2 — CallModel: ModifyRequest → stream → AfterModel.
+	sys := system
+	if !usePrompt {
+		sys = renderTemplate(l.instruction, rc.State.KV)
+	}
+	req := &llm.Request{System: sys, Messages: history, Tools: l.snapshotTools(rc).schemas}
+	req.Options.Apply(l.modelOpts...)
+	lc.Request = req
+	if err := l.mw.ModifyRequest(lc, req); err != nil {
+		return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
+	}
+	view, err := l.freezeStepView(lc, req)
+	if err != nil {
+		return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
+	}
+	lc.view = view
+	if err := l.checkReplayDrift(lc, view); err != nil {
+		return l.fail(rc, step, history, view.snapshot(), err), st, false
+	}
+
+	// Derive the context for this model call. An observability middleware
+	// (ModelContexter) injects its span here so the provider call — and any
+	// downstream traceparent — nests under it. With no such middleware,
+	// genCtx == rc.Context.
+	genCtx := l.mw.ModelContext(lc, rc.Context)
+
+	finalResp, ok, err := l.streamModel(genCtx, rc, lc, req)
+	if !ok {
+		return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
+	}
+	final := finalResp.Message
+
+	if d, err := l.mw.AfterModel(lc, finalResp); err != nil {
+		return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
+	} else {
+		switch d.Kind {
+		case core.Interrupt:
+			// Persist the model-request boundary, not final: a resumed run must
+			// re-ask the model rather than continue an uncheckpointed reply.
+			return l.interrupt(rc, step, history, lc.viewSnapshot(), nil, "after_model", d.Reason, checkpoint.RecoveryReplayModel), st, false
+		case core.Stop, core.Escalate, core.Transfer:
+			history = append(history, final)
+			rc.State.Messages = history
+			if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: true}); err != nil {
+				return runOutcome{Err: err}, st, false
+			}
+			return runOutcome{Result: core.Result{Message: final}, Control: d}, st, false
+		}
+	}
+
+	history = append(history, final)
+
+	calls := final.ToolCalls()
+	if len(calls) == 0 {
+		if l.outputKey != "" {
+			rc.State.Apply(core.StateOp{Kind: core.OpSetKV, Key: l.outputKey, Value: final.Text()})
+		}
+		rc.State.Messages = history
+		if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: true}); err != nil {
+			return runOutcome{Err: err}, st, false
+		}
+		rc.publish(core.TurnDone{Step: step})
+		return runOutcome{Result: core.Result{Message: final}}, st, false
+	}
+
+	// A max_tokens stop means the reply was cut off by the output cap, so
+	// every tool call in it may carry silently truncated arguments (they can
+	// still parse). None are safe to execute — and none reach the BeforeTool
+	// gate, so a truncated call never enters HITL approval — instead each
+	// becomes an error result asking the model to re-issue it.
+	if finalResp.StopReason == llm.StopMaxTokens {
+		history = append(history, core.Message{Role: core.RoleTool, Parts: truncatedResults(rc, calls)})
+		rc.State.Messages = history
+		if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot()}); err != nil {
+			return runOutcome{Err: err}, st, false
+		}
+		rc.publish(core.TurnDone{Step: step})
+		return runOutcome{}, taskState{
+			step:      step + 1,
+			maxStep:   st.maxStep,
+			history:   history,
+			system:    st.system,
+			usePrompt: st.usePrompt,
+		}, true
+	}
+
+	// Phase 3 — ExecuteTools: BeforeTool gate (HITL/permission) first, then the
+	// batch, then the rejections it collected. Reporting them after the batch joined
+	// (not from a tool's worker) and before this step's snapshot is what lets a
+	// ToolRejecter write State.KV without locking and have the write checkpointed.
+	if err := l.mw.CheckToolPolicy(lc, calls); err != nil {
+		return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
+	}
+	for i := range calls {
+		d, err := l.mw.BeforeTool(lc, &calls[i])
+		if err != nil {
+			return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
+		}
+		switch d.Kind {
+		case core.Interrupt:
+			// No handler has started yet. Save the whole original batch: calls
+			// checked before this gate were only preflighted, not executed.
+			return l.interrupt(rc, step, history, lc.viewSnapshot(), calls, "before_tool", d.Reason, checkpoint.RecoveryResumeTools), st, false
+		case core.Stop, core.Escalate, core.Transfer:
+			// A gate denied/redirected before any tool ran; end this unit with
+			// that control directive.
+			rc.State.Messages = history
+			if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: true}); err != nil {
+				return runOutcome{Err: err}, st, false
+			}
+			return runOutcome{Result: core.Result{Message: final}, Control: d}, st, false
+		}
+	}
+
+	results, dirs, rejects, execErr := l.execTools(rc, lc, calls)
+	l.mw.ToolReject(lc, rejects)
+	if len(results) > 0 {
+		history = append(history, core.Message{Role: core.RoleTool, Parts: results})
+	}
+	if execErr != nil {
+		return l.fail(rc, step, history, lc.viewSnapshot(), execErr), st, false
+	}
+
+	// Phase 4 — Checkpoint the step's state.
+	rc.State.Messages = history
+	next := core.Resolve(dirs...)
+	if err := l.checkpoint(rc, commitOptions{Step: step, Snapshot: lc.viewSnapshot(), Release: next.Kind != core.Continue}); err != nil {
+		return runOutcome{Err: err}, st, false
+	}
+	rc.publish(core.TurnDone{Step: step})
+
+	// Phase 5 — ApplyDirectives. A tool/AfterTool directive (Stop/Escalate/
+	// Transfer) ends this unit and propagates up via the outcome.
+	if next.Kind != core.Continue {
+		return runOutcome{Result: core.Result{Message: final}, Control: next}, st, false
+	}
+
+	return runOutcome{}, taskState{
+		step:      step + 1,
+		maxStep:   st.maxStep,
+		history:   history,
+		system:    st.system,
+		usePrompt: st.usePrompt,
+	}, true
 }
 
 // streamModel runs one model call, publishing MessageDelta for partials and
