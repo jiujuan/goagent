@@ -233,6 +233,29 @@ func (w *window) CompactHistory(lc *agent.LoopContext, history []core.Message) [
 	return out
 }
 
+// RecoverContext force-evicts the oldest units after the provider rejected the
+// history as too long. It never consults the configured strategy: the budget is
+// the reported limit, not the strategy's own. The newest unit is always kept, so
+// a history that is already one unit has no shorter form and is declined.
+func (w *window) RecoverContext(lc *agent.LoopContext, history []core.Message, overflow *llm.ContextLengthError) ([]core.Message, bool) {
+	if w.strategy == nil || len(history) <= 1 {
+		return history, false
+	}
+	before := w.estimate(lc, history)
+	target := windowRecoveryTarget(before, overflow.Limit)
+	if target <= 0 || target >= before {
+		return history, false
+	}
+	out := keepTailWithin(lc, w, history, target)
+	out = repairPairing(out)
+	after := w.estimate(lc, out)
+	if len(out) == 0 || len(out) >= len(history) || after >= before {
+		return history, false
+	}
+	w.publishTrimmedAs(lc, "overflow_tail", history, out, before)
+	return out, true
+}
+
 // apply runs the three steps of one eviction decision: split into units, ask the
 // strategy which units survive, then repair pairing. est is the calibrated token
 // estimate of the input before eviction. trimmed is false when the strategy took
@@ -240,8 +263,7 @@ func (w *window) CompactHistory(lc *agent.LoopContext, history []core.Message) [
 // repair is skipped too, so a pre-existing orphan in the stored history is never
 // silently rewritten by a step that decided to evict nothing.
 func (w *window) apply(lc *agent.LoopContext, msgs []core.Message) (out []core.Message, est int, trimmed bool) {
-	factor := loadCalibDefaultAt(lc, kvWindow)
-	count := func(m []core.Message) int { return int(float64(w.counter(m)) * factor) }
+	count := func(m []core.Message) int { return w.estimate(lc, m) }
 	est = count(msgs)
 	kept := w.strategy.Select(lc, count, msgs)
 	if len(kept) >= len(msgs) {
@@ -250,20 +272,61 @@ func (w *window) apply(lc *agent.LoopContext, msgs []core.Message) (out []core.M
 	return repairPairing(kept), est, true
 }
 
+// estimate is the one calibrated token measure both the strategy path and
+// recovery use, so the two cannot drift apart.
+func (w *window) estimate(lc *agent.LoopContext, msgs []core.Message) int {
+	return int(float64(w.counter(msgs)) * loadCalibDefaultAt(lc, kvWindow))
+}
+
 // publishTrimmed emits core.WindowTrimmed for one eviction that actually
 // happened. Dropped/Kept count messages (not units), measured against the input
 // of this step and after the pairing repair.
 func (w *window) publishTrimmed(lc *agent.LoopContext, in, out []core.Message, est int) {
+	w.publishTrimmedAs(lc, w.strategy.Name(), in, out, est)
+}
+
+// publishTrimmedAs is publishTrimmed with an explicit strategy name, so overflow
+// recovery can report "overflow_tail" without a strategy object.
+func (w *window) publishTrimmedAs(lc *agent.LoopContext, strategy string, in, out []core.Message, est int) {
 	if lc.Bus == nil {
 		return
 	}
 	lc.Bus.Publish(lc.Topic, core.WindowTrimmed{
-		Strategy:  w.strategy.Name(),
+		Strategy:  strategy,
 		Dropped:   len(in) - len(out),
 		Kept:      len(out),
 		EstTokens: est,
 		Step:      lc.Step,
 	})
+}
+
+// windowRecoveryTarget is the token budget the kept tail should fit: half the
+// rejected history and, when the provider reports one, half its limit.
+func windowRecoveryTarget(before, limit int) int {
+	if limit > 0 {
+		return min(limit/2, before/2)
+	}
+	return before / 2
+}
+
+// keepTailWithin keeps the newest unit unconditionally, then walks backwards
+// adding whole units while they fit target. Returning msgs means "nothing to
+// drop"; the caller still refuses an unchanged result.
+func keepTailWithin(lc *agent.LoopContext, w *window, msgs []core.Message, target int) []core.Message {
+	units := groupUnits(msgs)
+	used, start := 0, len(units)
+	for i := len(units) - 1; i >= 0; i-- {
+		size := w.estimate(lc, msgs[units[i].start:units[i].end])
+		if i != len(units)-1 && used+size > target {
+			break
+		}
+		start = i
+		used += size
+	}
+	if start <= 0 {
+		return msgs
+	}
+	return keptMessages(msgs, units[start:])
 }
 
 // AfterModel calibrates the estimator against the provider's real input-token
@@ -663,6 +726,7 @@ func tokenSet(s string) map[string]bool {
 
 var _ agent.Middleware = (*window)(nil)
 var _ agent.HistoryCompacter = (*window)(nil)
+var _ agent.ContextOverflowRecoverer = (*window)(nil)
 var _ WindowStrategy = (*recentN)(nil)
 var _ WindowStrategy = (*slidingWindow)(nil)
 var _ WindowStrategy = (*importanceWeighted)(nil)

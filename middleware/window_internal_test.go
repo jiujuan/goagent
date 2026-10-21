@@ -601,3 +601,190 @@ func TestWindowStrategyDefaults(t *testing.T) {
 		t.Fatal("a middleware without a strategy must not write a calibration")
 	}
 }
+
+// --- overflow recovery --------------------------------------------------------
+
+// winOverflowHistory is the shape the recovery tests cut: a tool pair in the
+// middle, then a user turn and a plain assistant answer. Under newCounter(10)
+// the four units weigh 10, 20, 10, 10.
+func winOverflowHistory() []core.Message {
+	return []core.Message{
+		winUser("q"),
+		winAsst("c1"),
+		winTool("c1"),
+		winUser("follow-up"),
+		core.AssistantText("answer"),
+	}
+}
+
+// winBusContext wires a loop context to a lossy event subscription.
+func winBusContext(topic bus.Topic, step int) (*agent.LoopContext, <-chan core.Event, func()) {
+	b := bus.New()
+	ch, cancel := b.Subscribe(topic, bus.Lossy)
+	lc := &agent.LoopContext{RunContext: &agent.RunContext{
+		Context: context.Background(), State: &core.State{}, Bus: b, Topic: topic,
+	}, Step: step}
+	return lc, ch, cancel
+}
+
+func TestWindowRecoveryTarget(t *testing.T) {
+	cases := []struct {
+		before, limit, want int
+	}{
+		{100, 0, 50},   // unknown limit: halve the history
+		{100, 200, 50}, // a generous limit is still capped by before/2
+		{100, 80, 40},  // half the provider limit
+	}
+	for _, tc := range cases {
+		if got := windowRecoveryTarget(tc.before, tc.limit); got != tc.want {
+			t.Errorf("windowRecoveryTarget(%d, %d) = %d, want %d", tc.before, tc.limit, got, tc.want)
+		}
+	}
+}
+
+func TestKeepTailWithin(t *testing.T) {
+	w := Window(WindowOptions{Strategy: SlidingWindow(1 << 30), Counter: newCounter(10)}).(*window)
+	lc := newLC(&core.State{}, nil)
+	history := winOverflowHistory()
+
+	if out := keepTailWithin(lc, w, history, 1000); &out[0] != &history[0] {
+		t.Fatal("a target that fits every unit must return the input history")
+	}
+
+	// 10 fits the newest unit exactly; 5 is below it. The newest unit survives
+	// either way, because the window sends too much rather than nothing.
+	for _, target := range []int{10, 5} {
+		out := keepTailWithin(lc, w, history, target)
+		if len(out) != 1 || out[0].Role != core.RoleAssistant || out[0].Text() != "answer" {
+			t.Fatalf("target %d kept [%s] with %d messages, want only the newest unit", target, winRoles(out), len(out))
+		}
+	}
+
+	// 10 + 10 + 20 = 40: the pair plus the two trailing turns.
+	out := keepTailWithin(lc, w, history, 40)
+	if len(out) != 4 {
+		t.Fatalf("kept %d messages [%s], want the pair plus the two trailing turns", len(out), winRoles(out))
+	}
+	if out[0].Role != core.RoleAssistant {
+		t.Fatalf("kept tail starts with %q, want the assistant call that owns the tool result", out[0].Role)
+	}
+	if orphans := winOrphanCallIDs(out); len(orphans) != 0 {
+		t.Fatalf("kept tail has orphans %v", orphans)
+	}
+	if units := groupUnits(out); len(units) != 3 {
+		t.Fatalf("kept tail is not three whole units: %v", gotUnits(units))
+	}
+}
+
+func TestWindowRecoverContext(t *testing.T) {
+	w := Window(WindowOptions{Strategy: SlidingWindow(1 << 30), Counter: newCounter(10)}).(*window)
+	lc, ch, cancel := winBusContext("window-recover", 2)
+	defer cancel()
+	history := winOverflowHistory()
+
+	out, ok := w.RecoverContext(lc, history, recoveryOverflow(t, 40))
+	if !ok {
+		t.Fatal("recovery did not run")
+	}
+	if len(out) != 2 {
+		t.Fatalf("recovered history has %d messages [%s], want 2", len(out), winRoles(out))
+	}
+	if orphans := winOrphanCallIDs(out); len(orphans) != 0 {
+		t.Fatalf("recovered history has orphans %v", orphans)
+	}
+
+	cancel()
+	events := winDrainEvents(ch)
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1 WindowTrimmed", len(events))
+	}
+	ev, ok := events[0].(core.WindowTrimmed)
+	if !ok {
+		t.Fatalf("event = %T, want core.WindowTrimmed", events[0])
+	}
+	if ev.Strategy != "overflow_tail" || ev.Dropped != 3 || ev.Kept != 2 || ev.EstTokens != 50 || ev.Step != 2 {
+		t.Fatalf("event = %+v, want overflow_tail, Dropped 3, Kept 2, EstTokens 50, Step 2", ev)
+	}
+}
+
+func TestWindowRecoverContextRejectsNoShrink(t *testing.T) {
+	t.Run("history is one unit", func(t *testing.T) {
+		w := Window(WindowOptions{Strategy: SlidingWindow(1 << 30), Counter: newCounter(10)}).(*window)
+		lc, ch, cancel := winBusContext("window-one-unit", 0)
+		defer cancel()
+		history := []core.Message{winAsst("c1"), winTool("c1")}
+
+		out, ok := w.RecoverContext(lc, history, recoveryOverflow(t, 100))
+		if ok {
+			t.Fatal("a single-unit history has no shorter form")
+		}
+		if len(out) != len(history) {
+			t.Fatalf("rejected recovery changed the history: %d messages", len(out))
+		}
+		cancel()
+		if n := len(winDrainEvents(ch)); n != 0 {
+			t.Fatalf("a rejected recovery published %d events", n)
+		}
+	})
+
+	t.Run("estimate does not shrink", func(t *testing.T) {
+		// A constant measure: dropping older messages cannot lower it. The tail
+		// still gets shorter, so only the estimate guard can reject this.
+		constCounter := func([]core.Message) int { return 10 }
+		w := Window(WindowOptions{Strategy: SlidingWindow(1 << 30), Counter: constCounter}).(*window)
+		lc, ch, cancel := winBusContext("window-flat-estimate", 0)
+		defer cancel()
+		history := []core.Message{winUser("q"), winUser("r"), core.AssistantText("answer")}
+		if tail := keepTailWithin(lc, w, history, 5); len(tail) != 1 {
+			t.Fatalf("fixture: tail should shrink to 1 message, got %d", len(tail))
+		}
+
+		out, ok := w.RecoverContext(lc, history, recoveryOverflow(t, 100))
+		if ok {
+			t.Fatal("a history whose estimate does not shrink must not recover")
+		}
+		if len(out) != len(history) {
+			t.Fatalf("rejected recovery changed the history: %d messages", len(out))
+		}
+		cancel()
+		if n := len(winDrainEvents(ch)); n != 0 {
+			t.Fatalf("a rejected recovery published %d events", n)
+		}
+	})
+}
+
+func TestWindowRecoverContextRejectsEmptyAfterRepair(t *testing.T) {
+	w := Window(WindowOptions{Strategy: SlidingWindow(1 << 30), Counter: newCounter(10)}).(*window)
+	lc, ch, cancel := winBusContext("window-empty", 0)
+	defer cancel()
+	// The target keeps only the trailing orphan result, which repair removes.
+	history := []core.Message{winUser("q"), winUser("r"), winTool("gone")}
+
+	out, ok := w.RecoverContext(lc, history, recoveryOverflow(t, 100))
+	if ok {
+		t.Fatal("an empty result after pairing repair must not be returned")
+	}
+	if len(out) != len(history) {
+		t.Fatalf("rejected recovery changed the history: %d messages", len(out))
+	}
+	cancel()
+	if n := len(winDrainEvents(ch)); n != 0 {
+		t.Fatalf("a rejected recovery published %d events", n)
+	}
+}
+
+func TestWindowRecoverIgnoresStrategyBudget(t *testing.T) {
+	// The configured budget is enormous, so the normal path never trims. If
+	// recovery consulted it, this history would come back unchanged.
+	w := Window(WindowOptions{Strategy: SlidingWindow(1 << 30), Counter: newCounter(10)}).(*window)
+	lc := newLC(&core.State{}, nil)
+	history := winOverflowHistory()
+
+	out, ok := w.RecoverContext(lc, history, recoveryOverflow(t, 40))
+	if !ok {
+		t.Fatal("recovery must not consult the configured strategy budget")
+	}
+	if len(out) >= len(history) {
+		t.Fatalf("recovered history has %d messages, want fewer than %d", len(out), len(history))
+	}
+}

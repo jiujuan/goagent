@@ -953,6 +953,102 @@ func TestContextOverflowCompactionRecovery(t *testing.T) {
 	}
 }
 
+func TestContextOverflowWindowRecovery(t *testing.T) {
+	ctx := context.Background()
+	big := strings.Repeat("x", 200)
+	toolPair := func(id string) []core.Message {
+		return []core.Message{
+			{Role: core.RoleAssistant, Parts: []core.Part{core.ToolCall{ID: id, Name: "fetch", Args: []byte("{}")}}},
+			{Role: core.RoleTool, Parts: []core.Part{core.ToolResult{CallID: id, Name: "fetch", Content: []core.Part{core.Text{Text: big}}}}},
+		}
+	}
+	seed := []core.Message{core.UserText("user-0 " + big)}
+	seed = append(seed, toolPair("call-1")...)
+	seed = append(seed, core.UserText("user-3 "+big), core.UserText("user-4 "+big), core.UserText("user-5 "+big))
+	seed = append(seed, toolPair("call-2")...)
+	if len(seed) != 8 {
+		t.Fatalf("seed has %d messages, want 8", len(seed))
+	}
+
+	store := seededStore(t, seed)
+	m := &scriptModel{}
+	m.pick = func(call int, _ *llm.Request) (*llm.Response, error) {
+		if call == 1 {
+			return nil, overflowError(100, 300)
+		}
+		return mock.Text("done"), nil
+	}
+	a, err := agent.New(
+		agent.WithModel(m),
+		agent.WithMiddleware(middleware.Window(middleware.WindowOptions{
+			Strategy: middleware.SlidingWindow(1 << 30),
+			Counter:  perMessageCounter(10),
+		})),
+		agent.WithCheckpointer(store),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events, runErr := phase1Drain(t, a.Stream(ctx, "go", agent.OnThread(overflowThread)))
+	if runErr != nil {
+		t.Fatalf("run error: %v", runErr)
+	}
+	if got := m.calls(); got != 2 {
+		t.Fatalf("model calls = %d, want 2", got)
+	}
+	reqs := m.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("recorded requests = %d, want 2", len(reqs))
+	}
+	if got := len(reqs[0].Messages); got != 9 {
+		t.Fatalf("first request has %d messages, want 9", got)
+	}
+	if got := len(reqs[1].Messages); got != 4 {
+		t.Fatalf("retried request has %d messages, want 4", got)
+	}
+	if out := orphanToolResults(reqs[1].Messages); len(out) != 0 {
+		t.Fatalf("retried request carries orphan tool results: %v", out)
+	}
+
+	var trimmedAt, retriedAt, trimmedCount = -1, -1, 0
+	var trimmed core.WindowTrimmed
+	for i, ev := range events {
+		switch e := ev.(type) {
+		case core.WindowTrimmed:
+			trimmedCount++
+			if trimmedAt < 0 {
+				trimmedAt, trimmed = i, e
+			}
+		case core.ContextOverflowRetried:
+			if retriedAt < 0 {
+				retriedAt = i
+			}
+		}
+	}
+	if trimmedAt < 0 || retriedAt < 0 {
+		t.Fatalf("events missing WindowTrimmed (%d) or ContextOverflowRetried (%d)", trimmedAt, retriedAt)
+	}
+	if trimmedCount != 1 {
+		t.Fatalf("WindowTrimmed events = %d, want only the recovery event", trimmedCount)
+	}
+	if trimmedAt > retriedAt {
+		t.Fatalf("WindowTrimmed at %d came after ContextOverflowRetried at %d", trimmedAt, retriedAt)
+	}
+	if trimmed.Strategy != "overflow_tail" || trimmed.Dropped != 5 || trimmed.Kept != 4 || trimmed.EstTokens != 90 || trimmed.Step != 0 {
+		t.Fatalf("WindowTrimmed = %+v, want overflow_tail, Dropped 5, Kept 4, EstTokens 90, Step 0", trimmed)
+	}
+
+	cp, err := store.Latest(ctx, overflowThread)
+	if err != nil || cp == nil {
+		t.Fatalf("latest checkpoint: %v (nil=%v)", err, cp == nil)
+	}
+	want := append(append([]core.Message(nil), reqs[1].Messages...), core.AssistantText("done"))
+	if got, wantDigest := digest(cp.State.Messages), digest(want); got != wantDigest {
+		t.Fatalf("checkpoint messages = %q, want the recovered history plus the final reply %q", got, wantDigest)
+	}
+}
+
 func TestContextOverflowOptionNegativeIsDisabled(t *testing.T) {
 	ctx := context.Background()
 	overflow := overflowError(100, 300)
