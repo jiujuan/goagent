@@ -158,7 +158,7 @@ func (p *parallelRunner) run(rc *RunContext) runOutcome {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			results[i] = p.subs[i].runnable.run(branches[i])
+			results[i] = runChild(branches[i], p.subs[i].runnable)
 		}(i)
 	}
 	wg.Wait()

@@ -44,7 +44,7 @@ func (r *llmRunner) run(rc *RunContext) runOutcome {
 		fmt.Sprintf("→ 转交给 %s", target.cfg.name))})
 	// Delegate on the same State (the delegate continues the conversation),
 	// one level deeper.
-	return target.runnable.run(rc.deeper())
+	return runChild(rc.deeper(), target.runnable)
 }
 
 var _ Runnable = (*llmRunner)(nil)

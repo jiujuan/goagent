@@ -40,3 +40,15 @@ type runOutcome struct {
 func (o runOutcome) terminal() bool {
 	return o.Err != nil || o.Control.Kind == core.Interrupt
 }
+
+// runChild drives a derived child environment (transfer target, parallel
+// branch, DAG node, planner) and closes its steering queue before returning.
+// Such contexts each own a fresh queue that no outside caller can reach after
+// the child returns; closing it settles any message a middleware injected.
+// Sequential and Loop children share the parent's queue and are driven
+// directly, not through runChild.
+func runChild(rc *RunContext, r Runnable) runOutcome {
+	out := r.run(rc)
+	rc.steering.close(ErrRunClosed)
+	return out
+}

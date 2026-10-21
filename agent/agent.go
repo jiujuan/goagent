@@ -245,6 +245,9 @@ func (a *Agent) newRunHandleWithID(ctx context.Context, runID, threadID string, 
 		Store:    a.store,
 		State:    state,
 		durable:  newDurableRunState(),
+		// Only an LLM agent's own run may continue after a final answer. Workflow
+		// roots and derived child contexts keep the single-turn semantics.
+		topLevel: a.loop != nil,
 	}
 	// The lease lives on the durable state every nested run shares, so one run cannot
 	// commit under one lease while its claim was renewed under another.

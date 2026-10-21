@@ -154,7 +154,10 @@ func (l *AgentLoop) run(rc *RunContext) runOutcome {
 
 		// Phase 1 — PrepareTurn: drain volatile steering, then the durable inbox.
 		if steers := rc.steering.drain(); len(steers) > 0 {
-			history = append(history, steers...)
+			for _, e := range steers {
+				history = append(history, e.msg)
+			}
+			settleDelivered(steers, step)
 		}
 		if durable, ok := rc.durableStore(); ok {
 			inbox, err := durable.Inbox(rc, rc.ThreadID)

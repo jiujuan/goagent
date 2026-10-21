@@ -390,7 +390,7 @@ func (p *planRunner) execNode(rc *RunContext, node Node, input string) (string, 
 	if w == nil {
 		return "", fmt.Errorf("node %q has no worker (set Node.Worker or WithWorker)", node.ID)
 	}
-	out := w.runnable.run(rc.subRun(core.UserText(input)))
+	out := runChild(rc.subRun(core.UserText(input)), w.runnable)
 	if out.Err != nil {
 		return "", out.Err
 	}
@@ -406,7 +406,7 @@ func (p *planRunner) plan(rc *RunContext, existing map[string]Node, existingOrde
 	prompt := base
 	lastErr := ""
 	for attempt := 0; attempt < p.cfg.maxPlanAttempts; attempt++ {
-		out := p.cfg.planner.runnable.run(rc.subRun(core.UserText(prompt)))
+		out := runChild(rc.subRun(core.UserText(prompt)), p.cfg.planner.runnable)
 		if out.Err != nil {
 			rc.publish(core.PlanNodeDone{NodeID: plannerNodeID, Status: "failed", Err: out.Err})
 			return nil, out.Err
@@ -451,7 +451,7 @@ func (p *planRunner) maybeReplan(rc *RunContext, nodes map[string]Node, st *plan
 	}
 	rc.publish(core.PlanNodeStarted{NodeID: replanNodeID})
 	prompt := buildReplanPrompt(rc.State.KV[planInputKey], st.Output, order)
-	out := p.cfg.replanner.runnable.run(rc.subRun(core.UserText(prompt)))
+	out := runChild(rc.subRun(core.UserText(prompt)), p.cfg.replanner.runnable)
 	if out.Err != nil {
 		rc.publish(core.PlanNodeDone{NodeID: replanNodeID, Status: "failed", Err: out.Err})
 		return nil

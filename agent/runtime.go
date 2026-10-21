@@ -48,6 +48,11 @@ type RunContext struct {
 
 	steering steeringQueue
 
+	// topLevel marks the execution environment of a top-level LLM run, the only
+	// kind allowed to continue across turns. Derived contexts (deeper, subRun,
+	// forBranch) leave it false.
+	topLevel bool
+
 	// dynamic holds tools injected into this run by middleware
 	// (LoopContext.AddTool). It is consulted before the agent's static table, so an
 	// injection can replace an agent-level tool of the same name for this run only.
@@ -117,34 +122,13 @@ func (rc *RunContext) forBranch(branch string) (*RunContext, error) {
 }
 
 // Steer injects a message to be delivered before the next model call. Safe to
-// call from another goroutine while the run is in flight.
-func (rc *RunContext) Steer(msg core.Message) { rc.steering.push(msg) }
+// call from another goroutine while the run is in flight. The returned ticket
+// settles when the message reaches a step's model context or the run ends
+// without delivering it.
+func (rc *RunContext) Steer(msg core.Message) (*SteerTicket, error) { return rc.steering.push(msg) }
 
 // publish is the loop's single-goroutine event sink.
 func (rc *RunContext) publish(ev core.Event) { rc.Bus.Publish(rc.Topic, ev) }
-
-// steeringQueue is a tiny goroutine-safe FIFO of injected messages.
-type steeringQueue struct {
-	mu   sync.Mutex
-	msgs []core.Message
-}
-
-func (q *steeringQueue) push(m core.Message) {
-	q.mu.Lock()
-	q.msgs = append(q.msgs, m)
-	q.mu.Unlock()
-}
-
-func (q *steeringQueue) drain() []core.Message {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if len(q.msgs) == 0 {
-		return nil
-	}
-	out := q.msgs
-	q.msgs = nil
-	return out
-}
 
 // dynamicTools is a goroutine-safe name-to-tool table of run-scoped tools. The loop
 // writes it while preparing a step and reads it from the tool goroutines, so both

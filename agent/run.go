@@ -140,14 +140,19 @@ func (r *Run) Wait() (core.Result, error) {
 	}
 }
 
-// Steer injects a message to be delivered before the next model call.
-func (r *Run) Steer(msg core.Message) { r.rc.Steer(msg) }
+// Steer injects a message to be delivered before the next model call. The
+// returned ticket settles once the message reaches a step or the run ends
+// without delivering it.
+func (r *Run) Steer(msg core.Message) (*SteerTicket, error) { return r.rc.Steer(msg) }
 
 // Cancel aborts the run. A Resume owns a durable claim before lazy execution
 // starts, so canceling that prepared handle releases the claim synchronously.
+// The steering queue closes in the same call, so a message that will never be
+// delivered settles as stopped instead of waiting for the run to wind down.
 func (r *Run) Cancel() {
 	r.lifecycleMu.Lock()
 	r.cancel()
+	r.rc.steering.close(ErrRunStopped)
 	if !r.driveStarted {
 		r.cancelErr = errors.Join(r.cancelErr, r.rc.releaseDurableClaim())
 	}
@@ -233,6 +238,7 @@ func (r *Run) drive() {
 		go func() {
 			r.bus.Publish(r.topic, core.RunStarted{RunID: r.identity.runID, ThreadID: r.identity.threadID})
 			if r.startErr != nil {
+				r.rc.steering.close(ErrRunClosed)
 				err := errors.Join(r.startErr, r.rc.releaseDurableClaim())
 				r.freezeFailure(err)
 				r.bus.Publish(r.topic, core.RunFailed{Err: err})
@@ -240,6 +246,7 @@ func (r *Run) drive() {
 				return
 			}
 			if err := r.prepare(); err != nil {
+				r.rc.steering.close(ErrRunClosed)
 				r.lifecycleMu.Lock()
 				cancelErr := r.cancelErr
 				r.lifecycleMu.Unlock()
@@ -253,6 +260,7 @@ func (r *Run) drive() {
 				r.bus.Publish(r.topic, ev)
 			}
 			out := r.runnable.run(r.rc)
+			r.rc.steering.close(ErrRunClosed)
 			// The boundary is captured while the claim is still held, and the
 			// outcome is frozen with it before any terminal event goes out.
 			boundaryID, boundaryRev, boundaryOK := r.rc.committedBoundary()
