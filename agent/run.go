@@ -268,6 +268,14 @@ func (r *Run) drive() {
 				r.finish(core.Result{}, err)
 				return
 			}
+			task := r.rc.taskInfo()
+			r.bus.Publish(r.topic, core.TaskStarted{
+				TaskID:   task.ID,
+				ParentID: task.ParentID,
+				ThreadID: task.ThreadID,
+				Kind:     string(task.Kind),
+				Depth:    task.Depth,
+			})
 			for _, ev := range r.rc.drainApprovalEvents() {
 				r.bus.Publish(r.topic, ev)
 			}
@@ -279,6 +287,22 @@ func (r *Run) drive() {
 			cleanupErr := r.rc.releaseDurableClaim()
 			res, err, paused := terminalOutcome(out, cleanupErr)
 			r.freezeTerminal(boundaryID, boundaryRev, boundaryOK, res, err, paused)
+
+			// TaskDone reports the terminal outcome, including a failed claim
+			// release, but is still published before the run's terminal event.
+			statusOut := out
+			if err != nil {
+				statusOut.Err = err
+			}
+			if paused {
+				statusOut.Control = core.Directive{Kind: core.Interrupt}
+			}
+			r.bus.Publish(r.topic, core.TaskDone{
+				TaskID: task.ID,
+				Kind:   string(task.Kind),
+				Status: taskStatus(statusOut),
+				Err:    err,
+			})
 
 			switch {
 			case err != nil:

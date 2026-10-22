@@ -97,6 +97,22 @@ func (e *TaskBudgetError) Error() string {
 // Unwrap lets callers test errors.Is(err, ErrTaskBudgetExceeded).
 func (e *TaskBudgetError) Unwrap() error { return ErrTaskBudgetExceeded }
 
+// taskStatus maps a unit outcome to the TaskDone status. Pause wins over the
+// error because a paused run carries no terminal error; a context cancellation
+// (a canceled run or a canceled sibling branch) is reported as canceled.
+func taskStatus(out runOutcome) string {
+	switch {
+	case out.Control.Kind == core.Interrupt:
+		return "paused"
+	case out.Err == nil:
+		return "done"
+	case errors.Is(out.Err, context.Canceled):
+		return "canceled"
+	default:
+		return "failed"
+	}
+}
+
 // taskKind reports the configured execution form. Agents built directly
 // without New (workflow roots aside) fall back to chat.
 func (a *Agent) taskKind() TaskKind {

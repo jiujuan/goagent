@@ -27,6 +27,9 @@ func TestEventJSONRoundTrip(t *testing.T) {
 		Progress{Job: ProgressInfo{JobID: "j1", Kind: "video", Status: "running", Percent: 42}},
 		PlanNodeStarted{NodeID: "research"},
 		PlanNodeDone{NodeID: "research", Status: "failed", Err: errString("nope")},
+		TaskStarted{TaskID: "task_child", ParentID: "task_root", ThreadID: "t1", Kind: "workflow", Depth: 1},
+		TaskDone{TaskID: "task_child", Kind: "workflow", Status: "failed", Err: errString("boom")},
+		BranchCanceled{Name: "fast", Reason: errString("sibling failed")},
 	}
 
 	for _, ev := range events {

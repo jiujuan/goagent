@@ -155,10 +155,25 @@ func (p *parallelRunner) run(rc *RunContext) runOutcome {
 
 	var wg sync.WaitGroup
 	for i := range p.subs {
+		info := branches[i].taskInfo()
+		rc.publish(core.TaskStarted{
+			TaskID:   info.ID,
+			ParentID: info.ParentID,
+			ThreadID: info.ThreadID,
+			Kind:     string(info.Kind),
+			Depth:    info.Depth,
+		})
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			results[i] = runChild(branches[i], p.subs[i].runnable)
+			out := runChild(branches[i], p.subs[i].runnable)
+			results[i] = out
+			rc.publish(core.TaskDone{
+				TaskID: info.ID,
+				Kind:   string(info.Kind),
+				Status: taskStatus(out),
+				Err:    out.Err,
+			})
 		}(i)
 	}
 	wg.Wait()

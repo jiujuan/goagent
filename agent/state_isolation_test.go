@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/jiujuan/goagent/bus"
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/llm"
@@ -336,6 +337,8 @@ func testRunContext(state *core.State) *RunContext {
 	return &RunContext{
 		Context: context.Background(),
 		RunID:   "run",
+		Bus:     bus.New(),
+		Topic:   "test",
 		State:   state,
 		durable: newDurableRunState(),
 	}

@@ -65,6 +65,12 @@ type eventWire struct {
 	Executed int `json:"executed,omitempty"`
 	Unknown  int `json:"unknown,omitempty"`
 	Rejected int `json:"rejected,omitempty"`
+
+	TaskID   string `json:"task_id,omitempty"`
+	ParentID string `json:"parent_id,omitempty"`
+	Kind     string `json:"kind,omitempty"`
+	Depth    int    `json:"depth,omitempty"`
+	Name     string `json:"name,omitempty"`
 }
 
 // MarshalEvent encodes an Event to tagged JSON.
@@ -80,6 +86,19 @@ func MarshalEvent(ev Event) ([]byte, error) {
 		w.Type = "run_failed"
 		if e.Err != nil {
 			w.Err = e.Err.Error()
+		}
+	case TaskStarted:
+		w.Type, w.TaskID, w.ParentID = "task_started", e.TaskID, e.ParentID
+		w.ThreadID, w.Kind, w.Depth = e.ThreadID, e.Kind, e.Depth
+	case TaskDone:
+		w.Type, w.TaskID, w.Kind, w.Status = "task_done", e.TaskID, e.Kind, e.Status
+		if e.Err != nil {
+			w.Err = e.Err.Error()
+		}
+	case BranchCanceled:
+		w.Type, w.Name = "branch_canceled", e.Name
+		if e.Reason != nil {
+			w.Err = e.Reason.Error()
 		}
 	case TurnStarted:
 		w.Type, w.Step = "turn_started", e.Step
@@ -173,6 +192,18 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		return RunDone{Result: Result{Message: deref(w.Message)}}, nil
 	case "run_failed":
 		return RunFailed{Err: toErr(w.Err)}, nil
+	case "task_started":
+		return TaskStarted{
+			TaskID:   w.TaskID,
+			ParentID: w.ParentID,
+			ThreadID: w.ThreadID,
+			Kind:     w.Kind,
+			Depth:    w.Depth,
+		}, nil
+	case "task_done":
+		return TaskDone{TaskID: w.TaskID, Kind: w.Kind, Status: w.Status, Err: toErr(w.Err)}, nil
+	case "branch_canceled":
+		return BranchCanceled{Name: w.Name, Reason: toErr(w.Err)}, nil
 	case "turn_started":
 		return TurnStarted{Step: w.Step}, nil
 	case "turn_done":

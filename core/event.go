@@ -32,6 +32,36 @@ type RunFailed struct {
 	Err error
 }
 
+// --- Task -------------------------------------------------------------------
+
+// TaskStarted is emitted when one runtime task begins: the root task of a run,
+// an AsTool child run, a Parallel branch, or a DAG node. Depth is 0 for a root
+// and grows by one per derived task; ParentID is empty for a root.
+type TaskStarted struct {
+	TaskID   string
+	ParentID string
+	ThreadID string
+	Kind     string
+	Depth    int
+}
+
+// TaskDone is emitted when a task settles. Status is "done" | "failed" |
+// "canceled" | "paused"; Err is set for failures and cancellations.
+type TaskDone struct {
+	TaskID string
+	Kind   string
+	Status string
+	Err    error
+}
+
+// BranchCanceled is emitted by Parallel for each sibling branch it cancels
+// after another branch failed. It is observational only: the root cause travels
+// through RunFailed and the terminal TaskDone.
+type BranchCanceled struct {
+	Name   string
+	Reason error
+}
+
 // --- Turn / message ---------------------------------------------------------
 
 // TurnStarted marks the start of one model-call step (0-indexed).
@@ -265,6 +295,9 @@ type ModelPreempted struct {
 func (RunStarted) isEvent()             {}
 func (RunDone) isEvent()                {}
 func (RunFailed) isEvent()              {}
+func (TaskStarted) isEvent()            {}
+func (TaskDone) isEvent()               {}
+func (BranchCanceled) isEvent()         {}
 func (TurnStarted) isEvent()            {}
 func (TurnDone) isEvent()               {}
 func (MessageDelta) isEvent()           {}

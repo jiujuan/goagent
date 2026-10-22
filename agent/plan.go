@@ -400,7 +400,21 @@ func (p *planRunner) execNode(rc *RunContext, node Node, input string) (string, 
 	if err != nil {
 		return "", err
 	}
+	info := child.taskInfo()
+	rc.publish(core.TaskStarted{
+		TaskID:   info.ID,
+		ParentID: info.ParentID,
+		ThreadID: info.ThreadID,
+		Kind:     string(info.Kind),
+		Depth:    info.Depth,
+	})
 	out := runChild(child, w.runnable)
+	rc.publish(core.TaskDone{
+		TaskID: info.ID,
+		Kind:   string(info.Kind),
+		Status: taskStatus(out),
+		Err:    out.Err,
+	})
 	if out.Err != nil {
 		return "", out.Err
 	}
