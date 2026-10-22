@@ -184,8 +184,12 @@ func (f *File) Deliver(ctx context.Context, threadID string, msg InboxMessage) (
 	if threadID == "" || msg.ID == "" {
 		return DeliveryReceipt{}, fmt.Errorf("checkpoint: durable delivery requires thread ID and message ID")
 	}
+	msg, err := normalizeInboxMessage(msg)
+	if err != nil {
+		return DeliveryReceipt{}, err
+	}
 	var receipt DeliveryReceipt
-	err := f.withThread(ctx, threadID, func(st *fileState) error {
+	err = f.withThread(ctx, threadID, func(st *fileState) error {
 		if old, ok := st.inbox[msg.ID]; ok {
 			same, err := sameInboxMessage(old, msg)
 			if err != nil {
@@ -194,7 +198,7 @@ func (f *File) Deliver(ctx context.Context, threadID string, msg InboxMessage) (
 			if !same {
 				return fmt.Errorf("checkpoint: inbox message ID %q conflicts with existing payload", msg.ID)
 			}
-			receipt = DeliveryReceipt{ID: msg.ID, Duplicate: true}
+			receipt = DeliveryReceipt{ID: msg.ID, Duplicate: true, State: core.InputStateQueued}
 			return nil
 		}
 		rec := journalRecord{Version: durableFormatVersion, Kind: recordInboxDeliver, Inbox: &msg}
@@ -202,7 +206,7 @@ func (f *File) Deliver(ctx context.Context, threadID string, msg InboxMessage) (
 			return err
 		}
 		applyJournalRecord(st, rec)
-		receipt = DeliveryReceipt{ID: msg.ID}
+		receipt = DeliveryReceipt{ID: msg.ID, State: core.InputStateQueued}
 		return nil
 	})
 	return receipt, err
@@ -746,6 +750,12 @@ func validateJournalRecord(rec journalRecord) error {
 		if rec.Inbox == nil || rec.Inbox.ID == "" {
 			return errors.New("invalid inbox delivery")
 		}
+		// A stored record whose phase is outside the closed set would leave the
+		// loop guessing when to deliver it, so the whole file fails to replay.
+		// The empty phase stays valid: it is how records written before phases existed.
+		if _, err := core.NormalizeInputPhase(rec.Inbox.Phase); err != nil {
+			return fmt.Errorf("invalid inbox delivery: %w", err)
+		}
 	case recordClaim:
 		if rec.Claim == nil || rec.Claim.ThreadID == "" {
 			return errors.New("invalid claim")
@@ -781,7 +791,11 @@ func applyJournalRecord(st *fileState, rec journalRecord) {
 	switch rec.Kind {
 	case recordInboxDeliver:
 		if _, exists := st.inbox[rec.Inbox.ID]; !exists {
-			st.inbox[rec.Inbox.ID] = *rec.Inbox
+			msg := *rec.Inbox
+			// Replay only accepts a known or empty phase, so this normalization
+			// cannot fail; it gives a legacy record the same phase a new one carries.
+			msg.Phase, _ = core.NormalizeInputPhase(msg.Phase)
+			st.inbox[rec.Inbox.ID] = msg
 			st.inboxOrder = append(st.inboxOrder, rec.Inbox.ID)
 		}
 	case recordClaim:

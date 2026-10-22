@@ -733,6 +733,90 @@ func mustReadFile(t *testing.T, path string) []byte {
 	return data
 }
 
+// appendJournalLine writes one record straight into a thread's journal, the way
+// a crashed writer or an older build would have. Each access replays the file,
+// so the next call sees it.
+func appendJournalLine(t *testing.T, store *File, threadID string, rec journalRecord) {
+	t.Helper()
+	line, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(store.dir, threadID+".jsonl")
+	fh, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fh.Close()
+	if _, err := fh.Write(append(line, '\n')); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFileJournalValidatesInboxPhase(t *testing.T) {
+	ctx := context.Background()
+	store, err := NewFile(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Deliver(ctx, "phase", InboxMessage{ID: "m1", Message: core.UserText("keep")}); err != nil {
+		t.Fatal(err)
+	}
+	appendJournalLine(t, store, "phase", journalRecord{
+		Version: durableFormatVersion,
+		Kind:    recordInboxDeliver,
+		Inbox:   &InboxMessage{ID: "m2", Message: core.UserText("odd"), Phase: core.InputPhase("later")},
+	})
+
+	inbox, err := store.Inbox(ctx, "phase")
+	if err == nil {
+		t.Fatalf("journal with an unknown inbox phase replayed as %+v, want a validation error", inbox)
+	}
+	if !strings.Contains(err.Error(), "corrupt") || !errors.Is(err, core.ErrUnknownInputPhase) {
+		t.Fatalf("replay error = %v, want a corrupt record reporting the unknown phase", err)
+	}
+}
+
+// TestFileJournalLegacyInboxRecordReadsAsBeforeModel is the upgrade case: a
+// record written before inbox messages carried a phase has no phase field at
+// all, and must read back as the delivery point it always had.
+func TestFileJournalLegacyInboxRecordReadsAsBeforeModel(t *testing.T) {
+	ctx := context.Background()
+	store, err := NewFile(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendJournalLine(t, store, "legacy", journalRecord{
+		Version: durableFormatVersion,
+		Kind:    recordInboxDeliver,
+		Inbox:   &InboxMessage{ID: "old", Message: core.UserText("written before phases")},
+	})
+
+	inbox, err := store.Inbox(ctx, "legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inbox) != 1 {
+		t.Fatalf("inbox = %+v, want the legacy record", inbox)
+	}
+	if inbox[0].Phase != core.InputBeforeModel {
+		t.Fatalf("legacy record phase = %q, want before_model", inbox[0].Phase)
+	}
+
+	// A producer that stored this message before the upgrade and retries it now
+	// names the phase explicitly. Same instruction, so it stays a duplicate —
+	// the raw stored value cannot be compared without normalizing on replay.
+	receipt, err := store.Deliver(ctx, "legacy", InboxMessage{
+		ID: "old", Message: core.UserText("written before phases"), Phase: core.InputBeforeModel,
+	})
+	if err != nil {
+		t.Fatalf("retry after upgrade: %v", err)
+	}
+	if !receipt.Duplicate || receipt.State != core.InputStateQueued {
+		t.Fatalf("retry receipt = %+v, want duplicate and queued", receipt)
+	}
+}
+
 func journalKindCount(t *testing.T, path, kind string) int {
 	t.Helper()
 	data := mustReadFile(t, path)

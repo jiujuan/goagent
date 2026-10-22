@@ -66,6 +66,10 @@ func (m *Memory) Deliver(_ context.Context, threadID string, msg InboxMessage) (
 	if threadID == "" || msg.ID == "" {
 		return DeliveryReceipt{}, fmt.Errorf("checkpoint: durable delivery requires thread ID and message ID")
 	}
+	msg, err := normalizeInboxMessage(msg)
+	if err != nil {
+		return DeliveryReceipt{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	st := m.durableLocked(threadID)
@@ -77,11 +81,11 @@ func (m *Memory) Deliver(_ context.Context, threadID string, msg InboxMessage) (
 		if !same {
 			return DeliveryReceipt{}, fmt.Errorf("checkpoint: inbox message ID %q conflicts with existing payload", msg.ID)
 		}
-		return DeliveryReceipt{ID: msg.ID, Duplicate: true}, nil
+		return DeliveryReceipt{ID: msg.ID, Duplicate: true, State: core.InputStateQueued}, nil
 	}
 	st.inbox[msg.ID] = msg
 	st.inboxOrder = append(st.inboxOrder, msg.ID)
-	return DeliveryReceipt{ID: msg.ID}, nil
+	return DeliveryReceipt{ID: msg.ID, State: core.InputStateQueued}, nil
 }
 
 func (m *Memory) Inbox(_ context.Context, threadID string) ([]InboxMessage, error) {
@@ -416,7 +420,15 @@ func cloneClaim(in *Claim) *Claim {
 	return &out
 }
 
+// sameInboxMessage decides whether a retry with an existing message ID is the
+// same instruction. Both sides arrive normalized, so an empty phase and an
+// explicit before_model compare equal while a phase change under the same ID is
+// a conflict: the producer changed when the message may be delivered, so the
+// stored record no longer describes what is being asked for.
 func sameInboxMessage(a, b InboxMessage) (bool, error) {
+	if a.Phase != b.Phase {
+		return false, nil
+	}
 	aa, err := json.Marshal(a.Message)
 	if err != nil {
 		return false, err

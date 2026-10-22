@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -476,4 +477,137 @@ func containsLine(lines []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestDeliverWithAgentPhase is the durable end of the phase contract: a record
+// delivered before the run starts arrives at the first step whether it asks for
+// before_model or is left unset (Agent.Deliver), while a next_turn record that
+// arrives mid-turn stays in the inbox until the turn restarts. Parking the step-1
+// model call is what puts the delivery inside the turn instead of before it.
+func TestDeliverWithAgentPhase(t *testing.T) {
+	ctx := context.Background()
+	store := checkpoint.NewMemory()
+	thread := "phase-thread"
+	if _, err := store.Deliver(ctx, thread, checkpoint.InboxMessage{
+		ID:      "now",
+		Message: core.UserText("durable now"),
+	}); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+
+	m := newBlockedCallModel(2, func(call int, _ *llm.Request) *llm.Response {
+		switch call {
+		case 1:
+			return mock.CallTool("c1", "quick", `{}`)
+		case 2:
+			return mock.CallTool("c2", "quick", `{}`)
+		case 3:
+			return mock.Text("mid")
+		default:
+			return mock.Text("final")
+		}
+	})
+	a, err := agent.New(agent.WithModel(m), agent.WithTools(quickTool("quick")), agent.WithCheckpointer(store))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	run := a.Stream(ctx, "start", agent.OnThread(thread))
+	driven := make(chan []core.Event, 1)
+	go func() {
+		events, res, err := collectRun(t, run)
+		if err != nil {
+			t.Errorf("run: %v", err)
+		}
+		if got := res.Message.Text(); got != "final" {
+			t.Errorf("result = %q, want final", got)
+		}
+		driven <- events
+	}()
+	releaseOnce := sync.OnceFunc(func() { close(m.release) })
+	t.Cleanup(releaseOnce)
+	go func() {
+		<-m.entered
+		if _, err := a.DeliverWith(ctx, thread, checkpoint.InboxMessage{
+			ID:      "later",
+			Message: core.UserText("durable later"),
+		}, core.InputNextTurn); err != nil {
+			t.Errorf("DeliverWith: %v", err)
+		}
+		releaseOnce()
+	}()
+	events := <-driven
+
+	history := m.history()
+	if len(history) != 4 {
+		t.Fatalf("model calls = %d, want 4", len(history))
+	}
+	if !hasText(history[0], "durable now") {
+		t.Fatalf("the unset-phase inbox message skipped the first step: %v", history[0])
+	}
+	if hasText(history[2], "durable later") {
+		t.Fatalf("the next_turn inbox message arrived mid-turn: %v", history[2])
+	}
+	if !hasText(history[3], "durable later") {
+		t.Fatalf("the next_turn inbox message never arrived: %v", history[3])
+	}
+
+	var sawNow, sawLater bool
+	for _, e := range deliveredEvents(events) {
+		if e.Source != core.InputDurable {
+			continue
+		}
+		switch e.Phase {
+		case core.InputBeforeModel:
+			sawNow = true
+			if e.Step != 0 || len(e.MessageIDs) != 1 || e.MessageIDs[0] != "now" || e.Count != 1 {
+				t.Fatalf("before_model durable delivery = %+v, want step 0 with only ID now", e)
+			}
+		case core.InputNextTurn:
+			sawLater = true
+			if e.Step != 3 || len(e.MessageIDs) != 1 || e.MessageIDs[0] != "later" || e.Count != 1 {
+				t.Fatalf("next_turn durable delivery = %+v, want step 3 with only ID later", e)
+			}
+		default:
+			t.Fatalf("unexpected durable delivery phase %q", e.Phase)
+		}
+	}
+	if !sawNow || !sawLater {
+		t.Fatalf("durable delivery events missing before_model=%v next_turn=%v", sawNow, sawLater)
+	}
+
+	inbox, err := store.Inbox(ctx, thread)
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if len(inbox) != 0 {
+		t.Fatalf("inbox still holds %+v after both messages were consumed", inbox)
+	}
+}
+
+// TestDeliverRejectsUnknownPhase keeps an unreadable delivery instruction out of
+// the inbox instead of letting a later run guess what it meant.
+func TestDeliverRejectsUnknownPhase(t *testing.T) {
+	ctx := context.Background()
+	store := checkpoint.NewMemory()
+	a, err := agent.New(agent.WithModel(mock.New("stub", func(*llm.Request) *llm.Response {
+		return mock.Text("done")
+	})), agent.WithCheckpointer(store))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = a.DeliverWith(ctx, "reject-thread", checkpoint.InboxMessage{
+		ID:      "bad",
+		Message: core.UserText("odd"),
+	}, core.InputPhase("later"))
+	if !errors.Is(err, core.ErrUnknownInputPhase) {
+		t.Fatalf("DeliverWith error = %v, want ErrUnknownInputPhase", err)
+	}
+	inbox, err := store.Inbox(ctx, "reject-thread")
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if len(inbox) != 0 {
+		t.Fatalf("inbox = %+v, want the refused message absent", inbox)
+	}
 }

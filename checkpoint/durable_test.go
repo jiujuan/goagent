@@ -3,6 +3,7 @@ package checkpoint_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -177,6 +178,113 @@ func TestToolOutcomeUnknownAfterCrash(t *testing.T) {
 		unknown, err := backend.store.ClaimTool(ctx, req)
 		if !errors.Is(err, checkpoint.ErrToolOutcomeUnknown) || unknown.State != checkpoint.ToolUnknown {
 			t.Fatalf("recovered tool claim = %+v err=%v, want unknown", unknown, err)
+		}
+	})
+}
+
+func TestInboxPhaseRoundTripMemoryAndFile(t *testing.T) {
+	eachDurableBackend(t, func(t *testing.T, backend durableBackend) {
+		ctx := context.Background()
+		if _, err := backend.store.Deliver(ctx, "thread", checkpoint.InboxMessage{
+			ID:      "no-phase",
+			Message: core.UserText("first"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := backend.store.Deliver(ctx, "thread", checkpoint.InboxMessage{
+			ID:      "with-phase",
+			Message: core.UserText("second"),
+			Phase:   core.InputNextTurn,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		inbox, err := backend.store.Inbox(ctx, "thread")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(inbox) != 2 {
+			t.Fatalf("inbox holds %d messages, want 2", len(inbox))
+		}
+		if inbox[0].ID != "no-phase" || inbox[0].Phase != core.InputBeforeModel {
+			t.Fatalf("first record = %+v, want the empty phase stored as before_model", inbox[0])
+		}
+		if inbox[1].ID != "with-phase" || inbox[1].Phase != core.InputNextTurn {
+			t.Fatalf("second record = %+v, want next_turn", inbox[1])
+		}
+	})
+}
+
+func TestInboxSameIDDifferentPhaseConflicts(t *testing.T) {
+	eachDurableBackend(t, func(t *testing.T, backend durableBackend) {
+		ctx := context.Background()
+		msg := core.UserText("same words")
+		if _, err := backend.store.Deliver(ctx, "thread", checkpoint.InboxMessage{
+			ID: "dup", Message: msg, Phase: core.InputBeforeModel,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_, err := backend.store.Deliver(ctx, "thread", checkpoint.InboxMessage{
+			ID: "dup", Message: msg, Phase: core.InputNextTurn,
+		})
+		if err == nil {
+			t.Fatal("a phase change under the same ID must conflict, not redeliver")
+		}
+		if !strings.Contains(err.Error(), "dup") {
+			t.Fatalf("conflict error = %v, want it to name the message ID", err)
+		}
+		inbox, err := backend.store.Inbox(ctx, "thread")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(inbox) != 1 || inbox[0].Phase != core.InputBeforeModel {
+			t.Fatalf("inbox = %+v, want the original record untouched", inbox)
+		}
+	})
+}
+
+func TestInboxSameIDSamePhaseIsDuplicate(t *testing.T) {
+	eachDurableBackend(t, func(t *testing.T, backend durableBackend) {
+		ctx := context.Background()
+		msg := core.UserText("retry me")
+		first, err := backend.store.Deliver(ctx, "thread", checkpoint.InboxMessage{
+			ID: "same", Message: msg,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first.ID != "same" || first.Duplicate || first.State != core.InputStateQueued {
+			t.Fatalf("first receipt = %+v, want accepted and queued", first)
+		}
+		// An empty phase and an explicit before_model are the same instruction, so
+		// a producer retry after an ambiguous failure stays a duplicate.
+		again, err := backend.store.Deliver(ctx, "thread", checkpoint.InboxMessage{
+			ID: "same", Message: msg, Phase: core.InputBeforeModel,
+		})
+		if err != nil {
+			t.Fatalf("retry with an equivalent phase: %v", err)
+		}
+		if !again.Duplicate || again.State != core.InputStateQueued {
+			t.Fatalf("retry receipt = %+v, want duplicate and queued", again)
+		}
+	})
+}
+
+func TestInboxUnknownPhaseRejected(t *testing.T) {
+	eachDurableBackend(t, func(t *testing.T, backend durableBackend) {
+		ctx := context.Background()
+		_, err := backend.store.Deliver(ctx, "thread", checkpoint.InboxMessage{
+			ID: "bad", Message: core.UserText("odd"), Phase: core.InputPhase("later"),
+		})
+		if !errors.Is(err, core.ErrUnknownInputPhase) {
+			t.Fatalf("unknown phase error = %v, want ErrUnknownInputPhase", err)
+		}
+		inbox, err := backend.store.Inbox(ctx, "thread")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(inbox) != 0 {
+			t.Fatalf("inbox = %+v, want the refused record absent", inbox)
 		}
 	})
 }

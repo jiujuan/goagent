@@ -40,8 +40,10 @@ func (q inputQueue) takeVolatilePhase(phase core.InputPhase) []steerEntry {
 // acknowledgement commits with the next checkpoint, which is what makes input
 // delivery and the conversation it influenced one atomic step.
 //
-// newTurn is not consulted yet. Durable records carry no delivery phase until
-// the inbox stores one, so every inbox message is eligible now.
+// newTurn filters by phase exactly like the volatile queue: mid-turn steps keep
+// a next_turn message in the inbox. Any other phase, including the empty value
+// a record written before phases existed carries, means "by the next
+// PrepareTurn" and is eligible now.
 func (q inputQueue) takeDurable(ctx context.Context, newTurn bool) ([]checkpoint.InboxMessage, error) {
 	if q.durable == nil {
 		return nil, nil
@@ -57,6 +59,9 @@ func (q inputQueue) takeDurable(ctx context.Context, newTurn bool) ([]checkpoint
 	out := make([]checkpoint.InboxMessage, 0, len(inbox))
 	for _, msg := range inbox {
 		if _, dup := acked[msg.ID]; dup {
+			continue
+		}
+		if !newTurn && msg.Phase == core.InputNextTurn {
 			continue
 		}
 		out = append(out, msg)
@@ -88,25 +93,28 @@ func (rc *RunContext) publishDeliveredVolatile(step int, entries []steerEntry, p
 	}
 }
 
-// publishDeliveredDurable reports the inbox messages a delivery point appended.
-// MessageIDs lets a producer correlate its own delivery with the step that read
-// it; the acknowledgement itself only lands with the next checkpoint.
+// publishDeliveredDurable reports the inbox messages a delivery point appended,
+// grouped by phase so a consumer can tell a message that reached the window it
+// asked for from one that arrived early. MessageIDs let a producer correlate its
+// own delivery with the step that read it; the acknowledgement itself only lands
+// with the next checkpoint.
 func (rc *RunContext) publishDeliveredDurable(step int, msgs []checkpoint.InboxMessage, preempted bool) {
-	if len(msgs) == 0 {
-		return
+	for _, phase := range inboxMessagePhases(msgs) {
+		var ids []string
+		for _, msg := range msgs {
+			if msg.Phase == phase {
+				ids = append(ids, msg.ID)
+			}
+		}
+		rc.publish(core.InputDelivered{
+			Step:       step,
+			Source:     core.InputDurable,
+			Phase:      phase,
+			Count:      len(ids),
+			MessageIDs: ids,
+			Preempted:  preempted,
+		})
 	}
-	ids := make([]string, 0, len(msgs))
-	for _, msg := range msgs {
-		ids = append(ids, msg.ID)
-	}
-	rc.publish(core.InputDelivered{
-		Step:       step,
-		Source:     core.InputDurable,
-		Phase:      core.InputBeforeModel,
-		Count:      len(msgs),
-		MessageIDs: ids,
-		Preempted:  preempted,
-	})
 }
 
 // steerEntryPhases lists the distinct phases in first-seen order.
@@ -119,6 +127,21 @@ func steerEntryPhases(entries []steerEntry) []core.InputPhase {
 		}
 		seen[e.phase] = struct{}{}
 		out = append(out, e.phase)
+	}
+	return out
+}
+
+// inboxMessagePhases lists the distinct phases of inbox records in first-seen
+// order, the same rule the volatile grouping uses.
+func inboxMessagePhases(msgs []checkpoint.InboxMessage) []core.InputPhase {
+	seen := make(map[core.InputPhase]struct{}, len(msgs))
+	out := make([]core.InputPhase, 0, len(msgs))
+	for _, msg := range msgs {
+		if _, ok := seen[msg.Phase]; ok {
+			continue
+		}
+		seen[msg.Phase] = struct{}{}
+		out = append(out, msg.Phase)
 	}
 	return out
 }

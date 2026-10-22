@@ -1,8 +1,11 @@
 package agent
 
 import (
+	"slices"
 	"testing"
+	"time"
 
+	"github.com/jiujuan/goagent/bus"
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/llm/mock"
@@ -115,5 +118,76 @@ func TestInputQueueWithoutDurableStore(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("takeDurable = %+v, want nil", got)
+	}
+}
+
+// TestInputQueueTakeDurableKeepsNextTurnMidTurn mirrors the volatile queue rule
+// on the durable channel: a mid-turn read leaves a next_turn record in the
+// inbox, and the same record is taken once the turn restarts.
+func TestInputQueueTakeDurableKeepsNextTurnMidTurn(t *testing.T) {
+	rc, q := inputQueueFor(t, "thread-next-turn",
+		checkpoint.InboxMessage{ID: "later", Message: core.UserText("later"), Phase: core.InputNextTurn},
+		checkpoint.InboxMessage{ID: "now", Message: core.UserText("now"), Phase: core.InputBeforeModel},
+	)
+
+	got, err := q.takeDurable(rc, false)
+	if err != nil {
+		t.Fatalf("takeDurable mid-turn: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "now" {
+		t.Fatalf("mid-turn takeDurable = %+v, want only the before_model record", got)
+	}
+	// A read only hides a record once the loop has registered its acknowledgement,
+	// which is what the delivery point does when it appends the message.
+	rc.addInboxAcks([]string{"now"})
+	got, err = q.takeDurable(rc, true)
+	if err != nil {
+		t.Fatalf("takeDurable at a new turn: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "later" {
+		t.Fatalf("new-turn takeDurable = %+v, want the next_turn record", got)
+	}
+}
+
+func TestPublishDeliveredDurableGroupsByPhase(t *testing.T) {
+	rc, _ := inputQueueFor(t, "thread-group")
+	events, cancel := rc.Bus.Subscribe(rc.Topic, bus.Lossy)
+	defer cancel()
+
+	rc.publishDeliveredDurable(2, []checkpoint.InboxMessage{
+		{ID: "a", Phase: core.InputNextTurn},
+		{ID: "b", Phase: core.InputBeforeModel},
+		{ID: "c", Phase: core.InputNextTurn},
+	}, false)
+
+	var got []core.InputDelivered
+	for len(got) < 2 {
+		select {
+		case ev := <-events:
+			if d, ok := ev.(core.InputDelivered); ok {
+				got = append(got, d)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("delivery events = %+v, want one per phase", got)
+		}
+	}
+	want := []struct {
+		phase core.InputPhase
+		ids   []string
+	}{
+		{core.InputNextTurn, []string{"a", "c"}},
+		{core.InputBeforeModel, []string{"b"}},
+	}
+	for i, w := range want {
+		e := got[i]
+		if e.Source != core.InputDurable || e.Phase != w.phase || e.Step != 2 || e.Preempted {
+			t.Fatalf("delivery event %d = %+v, want durable %s at step 2", i, e, w.phase)
+		}
+		if e.Count != len(w.ids) || !slices.Equal(e.MessageIDs, w.ids) {
+			t.Fatalf("delivery event %d = %+v, want IDs %v", i, e, w.ids)
+		}
+	}
+	if len(events) != 0 {
+		t.Fatalf("extra delivery events published: %+v", events)
 	}
 }

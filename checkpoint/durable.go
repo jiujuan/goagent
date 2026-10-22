@@ -3,6 +3,7 @@ package checkpoint
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jiujuan/goagent/core"
@@ -57,14 +58,36 @@ const DefaultLease = 30 * time.Second
 // InboxMessage is one durable, redeliverable message. ID is supplied by the
 // producer and is the idempotency key for delivery; it must remain stable when
 // a producer retries after an ambiguous transport failure.
+//
+// Phase is the latest point in a run at which the message may be delivered. The
+// empty value means core.InputBeforeModel, so records written before phases
+// existed keep their current delivery time. Deliver normalizes it, so a stored
+// record always carries an explicit phase.
 type InboxMessage struct {
-	ID      string       `json:"id"`
-	Message core.Message `json:"message"`
+	ID      string          `json:"id"`
+	Message core.Message    `json:"message"`
+	Phase   core.InputPhase `json:"phase,omitempty"`
 }
 
+// DeliveryReceipt reports what a Deliver call did with one message ID. State is
+// Queued for both a new record and a duplicate retry: the message is in the
+// inbox either way, and delivery happens later, inside a run.
 type DeliveryReceipt struct {
 	ID        string
 	Duplicate bool
+	State     core.InputState
+}
+
+// normalizeInboxMessage fills in the default phase and refuses a phase outside
+// the closed set, so a store never holds a record whose delivery point is
+// ambiguous. Every Deliver path runs it before touching persistent state.
+func normalizeInboxMessage(msg InboxMessage) (InboxMessage, error) {
+	phase, err := core.NormalizeInputPhase(msg.Phase)
+	if err != nil {
+		return InboxMessage{}, fmt.Errorf("checkpoint: inbox message %q: %w", msg.ID, err)
+	}
+	msg.Phase = phase
+	return msg, nil
 }
 
 // ClaimRequest uses the latest checkpoint revision and pause ID as a CAS
