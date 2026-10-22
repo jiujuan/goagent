@@ -247,7 +247,8 @@ func (a *Agent) newRunHandleWithID(ctx context.Context, runID, threadID string, 
 		durable:  newDurableRunState(),
 		// The queue owns the preemption switch so a message is refused at
 		// enqueue time when the agent cannot honor it.
-		steering: steeringQueue{preemptionEnabled: a.cfg.inputPreemption},
+		steering:      steeringQueue{preemptionEnabled: a.cfg.inputPreemption},
+		preemptedStep: -1,
 		// Only an LLM agent's own run may continue after a final answer. Workflow
 		// roots and derived child contexts keep the single-turn semantics.
 		topLevel: a.loop != nil,

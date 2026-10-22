@@ -21,6 +21,10 @@ var ErrMaxTurnsExceeded = errors.New("agent: loop exceeded MaxTurns")
 // an Interrupted event must always correspond to a saved checkpoint.
 var ErrCheckpointUnavailable = errors.New("agent: checkpoint store is required for a recoverable pause")
 
+// ErrModelNoFinal is returned when a model stream ends without a non-partial
+// response and no preemption or error explains why.
+var ErrModelNoFinal = errors.New("agent: model stream ended without a final response")
+
 const defaultMaxTurns = 16
 
 // AgentLoop is the runtime's controllable loop, an explicit phase machine. One
@@ -376,32 +380,96 @@ func (l *AgentLoop) runStep(rc *RunContext, st taskState) (runOutcome, taskState
 		return l.fail(rc, step, history, view.snapshot(), err), st, false
 	}
 
-	// Derive the context for this model call. An observability middleware
-	// (ModelContexter) injects its span here so the provider call — and any
-	// downstream traceparent — nests under it. With no such middleware,
-	// genCtx == rc.Context.
-	genCtx := l.mw.ModelContext(lc, rc.Context)
-
-	// A typed context-length overflow may be recovered inside this step. The
-	// retry request is rebuilt from the frozen view (only Messages changes), so
-	// request rewrites run once. Nothing is retried after output was emitted, on
-	// a cancelled run, or once the step's recovery budget is spent.
+	// A model call may be retried inside this step for two independent reasons:
+	// steering input preempted it, or the provider reported a typed
+	// context-length overflow. Each retry rebuilds the request from the frozen
+	// view (System/Tools/Options unchanged, Messages replaced), so request
+	// rewrites run once. The two recovery budgets count separately. Nothing is
+	// retried after output was emitted (overflow), on a cancelled run, or once
+	// the step's overflow budget is spent.
 	attempts := 0
 	var (
 		finalResp *llm.Response
 		final     core.Message
 	)
 	for {
-		resp, _, emitted, err := l.streamModel(genCtx, rc, lc, req)
-		if err == nil {
+		// An observability middleware (ModelContexter) injects its span here so
+		// the provider call — and any downstream traceparent — nests under it.
+		// Each attempt gets a fresh span and its own cancellable context, which
+		// is what a preemption request cancels.
+		attemptCtx, attempt := rc.beginModelAttempt(l.mw.ModelContext(lc, rc.Context), step)
+		resp, ok, emitted, err := l.streamModel(attemptCtx, rc, lc, req)
+		// Read cancellation before endModelAttempt releases the attempt context,
+		// which it cancels unconditionally.
+		attemptCanceled := attemptCtx.Err() != nil
+		preempted := rc.endModelAttempt(attempt)
+
+		// Success wins: if a response completed while the request raced in, use
+		// it and let the steering message wait for a normal delivery point.
+		if err == nil && ok {
 			finalResp = resp
 			final = resp.Message
 			break
 		}
 
+		// Run cancellation also cancels the attempt context; it wins over
+		// preemption, so only an uncancelled run retries the step.
+		if preempted && rc.Context.Err() == nil {
+			entries := rc.inputs().takeVolatilePhase(core.InputBeforeModel)
+			for _, e := range entries {
+				history = append(history, e.msg)
+			}
+			rc.publish(core.ModelPreempted{
+				Step:    step,
+				Emitted: emitted,
+				Count:   len(entries),
+				Reason:  attempt.reason,
+			})
+
+			retryReq := &llm.Request{
+				System:   view.System(),
+				Messages: history,
+				Tools:    view.Tools().Schemas(),
+				Options:  view.Options(),
+			}
+			retryView, ferr := l.freezeStepView(lc, retryReq)
+			if ferr != nil {
+				settleUndelivered(entries, ErrRunClosed)
+				return l.fail(rc, step, history, lc.viewSnapshot(), errors.Join(err, ferr)), st, false
+			}
+			rc.State.Messages = history
+			if cerr := l.checkpoint(rc, commitOptions{
+				Step:     step,
+				Snapshot: retryView.snapshot(),
+				Release:  false,
+			}); cerr != nil {
+				settleUndelivered(entries, ErrRunClosed)
+				return l.fail(rc, step, history, retryView.snapshot(), errors.Join(err, cerr)), st, false
+			}
+			settleDelivered(entries, step)
+			rc.publishDeliveredVolatile(step, entries, true)
+
+			lc.History = history
+			lc.Request = retryReq
+			req = retryReq
+			view = retryView
+			lc.view = view
+			continue
+		}
+
+		if err == nil {
+			// The provider ended the stream without a final response. On a
+			// cancelled run, the cancellation is the cause worth reporting.
+			if ctxErr := rc.Context.Err(); ctxErr != nil {
+				err = ctxErr
+			} else {
+				err = ErrModelNoFinal
+			}
+		}
+
 		var cle *llm.ContextLengthError
 		isOverflow := errors.As(err, &cle)
-		if !isOverflow || genCtx.Err() != nil || emitted || attempts >= l.contextOverflowRetry {
+		if !isOverflow || attemptCanceled || emitted || attempts >= l.contextOverflowRetry {
 			return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
 		}
 
@@ -448,7 +516,6 @@ func (l *AgentLoop) runStep(rc *RunContext, st taskState) (runOutcome, taskState
 			MessagesBefore: before,
 			MessagesAfter:  len(history),
 		})
-		genCtx = l.mw.ModelContext(lc, rc.Context)
 	}
 
 	if d, err := l.mw.AfterModel(lc, finalResp); err != nil {
@@ -638,20 +705,21 @@ func (l *AgentLoop) runStep(rc *RunContext, st taskState) (runOutcome, taskState
 }
 
 // streamModel runs one model call, publishing MessageDelta for partials and
-// MessageDone for the final message. ok is false (with err) if the model errored.
-// emitted reports whether any response was already published, so a caller can
-// refuse to replay a call whose output the subscriber has seen. genCtx is the
-// (possibly span-carrying) context to invoke the provider with; rc remains the
-// run environment for publishing and state. It returns the final *llm.Response
-// (carrying Usage and StopReason) so AfterModel can observe them.
+// MessageDone for the final message. ok is false when the stream produced no
+// non-partial response; err then says why, or is nil when the stream simply
+// ended (a preempted attempt is one such case). emitted reports whether any
+// response was already published, so a caller can refuse to replay a call whose
+// output the subscriber has seen. A canceled attempt does not consult OnError:
+// preemption and run cancellation abort the stream on purpose.
 func (l *AgentLoop) streamModel(genCtx context.Context, rc *RunContext, lc *LoopContext, req *llm.Request) (final *llm.Response, ok bool, emitted bool, err error) {
 	if err := rc.checkWriteAccess(); err != nil {
 		return nil, false, false, err
 	}
-	final = &llm.Response{}
 	for resp, err := range l.model.Generate(genCtx, req) {
 		if err != nil {
-			_, _ = l.mw.OnError(lc, err) // retry middleware consulted; real retry lands later
+			if genCtx.Err() == nil {
+				_, _ = l.mw.OnError(lc, err)
+			}
 			return nil, false, emitted, err
 		}
 		if resp.Partial {
@@ -660,10 +728,11 @@ func (l *AgentLoop) streamModel(genCtx context.Context, rc *RunContext, lc *Loop
 			continue
 		}
 		final = resp
+		ok = true
 		emitted = true
 		rc.publish(core.MessageDone{Message: resp.Message, Usage: resp.Usage})
 	}
-	return final, true, emitted, nil
+	return final, ok, emitted, nil
 }
 
 // commitOptions is one checkpoint write. Snapshot is the frozen step view the

@@ -59,6 +59,7 @@ type eventWire struct {
 	Source     string   `json:"source,omitempty"`
 	MessageIDs []string `json:"message_ids,omitempty"`
 	Preempted  bool     `json:"preempted,omitempty"`
+	Emitted    bool     `json:"emitted,omitempty"`
 
 	Replayed int `json:"replayed,omitempty"`
 	Executed int `json:"executed,omitempty"`
@@ -150,6 +151,9 @@ func MarshalEvent(ev Event) ([]byte, error) {
 		w.Type, w.Step = "input_delivered", e.Step
 		w.Source, w.Phase = string(e.Source), string(e.Phase)
 		w.Count, w.MessageIDs, w.Preempted = e.Count, e.MessageIDs, e.Preempted
+	case ModelPreempted:
+		w.Type, w.Step, w.Emitted = "model_preempted", e.Step, e.Emitted
+		w.Count, w.Reason = e.Count, e.Reason
 	default:
 		return nil, fmt.Errorf("core: cannot marshal event of type %T", ev)
 	}
@@ -245,6 +249,13 @@ func UnmarshalEvent(data []byte) (Event, error) {
 			Count:      w.Count,
 			MessageIDs: w.MessageIDs,
 			Preempted:  w.Preempted,
+		}, nil
+	case "model_preempted":
+		return ModelPreempted{
+			Step:    w.Step,
+			Emitted: w.Emitted,
+			Count:   w.Count,
+			Reason:  w.Reason,
 		}, nil
 	default:
 		return nil, fmt.Errorf("core: unknown event type %q", w.Type)

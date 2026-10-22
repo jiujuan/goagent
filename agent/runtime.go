@@ -59,6 +59,15 @@ type RunContext struct {
 
 	steering steeringQueue
 
+	// modelMu guards the one model attempt currently in flight. A steering
+	// request on another goroutine cancels that attempt, so the registration
+	// and its flags need a lock of their own.
+	modelMu      sync.Mutex
+	modelAttempt *modelAttempt
+	// preemptedStep is the step whose model call was already preempted; a step
+	// is cancelled at most once. -1 means no step has been preempted.
+	preemptedStep int
+
 	// topLevel marks the execution environment of a top-level LLM run, the only
 	// kind allowed to continue across turns. Derived contexts (deeper, subRun,
 	// forBranch) leave it false.
@@ -85,6 +94,7 @@ func (rc *RunContext) deeper() *RunContext {
 		branch:        rc.branch,
 		transferDepth: rc.transferDepth + 1,
 		durable:       rc.durable,
+		preemptedStep: -1,
 	}
 }
 
@@ -98,14 +108,15 @@ func (rc *RunContext) subRun(input core.Message) *RunContext {
 		st.Files = rc.State.Files
 	}
 	return &RunContext{
-		Context:  rc.Context,
-		RunID:    rc.RunID,
-		ThreadID: rc.ThreadID,
-		Bus:      rc.Bus,
-		Topic:    rc.Topic,
-		Store:    rc.Store,
-		State:    st,
-		durable:  rc.durable,
+		Context:       rc.Context,
+		RunID:         rc.RunID,
+		ThreadID:      rc.ThreadID,
+		Bus:           rc.Bus,
+		Topic:         rc.Topic,
+		Store:         rc.Store,
+		State:         st,
+		durable:       rc.durable,
+		preemptedStep: -1,
 	}
 }
 
@@ -120,15 +131,16 @@ func (rc *RunContext) forBranch(branch string) (*RunContext, error) {
 		return nil, err
 	}
 	return &RunContext{
-		Context:  rc.Context,
-		RunID:    rc.RunID,
-		ThreadID: rc.ThreadID,
-		Bus:      rc.Bus,
-		Topic:    rc.Topic,
-		Store:    rc.Store,
-		State:    &st,
-		branch:   branch,
-		durable:  rc.durable,
+		Context:       rc.Context,
+		RunID:         rc.RunID,
+		ThreadID:      rc.ThreadID,
+		Bus:           rc.Bus,
+		Topic:         rc.Topic,
+		Store:         rc.Store,
+		State:         &st,
+		branch:        branch,
+		durable:       rc.durable,
+		preemptedStep: -1,
 	}, nil
 }
 
@@ -144,7 +156,74 @@ func (rc *RunContext) Steer(msg core.Message) (*SteerTicket, error) {
 // optional request to preempt the model call in flight. The queue is the
 // message's only home until a delivery point takes it.
 func (rc *RunContext) SteerWith(msg core.Message, opts SteerOptions) (*SteerTicket, error) {
-	return rc.steering.pushWith(msg, opts)
+	ticket, err := rc.steering.pushWith(msg, opts)
+	if err != nil {
+		return nil, err
+	}
+	if opts.Preempt {
+		// pushWith already refused the request if preemption is disabled or the
+		// phase cannot be honored, so it is this run's to grant. With no call in
+		// flight the message simply waits for the next delivery point.
+		rc.requestPreemption(opts.Reason)
+	}
+	return ticket, nil
+}
+
+// modelAttempt is one model call registered with its run, so steering input can
+// cancel it. Its flags are guarded by RunContext.modelMu.
+type modelAttempt struct {
+	step      int
+	cancel    context.CancelFunc
+	preempted bool
+	done      bool
+	reason    string
+}
+
+// beginModelAttempt derives a cancellable context for one model call and
+// registers it as the run's active attempt. Requests racing each other see
+// exactly one active attempt; a derived RunContext starts with none.
+func (rc *RunContext) beginModelAttempt(ctx context.Context, step int) (context.Context, *modelAttempt) {
+	attemptCtx, cancel := context.WithCancel(ctx)
+	attempt := &modelAttempt{step: step, cancel: cancel}
+	rc.modelMu.Lock()
+	rc.modelAttempt = attempt
+	rc.modelMu.Unlock()
+	return attemptCtx, attempt
+}
+
+// endModelAttempt clears the registration and reports whether a preemption
+// request landed while the attempt was active. The caller runs it after reading
+// the final response, so a request that raced the end loses: success wins.
+func (rc *RunContext) endModelAttempt(attempt *modelAttempt) bool {
+	rc.modelMu.Lock()
+	if rc.modelAttempt == attempt {
+		rc.modelAttempt = nil
+	}
+	attempt.done = true
+	preempted := attempt.preempted
+	rc.modelMu.Unlock()
+	attempt.cancel()
+	return preempted
+}
+
+// requestPreemption cancels the active model attempt unless this step was
+// already preempted or no attempt is in flight. It reports whether it asked for
+// the cancellation; a false result leaves the message queued for a normal
+// delivery point.
+func (rc *RunContext) requestPreemption(reason string) bool {
+	rc.modelMu.Lock()
+	attempt := rc.modelAttempt
+	if attempt == nil || attempt.done || attempt.preempted || rc.preemptedStep == attempt.step {
+		rc.modelMu.Unlock()
+		return false
+	}
+	attempt.preempted = true
+	attempt.reason = reason
+	rc.preemptedStep = attempt.step
+	cancel := attempt.cancel
+	rc.modelMu.Unlock()
+	cancel()
+	return true
 }
 
 // publish is the loop's single-goroutine event sink.

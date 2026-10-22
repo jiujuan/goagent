@@ -42,10 +42,13 @@ type TurnStarted struct{ Step int }
 type TurnDone struct{ Step int }
 
 // MessageDelta is a streaming increment of the assistant message, for live
-// rendering only; it is never persisted.
+// rendering only; it is never persisted. An attempt canceled by preemption
+// publishes no MessageDone for these deltas: a renderer must discard them when
+// it sees ModelPreempted.
 type MessageDelta struct{ Delta Message }
 
-// MessageDone carries the completed assistant message of a step.
+// MessageDone carries the completed assistant message of a step. A canceled
+// attempt has no MessageDone; ModelPreempted says its deltas must be discarded.
 type MessageDone struct {
 	Message Message
 	Usage   *Usage
@@ -244,6 +247,19 @@ type InputDelivered struct {
 	Preempted  bool
 }
 
+// ModelPreempted is emitted when steering input cancelled the model call in
+// flight and the loop retries the same step with that input appended. Step is
+// the step being retried; Emitted reports whether the canceled attempt had
+// already published any MessageDelta, so a consumer knows to discard rendered
+// output; Count is how many queued messages the retry carries; Reason is the
+// requester's advisory label. The canceled attempt publishes no MessageDone.
+type ModelPreempted struct {
+	Step    int
+	Emitted bool
+	Count   int
+	Reason  string
+}
+
 // --- Marker -----------------------------------------------------------------
 
 func (RunStarted) isEvent()             {}
@@ -271,6 +287,7 @@ func (ContextOverflowRetried) isEvent() {}
 func (ArgRejected) isEvent()            {}
 func (StepViewDrifted) isEvent()        {}
 func (InputDelivered) isEvent()         {}
+func (ModelPreempted) isEvent()         {}
 
 // --- Payload types ----------------------------------------------------------
 

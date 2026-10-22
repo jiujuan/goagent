@@ -294,3 +294,38 @@ func TestToolBatchRecoveredEventOmitsZeroCounts(t *testing.T) {
 		}
 	}
 }
+
+func TestModelPreemptedEventRoundTrip(t *testing.T) {
+	in := ModelPreempted{Step: 3, Emitted: true, Count: 2, Reason: "user"}
+	data, err := MarshalEvent(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := out.(ModelPreempted)
+	if !ok {
+		t.Fatalf("round trip type = %T, want ModelPreempted", out)
+	}
+	if got != in {
+		t.Fatalf("round trip = %+v, want %+v", got, in)
+	}
+}
+
+func TestModelPreemptedEventOmitsEmptyFields(t *testing.T) {
+	data, err := MarshalEvent(ModelPreempted{Step: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"emitted", "count", "reason"} {
+		if _, ok := raw[key]; ok {
+			t.Errorf("zero-valued %q should be omitted from %s", key, data)
+		}
+	}
+}
