@@ -117,6 +117,12 @@ type RunConfig struct {
 	// admitted for it and shares the parent's task tree.
 	childTask *TaskInfo
 	taskTree  *taskRuntime
+
+	// admission controls same-thread admission. admissionSet distinguishes the
+	// zero value from an explicit choice so each entry point can pick its own
+	// default policy.
+	admission    AdmissionOptions
+	admissionSet bool
 }
 
 // RunOption configures a single Run/Stream invocation.
