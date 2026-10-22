@@ -35,7 +35,14 @@ type Agent struct {
 
 // New builds an Agent from functional options. WithModel is required.
 func New(opts ...Option) (*Agent, error) {
-	c := config{maxTurns: defaultMaxTurns, contextOverflowRetry: 1, claimLease: checkpoint.DefaultLease, inFlightCheckpoint: true}
+	c := config{
+		maxTurns:             defaultMaxTurns,
+		contextOverflowRetry: 1,
+		claimLease:           checkpoint.DefaultLease,
+		inFlightCheckpoint:   true,
+		taskKind:             TaskKindChat,
+		taskBudget:           defaultTaskBudget(),
+	}
 	for _, o := range opts {
 		o(&c)
 	}
@@ -45,6 +52,10 @@ func New(opts ...Option) (*Agent, error) {
 	if c.claimLease <= 0 {
 		return nil, fmt.Errorf("agent: claim lease must be positive, got %v", c.claimLease)
 	}
+	if c.taskBudget.MaxDepth < 0 || c.taskBudget.MaxUnits < 0 || c.taskBudget.MaxTurns < 0 {
+		return nil, fmt.Errorf("agent: task budget fields must not be negative, got %+v", c.taskBudget)
+	}
+	c.taskBudget = normalizeTaskBudget(c.taskBudget)
 	switch c.stepSnapshotPolicy {
 	case StepSnapshotWarn, StepSnapshotStrict, StepSnapshotOff:
 	default:
@@ -236,6 +247,7 @@ func (a *Agent) newRunHandle(ctx context.Context, threadID string, state *core.S
 func (a *Agent) newRunHandleWithID(ctx context.Context, runID, threadID string, state *core.State) *Run {
 	runCtx, cancel := context.WithCancel(ctx)
 	topic := bus.Topic(runID)
+	taskID := core.NewID("task")
 	rc := &RunContext{
 		Context:  runCtx,
 		RunID:    runID,
@@ -244,6 +256,8 @@ func (a *Agent) newRunHandleWithID(ctx context.Context, runID, threadID string, 
 		Topic:    topic,
 		Store:    a.store,
 		State:    state,
+		task:     &taskRuntime{rootID: taskID, budget: normalizeTaskBudget(a.cfg.taskBudget)},
+		info:     TaskInfo{ID: taskID, ThreadID: threadID, Kind: a.taskKind()},
 		durable:  newDurableRunState(),
 		// The queue owns the preemption switch so a message is refused at
 		// enqueue time when the agent cannot honor it.

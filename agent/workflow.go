@@ -78,7 +78,7 @@ func wrapWorkflowWithStore(name string, r Runnable, store checkpoint.Checkpointe
 	if store == nil {
 		store = checkpoint.NewMemory()
 	}
-	c := config{name: name}
+	c := config{name: name, taskKind: TaskKindWorkflow, taskBudget: defaultTaskBudget()}
 	return &Agent{cfg: c, runnable: r, bus: bus.New(), store: store}
 }
 

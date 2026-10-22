@@ -28,6 +28,13 @@ type RunContext struct {
 	State    *core.State
 	branch   string // set for a parallel sub-branch (isolation label)
 
+	// task is the budget runtime shared by the whole task tree; info is this
+	// environment's identity within it. taskMu guards both because the root
+	// turn id is filled during prepare while Run.Task may read concurrently.
+	task   *taskRuntime
+	info   TaskInfo
+	taskMu sync.Mutex
+
 	transferDepth int // delegation chain depth, bounded in transfer.go
 
 	// resumed carries the tool batch a HITL pause left behind, set by Agent.Resume
@@ -83,6 +90,7 @@ type RunContext struct {
 // sharing the same State (so the delegate continues the conversation) and
 // Bus/Topic/Store. A fresh steering queue is intentional.
 func (rc *RunContext) deeper() *RunContext {
+	task, info := rc.taskState()
 	return &RunContext{
 		Context:       rc.Context,
 		RunID:         rc.RunID,
@@ -92,6 +100,8 @@ func (rc *RunContext) deeper() *RunContext {
 		Store:         rc.Store,
 		State:         rc.State,
 		branch:        rc.branch,
+		task:          task,
+		info:          info,
 		transferDepth: rc.transferDepth + 1,
 		durable:       rc.durable,
 		preemptedStep: -1,
@@ -107,6 +117,7 @@ func (rc *RunContext) subRun(input core.Message) *RunContext {
 	if rc.State != nil {
 		st.Files = rc.State.Files
 	}
+	task, info := rc.taskState()
 	return &RunContext{
 		Context:       rc.Context,
 		RunID:         rc.RunID,
@@ -115,6 +126,8 @@ func (rc *RunContext) subRun(input core.Message) *RunContext {
 		Topic:         rc.Topic,
 		Store:         rc.Store,
 		State:         st,
+		task:          task,
+		info:          info,
 		durable:       rc.durable,
 		preemptedStep: -1,
 	}
@@ -130,6 +143,7 @@ func (rc *RunContext) forBranch(branch string) (*RunContext, error) {
 	if err != nil {
 		return nil, err
 	}
+	task, info := rc.taskState()
 	return &RunContext{
 		Context:       rc.Context,
 		RunID:         rc.RunID,
@@ -139,6 +153,8 @@ func (rc *RunContext) forBranch(branch string) (*RunContext, error) {
 		Store:         rc.Store,
 		State:         &st,
 		branch:        branch,
+		task:          task,
+		info:          info,
 		durable:       rc.durable,
 		preemptedStep: -1,
 	}, nil

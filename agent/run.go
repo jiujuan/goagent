@@ -152,6 +152,11 @@ func (r *Run) SteerWith(msg core.Message, opts SteerOptions) (*SteerTicket, erro
 	return r.rc.SteerWith(msg, opts)
 }
 
+// Task reports this run's runtime task identity. The id, thread, kind and
+// depth are fixed when the handle is created; the turn id is filled once
+// prepare resolves it, so it may be empty before the run is driven.
+func (r *Run) Task() TaskInfo { return r.rc.taskInfo() }
+
 // Cancel aborts the run. A Resume owns a durable claim before lazy execution
 // starts, so canceling that prepared handle releases the claim synchronously.
 // The steering queue closes in the same call, so a message that will never be

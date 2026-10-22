@@ -91,6 +91,7 @@ func (r *Run) prepare() error {
 		turnID = core.NewID("turn")
 	}
 	r.rc.setLineageStart(head, turnID)
+	r.rc.setTaskTurn(turnID)
 	if coordinator != nil && claim != nil {
 		guard := newWriteGuard(coordinator, *claim, headRevision, r.agent.cfg.claimLease)
 		r.rc.setDurableGuard(guard)

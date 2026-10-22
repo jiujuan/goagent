@@ -34,6 +34,9 @@ type config struct {
 	inputPreemption           bool
 	inFlightCheckpoint        bool
 
+	taskKind   TaskKind
+	taskBudget TaskBudget
+
 	// delegation toggles (see transfer.go)
 	noTransfer       bool
 	noTransferParent bool
@@ -94,6 +97,17 @@ func WithoutTransfer() Option { return func(c *config) { c.noTransfer = true } }
 //
 //	agent.Loop("refine", 3, drafter, critic)   // run up to 3 rounds
 func WithMaxTurns(n int) Option { return func(c *config) { c.maxTurns = n } }
+
+// WithTaskBudget bounds the whole task tree this agent starts: the nesting
+// depth, the number of derived child tasks, and the model requests made by
+// every task in the tree. A pause/resume begins a new tree and counts from
+// zero again. When this agent runs as somebody else's child task, the parent
+// tree's budget applies instead.
+//
+// This is separate from middleware.RunBudget, which bounds one run's turns,
+// tokens, cost and duration and can wrap up a reply. A task-tree budget is a
+// hard error and has no token dimension.
+func WithTaskBudget(b TaskBudget) Option { return func(c *config) { c.taskBudget = b } }
 
 // WithContextOverflowRetry bounds how many recovery rounds one step may run
 // after a typed context-length overflow. The default is 1; 0 disables recovery.
