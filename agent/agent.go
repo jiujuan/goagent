@@ -42,6 +42,7 @@ func New(opts ...Option) (*Agent, error) {
 		inFlightCheckpoint:   true,
 		taskKind:             TaskKindChat,
 		taskBudget:           defaultTaskBudget(),
+		toolConcurrency:      defaultToolConcurrency,
 	}
 	for _, o := range opts {
 		o(&c)
@@ -51,6 +52,9 @@ func New(opts ...Option) (*Agent, error) {
 	}
 	if c.claimLease <= 0 {
 		return nil, fmt.Errorf("agent: claim lease must be positive, got %v", c.claimLease)
+	}
+	if c.toolConcurrency < 0 {
+		return nil, fmt.Errorf("agent: tool concurrency must not be negative, got %d", c.toolConcurrency)
 	}
 	if c.taskBudget.MaxDepth < 0 || c.taskBudget.MaxUnits < 0 || c.taskBudget.MaxTurns < 0 {
 		return nil, fmt.Errorf("agent: task budget fields must not be negative, got %+v", c.taskBudget)

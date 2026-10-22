@@ -26,6 +26,7 @@ type config struct {
 	contextOverflowRetry      int
 	toolExec                  ToolExecMode
 	toolTimeout               time.Duration
+	toolConcurrency           int
 	claimLease                time.Duration
 	modelOpts                 []llm.Option
 	outputKey                 string
@@ -125,8 +126,16 @@ func WithContextOverflowRetry(n int) Option {
 // WithToolExecution selects concurrent (default) or sequential tool execution.
 // Note: a tool wrapped with tool.AsSequential still gives its own call a serial
 // segment regardless of this mode; the consecutive calls around it remain
-// concurrent in their own segments.
+// concurrent in their own segments, bounded by WithToolConcurrency.
 func WithToolExecution(m ToolExecMode) Option { return func(c *config) { c.toolExec = m } }
+
+// WithToolConcurrency caps how many calls of one parallel tool segment run at
+// the same time (default 8). A value of 0 removes the cap; negative values are
+// rejected by New. Serial segments are unaffected: a ToolSequential call or a
+// tool wrapped with tool.AsSequential still runs alone. The cap belongs to one
+// AgentLoop, so a sub-agent has its own — a parent tool waiting on a child
+// cannot deadlock against a shared budget.
+func WithToolConcurrency(n int) Option { return func(c *config) { c.toolConcurrency = n } }
 
 // WithToolTimeout bounds how long a single tool call may run (default 0 = no
 // bound). It is per call, not per segment: each slow call in a serial segment

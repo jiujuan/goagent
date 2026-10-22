@@ -33,20 +33,21 @@ const defaultMaxTurns = 16
 // Checkpoint → ApplyDirectives. It publishes internal events to the Bus and
 // returns a runOutcome (lifecycle events are the Run wrapper's job).
 type AgentLoop struct {
-	model       llm.Model
-	instruction string
-	prompt      *prompt.Builder
-	name        string
-	description string
-	outputKey   string
-	modelOpts   []llm.Option
-	toolExec    ToolExecMode
-	toolTimeout time.Duration
-	mw          *Stack
-	tools       []tool.Tool
-	byName      map[string]tool.Tool
-	schemas     []llm.ToolSchema
-	maxTurns    int
+	model           llm.Model
+	instruction     string
+	prompt          *prompt.Builder
+	name            string
+	description     string
+	outputKey       string
+	modelOpts       []llm.Option
+	toolExec        ToolExecMode
+	toolTimeout     time.Duration
+	toolConcurrency int
+	mw              *Stack
+	tools           []tool.Tool
+	byName          map[string]tool.Tool
+	schemas         []llm.ToolSchema
+	maxTurns        int
 
 	contextOverflowRetry int
 	stepSnapshotPolicy   StepSnapshotPolicy
@@ -59,20 +60,21 @@ func newLoop(c config) *AgentLoop {
 		ms = defaultMaxTurns
 	}
 	return &AgentLoop{
-		model:       c.model,
-		instruction: c.instruction,
-		prompt:      c.prompt,
-		name:        c.name,
-		description: c.description,
-		outputKey:   c.outputKey,
-		modelOpts:   c.modelOpts,
-		toolExec:    c.toolExec,
-		toolTimeout: c.toolTimeout,
-		mw:          NewStack(c.middleware...),
-		tools:       c.tools,
-		byName:      tool.ByName(c.tools),
-		schemas:     tool.Schemas(c.tools),
-		maxTurns:    ms,
+		model:           c.model,
+		instruction:     c.instruction,
+		prompt:          c.prompt,
+		name:            c.name,
+		description:     c.description,
+		outputKey:       c.outputKey,
+		modelOpts:       c.modelOpts,
+		toolExec:        c.toolExec,
+		toolTimeout:     c.toolTimeout,
+		toolConcurrency: c.toolConcurrency,
+		mw:              NewStack(c.middleware...),
+		tools:           c.tools,
+		byName:          tool.ByName(c.tools),
+		schemas:         tool.Schemas(c.tools),
+		maxTurns:        ms,
 
 		contextOverflowRetry: c.contextOverflowRetry,
 		stepSnapshotPolicy:   c.stepSnapshotPolicy,

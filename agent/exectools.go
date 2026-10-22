@@ -15,6 +15,10 @@ import (
 	"github.com/jiujuan/goagent/tool"
 )
 
+// defaultToolConcurrency bounds one parallel tool segment unless
+// WithToolConcurrency overrides it.
+const defaultToolConcurrency = 8
+
 // execTools runs a step's tool calls and returns their results in the model's
 // original call order, plus the directives gathered from each tool's
 // Result.Control and the AfterTool middleware. State mutations a tool requests
@@ -24,6 +28,12 @@ import (
 // and a tool declaring the SequentialTool capability (tool.AsSequential) gives
 // its own call a serial segment — consecutive calls around it still run
 // concurrently within their own segments.
+//
+// A parallel segment admits at most WithToolConcurrency calls at a time. A call
+// waits for a slot before its ToolStarted is published, and returns the slot
+// when its run() settles — even if the handler was abandoned by a timeout and
+// is still executing, so one uncooperative tool cannot hold the rest of the
+// segment.
 //
 // ToolStarted is published in call order; ToolDone as each result lands, and a
 // serial call's ToolDone is published before the next segment's ToolStarted.
@@ -166,8 +176,26 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 		}
 
 		var wg sync.WaitGroup
+		limit := l.toolConcurrency
+		if limit <= 0 || limit > len(seg.indexes) {
+			limit = len(seg.indexes)
+		}
+		slots := make(chan struct{}, limit)
+		for i := 0; i < limit; i++ {
+			slots <- struct{}{}
+		}
 		for _, i := range seg.indexes {
+			select {
+			case <-slots:
+			case <-rc.Context.Done():
+				recordRunErr(rc.Context.Err())
+				dispatchStopped = true
+			}
+			if dispatchStopped {
+				break
+			}
 			if err := rc.checkWriteAccess(); err != nil {
+				slots <- struct{}{}
 				recordRunErr(err)
 				dispatchStopped = true
 				break
@@ -176,6 +204,7 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 			wg.Add(1)
 			go func(i int, c core.ToolCall) {
 				defer wg.Done()
+				defer func() { slots <- struct{}{} }()
 				run(i, c)
 			}(i, calls[i])
 		}
