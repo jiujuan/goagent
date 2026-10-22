@@ -88,7 +88,9 @@ type RunContext struct {
 
 // deeper returns a child execution environment one delegation level down,
 // sharing the same State (so the delegate continues the conversation) and
-// Bus/Topic/Store. A fresh steering queue is intentional.
+// Bus/Topic/Store. A fresh steering queue is intentional. It keeps the parent's
+// Task: a transfer stays inside one task, so the task-tree budget is not
+// charged; transferDepth tracks the delegation chain separately.
 func (rc *RunContext) deeper() *RunContext {
 	task, info := rc.taskState()
 	return &RunContext{
@@ -111,7 +113,9 @@ func (rc *RunContext) deeper() *RunContext {
 // subRun derives an isolated child execution environment seeded with a single
 // input message (fresh State, shared Files / Bus / Topic / Store). Used by the
 // DAG plan executor to run a unit on just its input, returning only its final
-// text — the parent's conversation is not shared.
+// text — the parent's conversation is not shared. It admits a child Task in the
+// shared tree, so the tree's depth and child count are charged before the child
+// starts; a refusal comes back as an error.
 func (rc *RunContext) subRun(input core.Message, kind TaskKind) (*RunContext, error) {
 	return rc.subRunWithContext(rc.Context, input, kind)
 }
@@ -146,7 +150,9 @@ func (rc *RunContext) subRunWithContext(ctx context.Context, input core.Message,
 // cloned State (so concurrent branches don't race), but the same Bus/Topic/Store
 // (so events merge into one observable stream and snapshots share a thread). A
 // fresh steering queue is intentional. It does NOT struct-copy rc (that would
-// copy the steering mutex).
+// copy the steering mutex). Each branch admits a child Task in the shared tree:
+// every branch draws on the same task-tree budget, and exceeding it fails the
+// branch at launch.
 func (rc *RunContext) forBranch(branch string, kind TaskKind) (*RunContext, error) {
 	return rc.forBranchWithContext(rc.Context, branch, kind)
 }

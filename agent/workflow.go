@@ -32,6 +32,12 @@ func Sequential(name string, subs ...*Agent) *Agent {
 // shared topic. Branch KV writes are folded back deterministically in branch
 // declaration order; conflicting writes to the same key are rejected (use
 // ParallelWithOptions to prefer a branch instead). Final texts are concatenated.
+//
+// The first branch failure cancels the branches still running: BranchCanceled is
+// emitted for each started branch that had not returned, and the run reports the
+// failed branch as the root error after the canceled branches exit. Pass
+// ParallelWithOptions with Failure: WaitForAll to let every branch finish before
+// reporting the first failure in declaration order.
 func Parallel(name string, subs ...*Agent) *Agent {
 	return ParallelWithOptions(name, ParallelOptions{}, subs...)
 }

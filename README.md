@@ -187,6 +187,7 @@ go run ./examples/quickstart
 | `task-loop` | `go run ./examples/task-loop` | 终稿后的追加消息与投递票据：一次运行两个回合，`TurnDone` 可出现多次、`RunDone` 只出现一次。 |
 | `input-phases` | `go run ./examples/input-phases` | 四个投递阶段：`before_model`/`after_model`/`after_tools` 进入同一步，`next_turn` 等新回合；抢占默认关闭。 |
 | `inflight-recovery` | `go run ./examples/inflight-recovery` | 在途批次的崩溃恢复：`RunStatus.InFlight`、`Resume` 按台账执行 pending 调用且不重复副作用。 |
+| `runtime-hardening` | `go run ./examples/runtime-hardening` | 运行时加固：根 Task 与 `AsTool` 子 Task、任务树预算耗尽后的工具错误、`Parallel` 失败后取消兄弟分支、同一个 `Session` 两次 `Send` 的先进先出执行。 |
 | `quickstart-chat` | `go run ./examples/quickstart-chat` | 真实模型的最小聊天启动模板。 |
 | `quickstart-tool` | `go run ./examples/quickstart-tool` | 真实模型调用一个类型化工具的启动模板。 |
 | `quickstart-stream` | `go run ./examples/quickstart-stream` | 流式接收真实模型输出的启动模板。 |
@@ -290,11 +291,23 @@ go run ./examples/quickstart
 ### 会话快照与并发
 
 - checkpoint 历史保持 append-only。Memory 和 File checkpointer 都会冻结状态数据与可快照文件，`Load`、`Latest`、`History` 和 Fork 返回的内容可独立修改，不会反向污染历史。
-- `Stream` 在创建句柄时不读取 checkpoint；第一次 `Wait`/`Iter` 才原子取得同线程 writer 并加载当前 head。同线程真正并发的普通运行会在模型和工具执行前返回 `checkpoint.ErrClaimConflict`。
+- `Stream` 在创建句柄时不读取 checkpoint；第一次 `Wait`/`Iter` 才取得同线程执行名额并加载当前 head。
+- 同线程准入：普通 `Agent.Run`/`Stream` 默认快速失败，忙时在模型和工具执行前返回 `checkpoint.ErrClaimConflict`；`Session.Send` 默认按先进先出排队，等前一次运行结束并提交后才开始；`Resume` 固定快速失败，不接受运行选项。
+- 排队默认允许每个线程 16 个等待者，超过返回 `agent.ErrAdmissionQueueFull`；在自己运行的线程里再次启动运行会直接返回 `agent.ErrAdmissionReentrant`，不会排队。不同线程互不影响。
+- 运行级覆盖用 `agent.WithAdmission(agent.AdmissionOptions{Policy: agent.AdmissionQueue})`（或 `AdmissionFail`），`Agent.Run`/`Stream` 与 `Session.Send` 都接受；`Session.Send` 不传时使用排队。
+- 持久 claim 仍是跨进程的正确性来源：准入名额只在一个 Agent 进程内排序并减少冲突；另一个进程或另一个 Agent 仍由 `Claim`/租约拒绝。
 - 暂停线程必须用 `Resume` 继续，普通 `Run`/`Stream` 返回 `checkpoint.ErrResumeRequired`。Prepared Resume 在 drive 前会验证租约，过期时返回 `checkpoint.ErrStaleFencingToken`，不会重新执行已批准工具。
 - Memory/File 默认实现线程协调。第三方 checkpointer 只有显式实现 `checkpoint.ThreadCoordinator` 才有同等跨实例保证；可用 `agent.WithThreadCoordinationRequired(true)` 在 `agent.New` 时强制检查。
 - `vfs.InState` 等 `core.Snapshottable` 后端会进入快照。真实目录或远端等外部托管后端需要在每个恢复进程重新传 `agent.WithRunFiles`，其内容不随时间旅行回滚。
 - `checkpoint.Fork` 现在返回 `(*checkpoint.Checkpoint, error)`，且只构造未保存的分支快照；调用方必须检查错误并显式 `Save`。完整迁移方式和并发边界见 [ADR-0032](docs/adr/ADR-0032-session-snapshot-consistency.md)。
+
+### 任务树预算
+
+- `agent.WithTaskBudget` 约束一次运行开始的整棵任务树：默认最多嵌套 8 层、64 个子任务，模型调用次数默认不限（`MaxTurns: 0`）。子 Agent、`Parallel` 分支和计划节点都从同一棵树扣额度；每次派生子任务先检查层级，再占用一个子任务名额。
+- 超预算在发生处是硬错误，不会转成“要一句总结”的收尾：`AsTool` 把错误作为工具结果交回模型，工作流分支或计划节点在启动时失败。`MaxTurns` 大于 0 时，树内每次模型尝试也计数，重试同样计入。
+- 暂停后恢复会开一棵新树、计数从零开始；`TaskID` 等 Task 信息只是运行期元数据，不写进 checkpoint。需要跨恢复累计时，由调用方自己记账。
+- 和 `middleware.RunBudget` 不同：后者约束单次运行的轮数、token、成本与时长，可以收尾成一句回答；任务树预算没有 token 维度，超限就是错误。
+- `Sequential`/`Parallel`/`Loop`/`Plan` 这类工作流根没有公开的预算选项，使用默认的 8 层 / 64 个子任务；只有 `agent.New(agent.WithTaskBudget(...))` 创建的 LLM Agent 可以配置。它作为别人的子任务运行时，使用父树的预算。
 
 ### 输入的投递阶段与崩溃恢复
 
