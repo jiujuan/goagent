@@ -146,7 +146,7 @@ func (p *parallelRunner) run(rc *RunContext) runOutcome {
 	results := make([]runOutcome, len(p.subs))
 	branches := make([]*RunContext, len(p.subs))
 	for i := range p.subs {
-		child, err := rc.forBranch(p.subs[i].cfg.name)
+		child, err := rc.forBranch(p.subs[i].cfg.name, p.subs[i].taskKind())
 		if err != nil {
 			return runOutcome{Err: err}
 		}

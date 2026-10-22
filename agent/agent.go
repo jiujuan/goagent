@@ -108,6 +108,11 @@ type RunConfig struct {
 	ThreadID string
 	Message  core.Message
 	Files    core.FileStore
+
+	// A child run started from a tool call adopts the identity the parent
+	// admitted for it and shares the parent's task tree.
+	childTask *TaskInfo
+	taskTree  *taskRuntime
 }
 
 // RunOption configures a single Run/Stream invocation.
@@ -142,6 +147,15 @@ func WithMessage(m core.Message) RunOption { return func(r *RunConfig) { r.Messa
 // the same id, which is why that id is validated as a file name (ADR-0028).
 func WithRunFiles(f core.FileStore) RunOption { return func(r *RunConfig) { r.Files = f } }
 
+// withTaskParent links a child run to the task its parent admitted for it: the
+// run adopts that identity and shares the parent's budget runtime.
+func withTaskParent(parent *RunContext, child TaskInfo) RunOption {
+	return func(r *RunConfig) {
+		r.childTask = &child
+		r.taskTree = parent.ensureTask()
+	}
+}
+
 // Run drives the agent loop to completion and returns the final answer text. It
 // is the convenience entry: internally it calls the model and tools in a loop
 // until the model replies without tool calls.
@@ -174,6 +188,9 @@ func (a *Agent) streamConfigured(ctx context.Context, rc RunConfig) *Run {
 		message, err = core.CloneMessage(rc.Message)
 	}
 	run := a.newRunHandle(ctx, rc.ThreadID, &core.State{})
+	if rc.childTask != nil {
+		run.rc.adoptChildTask(rc.taskTree, *rc.childTask, rc.ThreadID)
+	}
 	run.startErr = err
 	run.preparation = &runPreparation{message: message, files: rc.Files, restoreCurrent: true}
 	return run

@@ -1,11 +1,13 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync/atomic"
 
 	"github.com/jiujuan/goagent/core"
+	"github.com/jiujuan/goagent/tool"
 )
 
 // TaskKind names the execution form of a runtime task. It is not a business
@@ -152,4 +154,81 @@ func (rc *RunContext) taskState() (*taskRuntime, TaskInfo) {
 	rc.taskMu.Lock()
 	defer rc.taskMu.Unlock()
 	return rc.task, rc.info
+}
+
+// admitChild registers a child task in the shared tree and returns its
+// identity. ThreadID/TurnID are left for the caller: a shared-thread
+// derivation fills the parent's, while an AsTool child run fills its own.
+// Budget checks land here in a later card.
+func (rc *RunContext) admitChild(kind TaskKind) (TaskInfo, error) {
+	rc.ensureTask()
+	parent := rc.taskInfo()
+	if kind == "" {
+		kind = TaskKindChat
+	}
+	return TaskInfo{
+		ID:       core.NewID("task"),
+		ParentID: parent.ID,
+		Kind:     kind,
+		Depth:    parent.Depth + 1,
+	}, nil
+}
+
+// deriveChildTask admits a child and completes the identity a derived
+// execution environment needs: the shared tree runtime plus the parent's
+// thread and turn. A manually built parent without task state gets a root on
+// demand, using its ThreadID for the child.
+func (rc *RunContext) deriveChildTask(kind TaskKind) (TaskInfo, *taskRuntime, error) {
+	child, err := rc.admitChild(kind)
+	if err != nil {
+		return TaskInfo{}, nil, err
+	}
+	task, parent := rc.taskState()
+	child.ThreadID = parent.ThreadID
+	if child.ThreadID == "" {
+		child.ThreadID = rc.ThreadID
+	}
+	child.TurnID = parent.TurnID
+	return child, task, nil
+}
+
+// adoptChildTask replaces the root identity of a run that was started as
+// somebody else's child. The child run keeps its own thread; prepare fills its
+// own turn later.
+func (rc *RunContext) adoptChildTask(tree *taskRuntime, child TaskInfo, threadID string) {
+	if tree == nil {
+		return
+	}
+	child.ThreadID = threadID
+	child.TurnID = ""
+	rc.taskMu.Lock()
+	rc.task = tree
+	rc.info = child
+	rc.taskMu.Unlock()
+}
+
+// runContextCarrier exposes the RunContext a tool call belongs to without
+// changing the public tool.Context shape.
+type runContextCarrier interface{ agentRunContext() *RunContext }
+
+type runContextCarrierCtx struct {
+	context.Context
+	rc *RunContext
+}
+
+func (c runContextCarrierCtx) agentRunContext() *RunContext { return c.rc }
+
+// UpdateTool forwards the Updater capability so wrapping a tool call context
+// to carry its run does not hide partial tool updates.
+func (c runContextCarrierCtx) UpdateTool(callID string, p core.Part) {
+	if u, ok := c.Context.(tool.Updater); ok {
+		u.UpdateTool(callID, p)
+	}
+}
+
+func runContextOf(ctx context.Context) *RunContext {
+	if c, ok := ctx.(runContextCarrier); ok {
+		return c.agentRunContext()
+	}
+	return nil
 }

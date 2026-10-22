@@ -109,28 +109,37 @@ func (rc *RunContext) deeper() *RunContext {
 }
 
 // subRun derives an isolated child execution environment seeded with a single
-// input message (fresh State, shared Files / Bus / Topic / Store). Used by
-// AsTool and the DAG plan executor to run a unit on just its input, returning
-// only its final text — the parent's conversation is not shared.
-func (rc *RunContext) subRun(input core.Message) *RunContext {
+// input message (fresh State, shared Files / Bus / Topic / Store). Used by the
+// DAG plan executor to run a unit on just its input, returning only its final
+// text — the parent's conversation is not shared.
+func (rc *RunContext) subRun(input core.Message, kind TaskKind) (*RunContext, error) {
+	return rc.subRunWithContext(rc.Context, input, kind)
+}
+
+// subRunWithContext is subRun under an explicit context, used when the child
+// must be cancellable without cancelling the parent.
+func (rc *RunContext) subRunWithContext(ctx context.Context, input core.Message, kind TaskKind) (*RunContext, error) {
+	child, task, err := rc.deriveChildTask(kind)
+	if err != nil {
+		return nil, err
+	}
 	st := &core.State{Messages: []core.Message{input}}
 	if rc.State != nil {
 		st.Files = rc.State.Files
 	}
-	task, info := rc.taskState()
 	return &RunContext{
-		Context:       rc.Context,
+		Context:       ctx,
 		RunID:         rc.RunID,
-		ThreadID:      rc.ThreadID,
+		ThreadID:      child.ThreadID,
 		Bus:           rc.Bus,
 		Topic:         rc.Topic,
 		Store:         rc.Store,
 		State:         st,
 		task:          task,
-		info:          info,
+		info:          child,
 		durable:       rc.durable,
 		preemptedStep: -1,
-	}
+	}, nil
 }
 
 // forBranch derives a child execution environment for a parallel sub-agent: a
@@ -138,23 +147,32 @@ func (rc *RunContext) subRun(input core.Message) *RunContext {
 // (so events merge into one observable stream and snapshots share a thread). A
 // fresh steering queue is intentional. It does NOT struct-copy rc (that would
 // copy the steering mutex).
-func (rc *RunContext) forBranch(branch string) (*RunContext, error) {
+func (rc *RunContext) forBranch(branch string, kind TaskKind) (*RunContext, error) {
+	return rc.forBranchWithContext(rc.Context, branch, kind)
+}
+
+// forBranchWithContext is forBranch under an explicit context, used by
+// workflows that cancel sibling branches without cancelling the parent.
+func (rc *RunContext) forBranchWithContext(ctx context.Context, branch string, kind TaskKind) (*RunContext, error) {
 	st, err := cloneState(*rc.State)
 	if err != nil {
 		return nil, err
 	}
-	task, info := rc.taskState()
+	child, task, err := rc.deriveChildTask(kind)
+	if err != nil {
+		return nil, err
+	}
 	return &RunContext{
-		Context:       rc.Context,
+		Context:       ctx,
 		RunID:         rc.RunID,
-		ThreadID:      rc.ThreadID,
+		ThreadID:      child.ThreadID,
 		Bus:           rc.Bus,
 		Topic:         rc.Topic,
 		Store:         rc.Store,
 		State:         &st,
 		branch:        branch,
 		task:          task,
-		info:          info,
+		info:          child,
 		durable:       rc.durable,
 		preemptedStep: -1,
 	}, nil

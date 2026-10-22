@@ -261,7 +261,10 @@ func TestSnapshotConsistencyParallelNestedState(t *testing.T) {
 func TestSnapshotConsistencySubagentFilesShared(t *testing.T) {
 	files := vfs.NewInState()
 	rc := testRunContext(&core.State{Files: files})
-	sub := rc.subRun(core.UserText("task"))
+	sub, err := rc.subRun(core.UserText("task"), TaskKindChat)
+	if err != nil {
+		t.Fatal(err)
+	}
 	deep := rc.deeper()
 
 	if sub.State.Files != files || deep.State.Files != files {

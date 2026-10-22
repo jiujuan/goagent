@@ -50,6 +50,13 @@ func (s *subAgentTool) Call(tctx *tool.Context, args json.RawMessage) (*tool.Res
 	if tctx.State != nil && tctx.State.Files != nil {
 		opts = append(opts, WithRunFiles(tctx.State.Files))
 	}
+	if parent := runContextOf(tctx.Context); parent != nil {
+		childInfo, err := parent.admitChild(s.child.taskKind())
+		if err != nil {
+			return tool.ErrorResult(err.Error()), nil
+		}
+		opts = append(opts, withTaskParent(parent, childInfo))
+	}
 	answer, err := s.child.Run(tctx, in.Task, opts...)
 	if err != nil {
 		return tool.ErrorResult(fmt.Sprintf("sub-agent %s failed: %v", s.name, err)), nil

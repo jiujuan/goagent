@@ -443,10 +443,14 @@ func TestReplayBaselineNotInheritedBySubRun(t *testing.T) {
 	if child := rc.deeper(); child.replayBaseline != nil {
 		t.Fatalf("deeper inherited the replay baseline: %+v", child.replayBaseline)
 	}
-	if child := rc.subRun(core.UserText("child")); child.replayBaseline != nil {
-		t.Fatalf("subRun inherited the replay baseline: %+v", child.replayBaseline)
+	sub, err := rc.subRun(core.UserText("child"), TaskKindChat)
+	if err != nil {
+		t.Fatal(err)
 	}
-	child, err := rc.forBranch("branch")
+	if sub.replayBaseline != nil {
+		t.Fatalf("subRun inherited the replay baseline: %+v", sub.replayBaseline)
+	}
+	child, err := rc.forBranch("branch", TaskKindChat)
 	if err != nil {
 		t.Fatal(err)
 	}

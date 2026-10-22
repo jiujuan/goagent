@@ -100,13 +100,17 @@ func TestNestedContextsAreNotTopLevel(t *testing.T) {
 		State:    &core.State{},
 		topLevel: true,
 	}
-	branch, err := rc.forBranch("b")
+	branch, err := rc.forBranch("b", TaskKindChat)
 	if err != nil {
 		t.Fatalf("forBranch: %v", err)
 	}
+	sub, err := rc.subRun(core.UserText("input"), TaskKindChat)
+	if err != nil {
+		t.Fatalf("subRun: %v", err)
+	}
 	children := map[string]*RunContext{
 		"deeper":    rc.deeper(),
-		"subRun":    rc.subRun(core.UserText("input")),
+		"subRun":    sub,
 		"forBranch": branch,
 	}
 	for name, child := range children {

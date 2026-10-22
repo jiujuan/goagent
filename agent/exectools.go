@@ -443,7 +443,7 @@ func (l *AgentLoop) callOne(lc *LoopContext, callCtx context.Context, c core.Too
 	}
 
 	tctx := &tool.Context{
-		Context:        keepToolUpdates(callCtx, lc.RunContext),
+		Context:        runContextCarrierCtx{Context: keepToolUpdates(callCtx, lc.RunContext), rc: lc.RunContext},
 		State:          lc.State,
 		CallID:         c.ID,
 		InvocationID:   invocationID,

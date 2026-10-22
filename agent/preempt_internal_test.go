@@ -93,7 +93,7 @@ func TestRunContextDerivedContextsDoNotShareAttempt(t *testing.T) {
 		t.Fatalf("deeper preemptedStep = %d, want -1", deeper.preemptedStep)
 	}
 
-	branch, err := parent.forBranch("b")
+	branch, err := parent.forBranch("b", TaskKindChat)
 	if err != nil {
 		t.Fatal(err)
 	}
