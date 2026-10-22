@@ -64,6 +64,13 @@ type Checkpoint struct {
 	// RecoveryReplayModel and deliberately contain no model reply to continue.
 	Pause *Pause `json:"pause,omitempty"`
 
+	// InFlight marks a tool batch that was planned and committed but has not
+	// produced results yet. It is not a pause: there is no approval pending and
+	// nothing to decide, and the recovery entry point is Agent.Resume, which
+	// replays the batch against the tool ledger. The checkpoint that records the
+	// batch's results clears it.
+	InFlight *InFlightBatch `json:"in_flight,omitempty"`
+
 	// Snapshot is the step view that was current when this checkpoint was
 	// written: the advertised tool names and the digests of the tools and
 	// settings that formed the model request. nil on records written before it

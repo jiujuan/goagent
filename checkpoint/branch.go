@@ -30,6 +30,11 @@ func Fork(parent *Checkpoint, newThreadID, newID string) (*Checkpoint, error) {
 	if newID == parent.ID {
 		return nil, fmt.Errorf("checkpoint: fork checkpoint ID %q matches the parent checkpoint", newID)
 	}
+	// A branch is a new continuation, so it must not inherit a batch whose side
+	// effects only the parent thread's tool ledger can account for.
+	if parent.InFlight != nil {
+		return nil, fmt.Errorf("%w: fork parent %q carries an in-flight batch", ErrInFlightConflict, parent.ID)
+	}
 
 	child, err := freezeCheckpoint(parent)
 	if err != nil {

@@ -18,6 +18,9 @@ func freezeCheckpoint(cp *Checkpoint) (*Checkpoint, error) {
 	if err := validateLineage(out); err != nil {
 		return nil, err
 	}
+	if err := validateWorkState(out); err != nil {
+		return nil, err
+	}
 	if files, ok := cp.State.Files.(core.Snapshottable); ok {
 		out.FileSnapshot = cloneFileSnapshot(files.Snapshot())
 		out.State.Files = nil
@@ -40,6 +43,7 @@ func cloneCheckpoint(cp *Checkpoint) (*Checkpoint, error) {
 	out.State = state
 	out.Pending = clonePending(cp.Pending)
 	out.Pause = clonePause(cp.Pause)
+	out.InFlight = cloneInFlight(cp.InFlight)
 	out.Snapshot = cloneStepSnapshot(cp.Snapshot)
 	out.ParentRef = cloneRef(cp.ParentRef)
 	out.Completion, err = cloneCompletion(cp.Completion)

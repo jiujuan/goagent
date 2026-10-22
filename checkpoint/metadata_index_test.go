@@ -1041,3 +1041,74 @@ func benchFullLoop(b *testing.B, store Checkpointer, size int) {
 		}
 	}
 }
+
+// TestFileMetadataRebuildInFlight checks the projection twice: from the sidecar
+// the write path maintained, and from a journal rebuild after the sidecar is
+// gone. Both must agree with what the main store says about the head.
+func TestFileMetadataRebuildInFlight(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store := metaOpenFile(t, dir)
+
+	inflight := inFlightStoredFixture("inflight-rebuild", "b1")
+	if _, err := store.Commit(ctx, CommitRequest{Checkpoint: inflight}); err != nil {
+		t.Fatalf("commit in-flight record: %v", err)
+	}
+	paused := inFlightStoredFixture("inflight-rebuild-paused", "p1")
+	paused.InFlight = nil
+	paused.Pause = &Pause{ID: "pause-1", Phase: "before_tool", Recovery: RecoveryResumeTools}
+	if _, err := store.Commit(ctx, CommitRequest{Checkpoint: paused}); err != nil {
+		t.Fatalf("commit paused record: %v", err)
+	}
+
+	assertFlags := func(what string, items []CheckpointMetadata) {
+		t.Helper()
+		var flight, halt int
+		for _, item := range items {
+			if item.InFlight && item.Paused {
+				t.Fatalf("%s: one record claims both in_flight and paused: %+v", what, item)
+			}
+			if item.InFlight {
+				flight++
+			}
+			if item.Paused {
+				halt++
+			}
+		}
+		if flight != 1 || halt != 1 {
+			t.Fatalf("%s: in_flight=%d paused=%d, want one of each in %v", what, flight, halt, items)
+		}
+	}
+
+	assertFlags("sidecar projection", metaQueryAll(t, store, ListOptions{}))
+	for _, tc := range []struct {
+		threadID   string
+		inFlight   bool
+		pausedFlag bool
+	}{
+		{threadID: "inflight-rebuild", inFlight: true},
+		{threadID: "inflight-rebuild-paused", pausedFlag: true},
+	} {
+		items := metaQueryAll(t, store, ListOptions{ThreadID: tc.threadID})
+		if len(items) != 1 {
+			t.Fatalf("thread %s: want one record, got %d", tc.threadID, len(items))
+		}
+		if items[0].InFlight != tc.inFlight || items[0].Paused != tc.pausedFlag {
+			t.Fatalf("thread %s projection = in_flight %v paused %v, want in_flight %v paused %v",
+				tc.threadID, items[0].InFlight, items[0].Paused, tc.inFlight, tc.pausedFlag)
+		}
+	}
+
+	if err := os.Remove(metaSidecarPath(t, dir, "inflight-rebuild")); err != nil {
+		t.Fatalf("删 sidecar: %v", err)
+	}
+	if err := os.Remove(metaSidecarPath(t, dir, "inflight-rebuild-paused")); err != nil {
+		t.Fatalf("删 sidecar: %v", err)
+	}
+	assertFlags("rebuilt projection", metaQueryAll(t, store, ListOptions{}))
+
+	head, err := store.Latest(ctx, "inflight-rebuild")
+	if err != nil || head == nil || head.InFlight == nil {
+		t.Fatalf("Latest = %+v err %v, want the in-flight head", head, err)
+	}
+}

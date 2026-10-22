@@ -67,9 +67,11 @@ type metaFields struct {
 	RunID     string    `json:"run_id"`
 	TurnID    string    `json:"turn_id"`
 	CreatedAt time.Time `json:"created_at"`
-	// Pending and Pause are kept as raw bytes only to ask whether either is present.
+	// Pending, Pause and InFlight are kept as raw bytes only to ask whether each
+	// is present, so a rebuild never decodes a tool batch it does not need.
 	Pending    *json.RawMessage `json:"pending"`
 	Pause      *json.RawMessage `json:"pause"`
+	InFlight   *json.RawMessage `json:"in_flight"`
 	Completion *struct {
 		Kind string `json:"kind"`
 	} `json:"completion"`
@@ -77,6 +79,10 @@ type metaFields struct {
 
 func (m *metaFields) paused() bool {
 	return rawPresent(m.Pending) || rawPresent(m.Pause)
+}
+
+func (m *metaFields) inFlight() bool {
+	return rawPresent(m.InFlight)
 }
 
 func rawPresent(raw *json.RawMessage) bool {
@@ -458,6 +464,7 @@ func projectJournalLine(body []byte, threadID string, revision uint64) (metadata
 		TurnID:     fields.TurnID,
 		CreatedAt:  fields.CreatedAt,
 		Pause:      summaryPauseMarker(fields),
+		InFlight:   summaryInFlightMarker(fields),
 		Completion: summaryCompletionMarker(fields),
 	})
 	return metadata, nextRevision, true, nil
@@ -471,6 +478,16 @@ func summaryPauseMarker(fields *metaFields) *Pause {
 		return nil
 	}
 	return &Pause{Phase: "summary"}
+}
+
+// summaryInFlightMarker hands checkpointMetadataOf the presence of an in-flight
+// batch without materialising its calls. Only the flag is projected, so a
+// rebuild stays as cheap as the pause marker already was.
+func summaryInFlightMarker(fields *metaFields) *InFlightBatch {
+	if !fields.inFlight() {
+		return nil
+	}
+	return &InFlightBatch{Step: fields.Step}
 }
 
 func summaryCompletionMarker(fields *metaFields) *Completion {

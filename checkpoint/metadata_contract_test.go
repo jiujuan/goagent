@@ -788,3 +788,62 @@ func TestLegacyDigestRetry(t *testing.T) {
 		}
 	})
 }
+
+// TestMetadataInFlightProjection keeps the two flags apart in the summary view:
+// an in-flight head is not paused, and a paused head is not in flight. A caller
+// that only reads the projection must still be able to tell the two apart.
+func TestMetadataInFlightProjection(t *testing.T) {
+	ctx := context.Background()
+	for name, newBackend := range lineageBackends(t) {
+		t.Run(name, func(t *testing.T) {
+			b := newBackend()
+			reader, ok := b.store.(MetadataReader)
+			if !ok {
+				t.Fatalf("%s store does not read checkpoint metadata", name)
+			}
+
+			inflightThread := "meta-inflight-" + name
+			inflight := inFlightStoredFixture(inflightThread, "meta-inflight")
+			if err := b.store.Save(ctx, inflight); err != nil {
+				t.Fatalf("save in-flight head: %v", err)
+			}
+			head, ok, err := reader.ReadSessionHead(ctx, inflightThread)
+			if err != nil || !ok {
+				t.Fatalf("ReadSessionHead = ok %v err %v", ok, err)
+			}
+			if !head.InFlight || head.Paused {
+				t.Fatalf("in-flight head projection = %+v, want in_flight without paused", head)
+			}
+
+			pausedThread := "meta-paused-" + name
+			paused := inFlightStoredFixture(pausedThread, "meta-paused")
+			paused.InFlight = nil
+			paused.Pending = &PendingHITL{Step: 2}
+			if err := b.store.Save(ctx, paused); err != nil {
+				t.Fatalf("save paused head: %v", err)
+			}
+			got, ok, err := reader.ReadSessionHead(ctx, pausedThread)
+			if err != nil || !ok {
+				t.Fatalf("ReadSessionHead = ok %v err %v", ok, err)
+			}
+			if got.InFlight || !got.Paused {
+				t.Fatalf("paused head projection = %+v, want paused without in_flight", got)
+			}
+
+			plainThread := "meta-plain-" + name
+			plain := inFlightStoredFixture(plainThread, "meta-plain")
+			plain.InFlight = nil
+			plain.Snapshot = nil
+			if err := b.store.Save(ctx, plain); err != nil {
+				t.Fatalf("save plain head: %v", err)
+			}
+			gotPlain, ok, err := reader.ReadSessionHead(ctx, plainThread)
+			if err != nil || !ok {
+				t.Fatalf("ReadSessionHead = ok %v err %v", ok, err)
+			}
+			if gotPlain.InFlight || gotPlain.Paused {
+				t.Fatalf("plain head projection = %+v, want neither flag", gotPlain)
+			}
+		})
+	}
+}

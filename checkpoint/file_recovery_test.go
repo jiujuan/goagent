@@ -865,3 +865,29 @@ func journalCommitDigest(t *testing.T, path, checkpointID string) string {
 	}
 	return ""
 }
+
+// TestFileJournalReplayValidatesInFlightRecord closes the one door the write path
+// cannot: a journal line that pairs an in-flight batch with a pause reaches the
+// reader only by hand or by an older writer, and replay must refuse it rather
+// than let a thread resume against two work states at once.
+func TestFileJournalReplayValidatesInFlightRecord(t *testing.T) {
+	ctx := context.Background()
+	store, err := NewFile(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(ctx, inFlightStoredFixture("inflight-replay", "cp-ok")); err != nil {
+		t.Fatal(err)
+	}
+
+	bad := inFlightStoredFixture("inflight-replay", "cp-bad")
+	bad.Pause = &Pause{ID: "p", Phase: "before_tool", Recovery: RecoveryResumeTools}
+	appendJournalLine(t, store, "inflight-replay", journalRecord{
+		Version: durableFormatVersion, Kind: recordCommit,
+		Checkpoint: &checkpointRecord{Checkpoint: bad, Files: map[string]string{}},
+	})
+
+	if _, err := store.Latest(ctx, "inflight-replay"); !errors.Is(err, ErrInFlightConflict) {
+		t.Fatalf("replay error = %v, want ErrInFlightConflict", err)
+	}
+}

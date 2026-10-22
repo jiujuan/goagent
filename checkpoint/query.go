@@ -74,6 +74,11 @@ type CheckpointMetadata struct {
 	CreatedAt time.Time `json:"created_at,omitzero"`
 	// Paused marks a snapshot a run stopped at for a human decision.
 	Paused bool `json:"paused,omitempty"`
+	// InFlight marks a snapshot that committed a tool batch whose results are not
+	// recorded yet. It is deliberately separate from Paused: there is nothing to
+	// decide here, only work a resume has to finish or account for. The two are
+	// never both true, because the store rejects that combination on write.
+	InFlight bool `json:"in_flight,omitempty"`
 	// CompletionKind is CompletionCompleted or CompletionFailed for a record that has a
 	// terminal record attached, and empty for one that does not — which is not the same
 	// claim as "this run completed".
@@ -156,6 +161,7 @@ func checkpointMetadataOf(cp *Checkpoint) CheckpointMetadata {
 		TurnID:    cp.TurnID,
 		CreatedAt: cp.CreatedAt,
 		Paused:    cp.Pending != nil || cp.Pause != nil,
+		InFlight:  cp.InFlight != nil,
 	}
 	if cp.ParentRef != nil {
 		parent := *cp.ParentRef

@@ -20,7 +20,7 @@ func (f *File) BeginRun(ctx context.Context, req BeginRunRequest) (BeginRunResul
 		}
 
 		head := latestFileCheckpoint(st)
-		if head != nil && (head.Pending != nil || head.Pause != nil) {
+		if head != nil && RequiresResume(head.Checkpoint) {
 			return ErrResumeRequired
 		}
 		cloned, err := fileCheckpoint(head, st.blobs)

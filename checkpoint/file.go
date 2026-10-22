@@ -776,6 +776,13 @@ func validateJournalRecord(rec journalRecord) error {
 		if rec.Checkpoint == nil || rec.Checkpoint.Checkpoint == nil || rec.Checkpoint.ID == "" {
 			return errors.New("invalid commit checkpoint")
 		}
+		// Replay is the one path that reaches a reader without passing through
+		// freezeCheckpoint, so the work-state gate is re-checked here: a journal
+		// line pairing a batch with a pause must fail to load rather than offer a
+		// thread two recovery entries at once.
+		if err := validateWorkState(rec.Checkpoint.Checkpoint); err != nil {
+			return err
+		}
 		for _, ex := range rec.ToolExecutions {
 			if ex.InvocationID == "" {
 				return errors.New("invalid committed tool execution")

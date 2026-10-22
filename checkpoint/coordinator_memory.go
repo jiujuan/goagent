@@ -23,7 +23,7 @@ func (m *Memory) BeginRun(_ context.Context, req BeginRunRequest) (BeginRunResul
 	}
 
 	head := latestLocked(m.byThread[req.ThreadID])
-	if head != nil && (head.Pending != nil || head.Pause != nil) {
+	if RequiresResume(head) {
 		return BeginRunResult{}, ErrResumeRequired
 	}
 	cloned, err := cloneCheckpoint(head)

@@ -244,3 +244,30 @@ func assertForkTestParentUnchanged(t *testing.T, parent *checkpoint.Checkpoint) 
 		t.Fatalf("parent file snapshot = %q, want parent", got)
 	}
 }
+
+// TestForkRejectsInFlight keeps a branch from copying a batch that was planned
+// but never produced results: the branch would inherit work whose outcome only
+// the parent thread's ledger can explain.
+func TestForkRejectsInFlight(t *testing.T) {
+	parent := inFlightCheckpoint("parent-thread", "parent")
+	child, err := checkpoint.Fork(parent, "child-thread", "child")
+	if !errors.Is(err, checkpoint.ErrInFlightConflict) {
+		t.Fatalf("Fork error = %v, want ErrInFlightConflict", err)
+	}
+	if child != nil {
+		t.Fatalf("Fork returned a child for an in-flight parent: %+v", child)
+	}
+	if parent.InFlight == nil || len(parent.InFlight.Calls) != 1 {
+		t.Fatalf("rejected fork changed the parent batch: %+v", parent.InFlight)
+	}
+
+	plain := inFlightCheckpoint("parent-thread", "parent")
+	plain.InFlight = nil
+	forked, err := checkpoint.Fork(plain, "child-thread", "child")
+	if err != nil {
+		t.Fatalf("Fork without an in-flight batch: %v", err)
+	}
+	if forked.InFlight != nil {
+		t.Fatalf("fork inherited an in-flight batch: %+v", forked.InFlight)
+	}
+}

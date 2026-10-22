@@ -288,3 +288,40 @@ func TestInboxUnknownPhaseRejected(t *testing.T) {
 		}
 	})
 }
+
+// TestFileJournalValidatesInFlightRecord covers the in-flight boundary on the
+// append-only journal: a legal batch survives the replay that every read does,
+// and a record that carries a batch alongside a pause never reaches the journal.
+func TestFileJournalValidatesInFlightRecord(t *testing.T) {
+	eachDurableBackend(t, func(t *testing.T, backend durableBackend) {
+		ctx := context.Background()
+		if err := backend.check.Save(ctx, inFlightCheckpoint("thread", "journal-inflight")); err != nil {
+			t.Fatalf("save in-flight record: %v", err)
+		}
+		head, err := backend.check.Latest(ctx, "thread")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if head.InFlight == nil || len(head.InFlight.Calls) != 1 || head.InFlight.Calls[0].ID != "call-1" {
+			t.Fatalf("replayed in-flight batch = %+v", head.InFlight)
+		}
+		if string(head.InFlight.Calls[0].Args) != `{"query":"first"}` {
+			t.Fatalf("replayed arguments = %s, want the recorded payload", head.InFlight.Calls[0].Args)
+		}
+
+		conflicting := inFlightCheckpoint("thread", "journal-conflict")
+		conflicting.Pause = &checkpoint.Pause{
+			ID: "pause-1", Phase: "before_tool", Recovery: checkpoint.RecoveryResumeTools,
+		}
+		if err := backend.check.Save(ctx, conflicting); !errors.Is(err, checkpoint.ErrInFlightConflict) {
+			t.Fatalf("save conflicting record error = %v, want ErrInFlightConflict", err)
+		}
+		again, err := backend.check.Latest(ctx, "thread")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if again.ID != "journal-inflight" {
+			t.Fatalf("rejected record became visible: %+v", again)
+		}
+	})
+}

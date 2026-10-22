@@ -2,7 +2,9 @@ package checkpoint
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -569,3 +571,72 @@ func coordinatorCurrentClaim(store coordinatorTestStore, threadID string) *Claim
 }
 
 func coordinatorMessagePtr(message core.Message) *core.Message { return &message }
+
+// TestCommitDigestOmitsInFlightWhenAbsent is the byte-compatibility guard for
+// invariant 25: a commit that carries no in-flight batch hashes to the same
+// payload it did before the field existed.
+func TestCommitDigestOmitsInFlightWhenAbsent(t *testing.T) {
+	absent, err := json.Marshal(commitDigestCheckpoint{ID: "cp", ThreadID: "thread", Step: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(absent), `"in_flight"`) {
+		t.Fatalf("digest payload carries an empty in-flight key: %s", absent)
+	}
+
+	present, err := json.Marshal(commitDigestCheckpoint{
+		ID: "cp", ThreadID: "thread", Step: 2,
+		InFlight: &commitDigestInFlight{Step: 2, Calls: []commitDigestToolCall{
+			{ID: "call-1", Name: "search", Args: []byte(`{"query":"a"}`)},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(present), `"in_flight"`) || !strings.Contains(string(present), "call-1") {
+		t.Fatalf("digest payload dropped the in-flight batch: %s", present)
+	}
+}
+
+func TestSnapshotConsistencyBeginRunInFlight(t *testing.T) {
+	eachCoordinatorBackend(t, testSnapshotConsistencyBeginRunInFlight)
+}
+
+// testSnapshotConsistencyBeginRunInFlight keeps an in-flight thread from taking
+// an ordinary new run, while still letting a resume claim fence it — the same
+// coordination a pause gets, reported without the paused wording.
+func testSnapshotConsistencyBeginRunInFlight(t *testing.T, backend coordinatorTestBackend) {
+	ctx := context.Background()
+	now := time.Date(2026, time.October, 12, 11, 30, 0, 0, time.UTC)
+	store := backend.open(t, &now)
+
+	head := inFlightStoredFixture("thread", "inflight-head")
+	if err := store.Save(ctx, head); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.Latest(ctx, "thread")
+	if err != nil || stored == nil || stored.InFlight == nil {
+		t.Fatalf("in-flight head = %+v err=%v", stored, err)
+	}
+
+	_, err = store.BeginRun(ctx, BeginRunRequest{ThreadID: "thread", Owner: "ordinary", Lease: time.Minute})
+	if !errors.Is(err, ErrResumeRequired) {
+		t.Fatalf("BeginRun error = %v, want ErrResumeRequired", err)
+	}
+	if strings.Contains(err.Error(), "paused") {
+		t.Fatalf("BeginRun error = %v, want wording that also fits an in-flight thread", err)
+	}
+
+	resume, err := store.Claim(ctx, ClaimRequest{
+		ThreadID: "thread", Revision: stored.Revision, PauseID: EffectivePauseID(stored), Owner: "resume", Lease: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("resume Claim: %v", err)
+	}
+	if resume.Owner != "resume" || resume.PauseID != EffectivePauseID(stored) {
+		t.Fatalf("resume claim = %+v", resume)
+	}
+	if _, err := store.BeginRun(ctx, BeginRunRequest{ThreadID: "thread", Owner: "ordinary", Lease: time.Minute}); !errors.Is(err, ErrClaimConflict) {
+		t.Fatalf("BeginRun with a live resume owner error = %v, want ErrClaimConflict", err)
+	}
+}

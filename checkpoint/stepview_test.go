@@ -2,6 +2,7 @@ package checkpoint_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
@@ -168,6 +169,48 @@ func TestLegacyCheckpointDigestUnchanged(t *testing.T) {
 				Checkpoint: legacyCheckpoint("same"),
 			}); err != nil {
 				t.Fatalf("legacy retry: %v", err)
+			}
+		})
+	}
+}
+
+// TestInFlightDigestRetry folds the in-flight batch into the commit digest: the
+// same batch retried confirms the earlier commit, while a reordered or re-argued
+// batch is a different request and must not silently replace it.
+func TestInFlightDigestRetry(t *testing.T) {
+	for _, backend := range []string{"memory", "file"} {
+		t.Run(backend, func(t *testing.T) {
+			ctx := context.Background()
+			store, _ := newSnapshotContractStore(t, backend)
+			durable, ok := store.(checkpoint.Durable)
+			if !ok {
+				t.Fatalf("%s store does not implement Durable", backend)
+			}
+			cp := inFlightCheckpoint("thread", "inflight-digest")
+			cp.InFlight.Calls = []core.ToolCall{
+				{ID: "call-1", Name: "search", Args: json.RawMessage(`{"query":"a"}`)},
+				{ID: "call-2", Name: "search", Args: json.RawMessage(`{"query":"b"}`)},
+			}
+			if _, err := durable.Commit(ctx, checkpoint.CommitRequest{Checkpoint: cp}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := durable.Commit(ctx, checkpoint.CommitRequest{Checkpoint: cp}); err != nil {
+				t.Fatalf("matching in-flight retry: %v", err)
+			}
+
+			swapped := inFlightCheckpoint("thread", "inflight-digest")
+			swapped.InFlight.Calls = []core.ToolCall{cp.InFlight.Calls[1], cp.InFlight.Calls[0]}
+			if _, err := durable.Commit(ctx, checkpoint.CommitRequest{Checkpoint: swapped}); !errors.Is(err, checkpoint.ErrCheckpointConflict) {
+				t.Fatalf("reordered batch retry error = %v, want ErrCheckpointConflict", err)
+			}
+
+			reargued := inFlightCheckpoint("thread", "inflight-digest")
+			reargued.InFlight.Calls = []core.ToolCall{
+				cp.InFlight.Calls[0],
+				{ID: "call-2", Name: "search", Args: json.RawMessage(`{"query":"changed"}`)},
+			}
+			if _, err := durable.Commit(ctx, checkpoint.CommitRequest{Checkpoint: reargued}); !errors.Is(err, checkpoint.ErrCheckpointConflict) {
+				t.Fatalf("changed arguments retry error = %v, want ErrCheckpointConflict", err)
 			}
 		})
 	}

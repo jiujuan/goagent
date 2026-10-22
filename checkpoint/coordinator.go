@@ -15,7 +15,7 @@ import (
 
 var (
 	ErrRevisionConflict        = errors.New("checkpoint: expected revision does not match head")
-	ErrResumeRequired          = errors.New("checkpoint: paused thread requires resume")
+	ErrResumeRequired          = errors.New("checkpoint: thread requires resume")
 	ErrCoordinationUnavailable = errors.New("checkpoint: thread coordination unavailable")
 	ErrCheckpointConflict      = errors.New("checkpoint: checkpoint ID conflicts with existing content")
 )
@@ -47,6 +47,9 @@ type commitDigestCheckpoint struct {
 	State    commitDigestState        `json:"state"`
 	Pending  *commitDigestPendingHITL `json:"pending,omitempty"`
 	Pause    *Pause                   `json:"pause,omitempty"`
+	// InFlight is omitted while absent, so a commit of a batch-free checkpoint
+	// hashes to exactly the bytes it did before the field existed.
+	InFlight *commitDigestInFlight `json:"in_flight,omitempty"`
 	// Snapshot is omitted while absent, so commits recorded before the step view
 	// was persisted keep producing the same digest bytes.
 	Snapshot *StepSnapshot `json:"step_snapshot,omitempty"`
@@ -105,6 +108,14 @@ type commitDigestToolCall struct {
 type commitDigestPendingHITL struct {
 	Step    int                    `json:"step"`
 	Pending []commitDigestToolCall `json:"pending"`
+}
+
+// commitDigestInFlight hashes the batch in the recorded order: which call was
+// planned first is part of what a recovery replays, so reordering it is a
+// different request rather than a retry of the same one.
+type commitDigestInFlight struct {
+	Step  int                    `json:"step"`
+	Calls []commitDigestToolCall `json:"calls"`
 }
 
 type commitDigestToolExecution struct {
@@ -179,6 +190,7 @@ func commitRequestDigest(cp *Checkpoint, ackMessageIDs []string, claim *Claim, e
 			State:        state,
 			Pending:      makeCommitDigestPending(cp.Pending),
 			Pause:        cp.Pause,
+			InFlight:     makeCommitDigestInFlight(cp.InFlight),
 			Snapshot:     cp.Snapshot,
 			Completion:   completion,
 			ParentRef:    cp.ParentRef,
@@ -281,6 +293,21 @@ func makeCommitDigestPending(pending *PendingHITL) *commitDigestPendingHITL {
 	out.Pending = make([]commitDigestToolCall, len(pending.Pending))
 	for i, call := range pending.Pending {
 		out.Pending[i] = commitDigestToolCall{ID: call.ID, Name: call.Name, Args: []byte(call.Args)}
+	}
+	return out
+}
+
+func makeCommitDigestInFlight(batch *InFlightBatch) *commitDigestInFlight {
+	if batch == nil {
+		return nil
+	}
+	out := &commitDigestInFlight{Step: batch.Step}
+	if batch.Calls == nil {
+		return out
+	}
+	out.Calls = make([]commitDigestToolCall, len(batch.Calls))
+	for i, call := range batch.Calls {
+		out.Calls[i] = commitDigestToolCall{ID: call.ID, Name: call.Name, Args: []byte(call.Args)}
 	}
 	return out
 }
