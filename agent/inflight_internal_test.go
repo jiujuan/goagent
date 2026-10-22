@@ -155,7 +155,7 @@ func TestResumeInFlightRejectsConflictingHead(t *testing.T) {
 		Pause:    &checkpoint.Pause{Phase: "before_tool", Recovery: checkpoint.RecoveryResumeTools},
 		Snapshot: internalInFlightSnapshot(0, internalRecTool("rec")),
 	}
-	_, err = a.resumeInFlight(context.Background(), cp, nil)
+	_, err = a.resumeInFlight(context.Background(), cp, nil, func() {})
 	if !errors.Is(err, ErrInFlightUnrecoverable) {
 		t.Fatalf("resumeInFlight with a conflicting head = %v, want ErrInFlightUnrecoverable", err)
 	}

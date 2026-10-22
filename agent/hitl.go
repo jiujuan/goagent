@@ -80,6 +80,23 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 	if err := core.CheckThreadID(threadID); err != nil {
 		return nil, err
 	}
+	if err := checkReentrant(ctx, threadID); err != nil {
+		return nil, err
+	}
+	// The thread slot is taken before the checkpoint is read: a resume that
+	// loses the race to an active run must not read, claim, or replay anything.
+	releaseGate, err := a.gate.acquire(ctx, threadID, AdmissionFail, defaultAdmissionWaiters)
+	if err != nil {
+		return nil, err
+	}
+	// Every error path below drops the slot; it is handed to the returned run
+	// only once one exists, and that run releases it when driven or canceled.
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			releaseGate()
+		}
+	}()
 	cp, err := a.store.Latest(ctx, threadID)
 	if err != nil {
 		return nil, err
@@ -88,7 +105,9 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		return nil, fmt.Errorf("agent: no checkpoint to resume for thread %q", threadID)
 	}
 	if cp.InFlight != nil {
-		return a.resumeInFlight(ctx, cp, approvals)
+		// resumeInFlight owns the slot from here and attaches it to the run.
+		handedOff = true
+		return a.resumeInFlight(ctx, cp, approvals, releaseGate)
 	}
 	if err := validatePause(cp); err != nil {
 		return nil, err
@@ -168,6 +187,8 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		state.KV[approvalsKey] = merged
 	}
 	run := a.newRunHandle(ctx, threadID, &state)
+	run.setGateRelease(releaseGate)
+	handedOff = true
 	run.rc.setDurableClaim(claim)
 	// Every exit below continues the turn the resumed checkpoint belongs to, so
 	// the loop's first delivery point keeps next_turn input queued.
@@ -218,15 +239,22 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 // approvals. It does not execute here either: preflight checks everything that
 // can be checked before the claim, the claim fences this attempt, and the
 // resumed loop settles the batch before its next model call.
-func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, approvals []Approval) (*Run, error) {
+//
+// The caller hands in the thread slot it acquired before reading the head; this
+// function owns it from here, releases it on every error path, and attaches it
+// to the returned run.
+func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, approvals []Approval, releaseGate func()) (*Run, error) {
 	if cp.Pending != nil || cp.Pause != nil || cp.Completion != nil {
+		releaseGate()
 		return nil, fmt.Errorf("%w: checkpoint %s carries work state that conflicts with an in-flight batch", ErrInFlightUnrecoverable, cp.ID)
 	}
 	if len(approvals) > 0 {
+		releaseGate()
 		return nil, fmt.Errorf("%w: an in-flight batch takes no approvals; it was authorized before execution", ErrInFlightUnrecoverable)
 	}
 	batch, err := a.preflightInFlight(ctx, cp)
 	if err != nil {
+		releaseGate()
 		return nil, err
 	}
 	durable := a.store.(checkpoint.Durable) // preflight proved the capability
@@ -238,6 +266,7 @@ func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, a
 		Lease:    a.cfg.claimLease,
 	})
 	if err != nil {
+		releaseGate()
 		return nil, err
 	}
 	claim := &claimed
@@ -245,10 +274,12 @@ func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, a
 	state, err := cloneState(cp.State)
 	if err != nil {
 		release()
+		releaseGate()
 		return nil, err
 	}
 	if err := applyFileSnapshot(&state, cp.FileSnapshot); err != nil {
 		release()
+		releaseGate()
 		return nil, err
 	}
 	if state.Files == nil {
@@ -259,10 +290,12 @@ func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, a
 	final, err := matchInFlightMessage(state.Messages, batch.calls)
 	if err != nil {
 		release()
+		releaseGate()
 		return nil, err
 	}
 	batch.final = final
 	run := a.newRunHandle(ctx, cp.ThreadID, &state)
+	run.setGateRelease(releaseGate)
 	run.rc.setDurableClaim(claim)
 	run.rc.continuedTurn = true
 	run.rc.inFlight = batch

@@ -92,6 +92,15 @@ func (r *Run) acquireAdmission() error {
 	return nil
 }
 
+// setGateRelease attaches a thread slot the caller already holds to this run. A
+// resume acquires the slot before it knows whether a handle will exist, so it
+// hands the release function over instead of acquiring again in prepare.
+func (r *Run) setGateRelease(release func()) {
+	r.lifecycleMu.Lock()
+	r.gateRelease = release
+	r.lifecycleMu.Unlock()
+}
+
 // releaseAdmission frees the thread slot if this run holds it. Every exit calls
 // it; only the first call releases.
 func (r *Run) releaseAdmission() {
