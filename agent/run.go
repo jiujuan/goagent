@@ -143,7 +143,14 @@ func (r *Run) Wait() (core.Result, error) {
 // Steer injects a message to be delivered before the next model call. The
 // returned ticket settles once the message reaches a step or the run ends
 // without delivering it.
-func (r *Run) Steer(msg core.Message) (*SteerTicket, error) { return r.rc.Steer(msg) }
+func (r *Run) Steer(msg core.Message) (*SteerTicket, error) { return r.SteerWith(msg, SteerOptions{}) }
+
+// SteerWith injects a message with delivery instructions. See
+// RunContext.SteerWith; the options are per message, so one run can mix a
+// message that waits for the next turn with one that arrives now.
+func (r *Run) SteerWith(msg core.Message, opts SteerOptions) (*SteerTicket, error) {
+	return r.rc.SteerWith(msg, opts)
+}
 
 // Cancel aborts the run. A Resume owns a durable claim before lazy execution
 // starts, so canceling that prepared handle releases the claim synchronously.

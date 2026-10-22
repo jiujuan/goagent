@@ -125,7 +125,16 @@ func (rc *RunContext) forBranch(branch string) (*RunContext, error) {
 // call from another goroutine while the run is in flight. The returned ticket
 // settles when the message reaches a step's model context or the run ends
 // without delivering it.
-func (rc *RunContext) Steer(msg core.Message) (*SteerTicket, error) { return rc.steering.push(msg) }
+func (rc *RunContext) Steer(msg core.Message) (*SteerTicket, error) {
+	return rc.SteerWith(msg, SteerOptions{})
+}
+
+// SteerWith injects a message with delivery instructions: a phase, and an
+// optional request to preempt the model call in flight. The queue is the
+// message's only home until a delivery point takes it.
+func (rc *RunContext) SteerWith(msg core.Message, opts SteerOptions) (*SteerTicket, error) {
+	return rc.steering.pushWith(msg, opts)
+}
 
 // publish is the loop's single-goroutine event sink.
 func (rc *RunContext) publish(ev core.Event) { rc.Bus.Publish(rc.Topic, ev) }

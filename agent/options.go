@@ -31,6 +31,7 @@ type config struct {
 	outputKey                 string
 	requireThreadCoordination bool
 	stepSnapshotPolicy        StepSnapshotPolicy
+	inputPreemption           bool
 
 	// delegation toggles (see transfer.go)
 	noTransfer       bool
@@ -142,6 +143,16 @@ func WithClaimLease(d time.Duration) Option { return func(c *config) { c.claimLe
 // batch never compares, because the batch executes before any new view freezes.
 func WithStepSnapshotPolicy(p StepSnapshotPolicy) Option {
 	return func(c *config) { c.stepSnapshotPolicy = p }
+}
+
+// WithInputPreemption lets a steering message cancel the model call in flight:
+// only a volatile before_model message with SteerOptions.Preempt may ask for it,
+// and only one call per step is interrupted. It is off by default, so a message
+// normally waits for the next delivery point instead of cutting a reply short.
+// A provider that ignores context cancellation still finishes; preemption then
+// costs nothing and gains nothing.
+func WithInputPreemption(enabled bool) Option {
+	return func(c *config) { c.inputPreemption = enabled }
 }
 
 // WithOutputKey writes this agent's final answer text into State.KV under key,
