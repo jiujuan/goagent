@@ -152,7 +152,8 @@ type Progress struct{ Job ProgressInfo }
 type PlanNodeStarted struct{ NodeID string }
 
 // PlanNodeDone is emitted when a DAG plan node settles. Status is
-// "done" | "failed" | "skipped" | "retry"; Err is set on failure/retry.
+// "done" | "failed" | "canceled" | "skipped" | "retry"; Err is set on
+// failure/cancel/retry.
 type PlanNodeDone struct {
 	NodeID string
 	Status string

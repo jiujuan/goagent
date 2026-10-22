@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -215,6 +216,16 @@ func (p *planRunner) run(rc *RunContext) runOutcome {
 	var failFastErr error
 	var saveErr error
 
+	// FailFast cancels in-flight nodes through this context only; the plan's
+	// parent context is left alone so the run can collect results and report the
+	// root error.
+	nodeCtx := rc.Context
+	var cancelNodes context.CancelFunc
+	if p.cfg.policy == FailFast {
+		nodeCtx, cancelNodes = context.WithCancel(rc.Context)
+		defer cancelNodes()
+	}
+
 	// LLM planning phase: if a planner is configured and we haven't planned yet
 	// (fresh run, not a resume), decompose the task into the initial DAG.
 	if p.cfg.planner != nil && !st.Planned {
@@ -241,6 +252,18 @@ func (p *planRunner) run(rc *RunContext) runOutcome {
 	}
 
 	for {
+		// Parent cancellation wins over a pending save error: stop scheduling and
+		// drain in-flight nodes, then report the parent's error.
+		if parentErr := rc.Context.Err(); parentErr != nil {
+			if inflight == 0 {
+				return runOutcome{Err: parentErr}
+			}
+			d := <-results
+			inflight--
+			p.applyResult(rc, st, nodes[d.id], d, nodeCtx, cancelNodes, &failFastErr)
+			continue
+		}
+
 		// A failed save means no subsequent state can be claimed durable. Do not
 		// launch more work, but collect workers already in flight so they cannot
 		// block trying to report their result.
@@ -250,7 +273,7 @@ func (p *planRunner) run(rc *RunContext) runOutcome {
 			}
 			d := <-results
 			inflight--
-			p.applyResult(rc, st, nodes[d.id], d, &failFastErr)
+			p.applyResult(rc, st, nodes[d.id], d, nodeCtx, cancelNodes, &failFastErr)
 			continue
 		}
 
@@ -259,7 +282,7 @@ func (p *planRunner) run(rc *RunContext) runOutcome {
 		// collect and pause once no other work is in flight.
 		var awaiting []core.ApprovalRequest
 		for _, id := range order {
-			if failFastErr != nil || inflight >= p.cfg.concurrency {
+			if failFastErr != nil || nodeCtx.Err() != nil || inflight >= p.cfg.concurrency {
 				break
 			}
 			node := nodes[id]
@@ -283,13 +306,16 @@ func (p *planRunner) run(rc *RunContext) runOutcome {
 			inflight++
 			rc.publish(core.PlanNodeStarted{NodeID: id})
 			go func(node Node, input string) {
-				out, err := p.execNode(rc, node, input)
+				out, err := p.execNode(nodeCtx, rc, node, input)
 				results <- planResult{node.ID, out, err}
 			}(node, input)
 		}
 
 		if inflight == 0 {
 			if failFastErr != nil {
+				// Surface dependents of failed/canceled nodes as skipped so the
+				// abort leaves one consistent snapshot for observers and resume.
+				p.skipBlocked(nodes, order, st, rc)
 				return runOutcome{Err: failFastErr}
 			}
 			if len(awaiting) > 0 {
@@ -325,11 +351,16 @@ func (p *planRunner) run(rc *RunContext) runOutcome {
 
 		d := <-results
 		inflight--
-		p.applyResult(rc, st, nodes[d.id], d, &failFastErr)
+		p.applyResult(rc, st, nodes[d.id], d, nodeCtx, cancelNodes, &failFastErr)
 		step++
 		if err := p.save(rc, st, step); err != nil {
 			saveErr = err
 		}
+	}
+
+	// A canceled parent must not be reported as a completed plan.
+	if err := rc.Context.Err(); err != nil {
+		return runOutcome{Err: err}
 	}
 
 	// Whole-plan final approval gate.
@@ -352,34 +383,53 @@ func (p *planRunner) run(rc *RunContext) runOutcome {
 	return runOutcome{Result: core.Result{Message: core.AssistantText(p.finalOutput(nodes, order, st))}}
 }
 
-func (p *planRunner) applyResult(rc *RunContext, st *planState, node Node, d planResult, failFastErr *error) {
+func (p *planRunner) applyResult(rc *RunContext, st *planState, node Node, d planResult, nodeCtx context.Context, cancelNodes context.CancelFunc, failFastErr *error) {
 	var budgetErr *TaskBudgetError
 	switch {
-	case d.err != nil && errors.As(d.err, &budgetErr):
+	case d.err == nil:
+		st.Status[d.id] = "done"
+		st.Output[d.id] = d.out
+		rc.State.KV[d.id] = d.out
+		rc.publish(core.PlanNodeDone{NodeID: d.id, Status: "done"})
+	case *failFastErr != nil || nodeCtx.Err() != nil:
+		// The plan already failed and canceled its nodes: record this result but do
+		// not retry and do not let a later failure overwrite the root error. A
+		// result caused by the node context (or a bare context.Canceled) is a
+		// cancellation, not a failure of this node.
+		if nodeCtx.Err() != nil || errors.Is(d.err, context.Canceled) {
+			st.Status[d.id] = "canceled"
+			rc.publish(core.PlanNodeDone{NodeID: d.id, Status: "canceled", Err: d.err})
+		} else {
+			st.Status[d.id] = "failed"
+			rc.publish(core.PlanNodeDone{NodeID: d.id, Status: "failed", Err: d.err})
+		}
+	case errors.As(d.err, &budgetErr):
 		// A budget error cannot recover by running the node again: the tree is
 		// already over quota, so retrying only burns another admission. Fail the
 		// node now; ContinueOnError lets skipBlocked cascade to its dependents.
 		st.Status[d.id] = "failed"
 		rc.publish(core.PlanNodeDone{NodeID: d.id, Status: "failed", Err: d.err})
-		if p.cfg.policy == FailFast {
-			*failFastErr = fmt.Errorf("plan %q: node %q failed: %w", p.name, d.id, d.err)
-		}
-	case d.err != nil && st.Attempts[d.id] < node.MaxRetries:
+		p.failPlan(d.id, d.err, cancelNodes, failFastErr)
+	case st.Attempts[d.id] < node.MaxRetries:
 		st.Attempts[d.id]++
 		st.Status[d.id] = "pending"
 		rc.publish(core.PlanNodeDone{NodeID: d.id, Status: "retry", Err: d.err})
-	case d.err != nil:
+	default:
 		st.Status[d.id] = "failed"
 		rc.publish(core.PlanNodeDone{NodeID: d.id, Status: "failed", Err: d.err})
-		if p.cfg.policy == FailFast {
-			*failFastErr = fmt.Errorf("plan %q: node %q failed: %w", p.name, d.id, d.err)
-		}
-	default:
-		st.Status[d.id] = "done"
-		st.Output[d.id] = d.out
-		rc.State.KV[d.id] = d.out
-		rc.publish(core.PlanNodeDone{NodeID: d.id, Status: "done"})
+		p.failPlan(d.id, d.err, cancelNodes, failFastErr)
 	}
+}
+
+// failPlan records the first unrecoverable node failure under FailFast and
+// cancels the node context. The root error is set once: later failures must not
+// replace it. ContinueOnError leaves the plan running.
+func (p *planRunner) failPlan(nodeID string, err error, cancelNodes context.CancelFunc, failFastErr *error) {
+	if p.cfg.policy != FailFast || *failFastErr != nil {
+		return
+	}
+	*failFastErr = fmt.Errorf("plan %q: node %q failed: %w", p.name, nodeID, err)
+	cancelNodes()
 }
 
 // materialize builds the working node set: static nodes plus any dynamic nodes
@@ -398,8 +448,9 @@ func (p *planRunner) materialize(st *planState) (map[string]Node, []string) {
 	return nodes, order
 }
 
-// execNode runs a node's worker as an isolated sub-run and returns its final text.
-func (p *planRunner) execNode(rc *RunContext, node Node, input string) (string, error) {
+// execNode runs a node's worker as an isolated sub-run under ctx and returns its
+// final text. ctx is the plan's node context, canceled on FailFast.
+func (p *planRunner) execNode(ctx context.Context, rc *RunContext, node Node, input string) (string, error) {
 	w := node.Worker
 	if w == nil {
 		w = p.cfg.worker
@@ -407,7 +458,7 @@ func (p *planRunner) execNode(rc *RunContext, node Node, input string) (string, 
 	if w == nil {
 		return "", fmt.Errorf("node %q has no worker (set Node.Worker or WithWorker)", node.ID)
 	}
-	child, err := rc.subRun(core.UserText(input), w.taskKind())
+	child, err := rc.subRunWithContext(ctx, core.UserText(input), w.taskKind())
 	if err != nil {
 		return "", err
 	}
@@ -512,7 +563,8 @@ func (p *planRunner) maybeReplan(rc *RunContext, nodes map[string]Node, st *plan
 	return delta.Nodes, nil
 }
 
-// skipBlocked marks pending nodes whose deps failed/skipped/rejected as skipped.
+// skipBlocked marks pending nodes whose deps failed/canceled/skipped/rejected as
+// skipped.
 func (p *planRunner) skipBlocked(nodes map[string]Node, order []string, st *planState, rc *RunContext) bool {
 	changed := false
 	for _, id := range order {
@@ -520,7 +572,7 @@ func (p *planRunner) skipBlocked(nodes map[string]Node, order []string, st *plan
 			continue
 		}
 		for _, d := range nodes[id].DependsOn {
-			if s := st.Status[d]; s == "failed" || s == "skipped" || s == "rejected" {
+			if s := st.Status[d]; s == "failed" || s == "canceled" || s == "skipped" || s == "rejected" {
 				st.Status[id] = "skipped"
 				rc.publish(core.PlanNodeDone{NodeID: id, Status: "skipped"})
 				changed = true
