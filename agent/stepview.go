@@ -338,28 +338,36 @@ func (l *AgentLoop) snapshotTools(rc *RunContext) runToolTable {
 // cases: runtime-injected tools were never persisted, and preflightResumeTools
 // has already rejected a paused batch that cannot resolve.
 func (l *AgentLoop) resumeStepView(rb *resumeBatch) *StepView {
+	return l.resumeStepViewFor(rb.step, rb.calls, rb.snapshot)
+}
+
+// resumeStepViewFor builds a view around a saved step snapshot and the current
+// static tool table. It serves both a paused batch and an in-flight recovery;
+// neither may re-freeze the view, because the step it belongs to is already
+// recorded.
+func (l *AgentLoop) resumeStepViewFor(step int, calls []core.ToolCall, snapshot *checkpoint.StepSnapshot) *StepView {
 	tv := ToolView{
-		byName:     make(map[string]tool.Tool, len(rb.calls)),
-		sequential: make(map[string]bool, len(rb.calls)),
+		byName:     make(map[string]tool.Tool, len(calls)),
+		sequential: make(map[string]bool, len(calls)),
 		known:      make(map[string]struct{}, len(l.byName)),
 	}
 	for name := range l.byName {
 		tv.known[name] = struct{}{}
 	}
-	view := &StepView{step: rb.step}
+	view := &StepView{step: step}
 
 	var names []string
-	if rb.snapshot != nil {
-		names = rb.snapshot.Advertised
-		view.model = rb.snapshot.Model
+	if snapshot != nil {
+		names = snapshot.Advertised
+		view.model = snapshot.Model
 		view.digest = StepDigest{
-			ToolDigest:     rb.snapshot.ToolDigest,
-			SettingsDigest: rb.snapshot.SettingsDigest,
-			Advertised:     slices.Clone(rb.snapshot.Advertised),
+			ToolDigest:     snapshot.ToolDigest,
+			SettingsDigest: snapshot.SettingsDigest,
+			Advertised:     slices.Clone(snapshot.Advertised),
 		}
 	} else {
-		seen := make(map[string]struct{}, len(rb.calls))
-		for _, c := range rb.calls {
+		seen := make(map[string]struct{}, len(calls))
+		for _, c := range calls {
 			if _, ok := seen[c.Name]; ok {
 				continue
 			}

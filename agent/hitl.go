@@ -87,6 +87,9 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 	if cp == nil {
 		return nil, fmt.Errorf("agent: no checkpoint to resume for thread %q", threadID)
 	}
+	if cp.InFlight != nil {
+		return a.resumeInFlight(ctx, cp, approvals)
+	}
 	if err := validatePause(cp); err != nil {
 		return nil, err
 	}
@@ -207,6 +210,68 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 	batch := newResumeBatch(cp.Pending.Step, cp.Pending.Pending, allApprovals, lastAssistant(state.Messages))
 	batch.snapshot = cloneStepSnapshot(cp.Snapshot)
 	run.rc.resumed = batch
+	return run, nil
+}
+
+// resumeInFlight continues a thread whose head is an in-flight tool batch. The
+// batch already passed every gate before it was recorded, so it takes no
+// approvals. It does not execute here either: preflight checks everything that
+// can be checked before the claim, the claim fences this attempt, and the
+// resumed loop settles the batch before its next model call.
+func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, approvals []Approval) (*Run, error) {
+	if cp.Pending != nil || cp.Pause != nil || cp.Completion != nil {
+		return nil, fmt.Errorf("%w: checkpoint %s carries work state that conflicts with an in-flight batch", ErrInFlightUnrecoverable, cp.ID)
+	}
+	if len(approvals) > 0 {
+		return nil, fmt.Errorf("%w: an in-flight batch takes no approvals; it was authorized before execution", ErrInFlightUnrecoverable)
+	}
+	batch, err := a.preflightInFlight(ctx, cp)
+	if err != nil {
+		return nil, err
+	}
+	durable := a.store.(checkpoint.Durable) // preflight proved the capability
+	claimed, err := durable.Claim(ctx, checkpoint.ClaimRequest{
+		ThreadID: cp.ThreadID,
+		Revision: cp.Revision,
+		PauseID:  checkpoint.EffectivePauseID(cp),
+		Owner:    core.NewID("resume"),
+		Lease:    a.cfg.claimLease,
+	})
+	if err != nil {
+		return nil, err
+	}
+	claim := &claimed
+	release := func() { _ = durable.ReleaseClaim(context.Background(), *claim) }
+	state, err := cloneState(cp.State)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	if err := applyFileSnapshot(&state, cp.FileSnapshot); err != nil {
+		release()
+		return nil, err
+	}
+	if state.Files == nil {
+		state.Files = vfs.NewInState()
+	}
+	// The batch runs against the state this handle cloned, so the message that
+	// issued it is matched there rather than in the preflight copy.
+	final, err := matchInFlightMessage(state.Messages, batch.calls)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	batch.final = final
+	run := a.newRunHandle(ctx, cp.ThreadID, &state)
+	run.rc.setDurableClaim(claim)
+	run.rc.continuedTurn = true
+	run.rc.inFlight = batch
+	run.preparation = &runPreparation{
+		head:         checkpointRef(cp),
+		turnID:       cp.TurnID,
+		claim:        copyClaim(claim),
+		headRevision: cp.Revision,
+	}
 	return run, nil
 }
 

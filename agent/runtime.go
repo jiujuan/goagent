@@ -34,6 +34,11 @@ type RunContext struct {
 	// and consumed once by the loop before its first model call (see hitl.go).
 	resumed *resumeBatch
 
+	// inFlight carries the tool batch an in-flight checkpoint left behind, set by
+	// Agent.Resume and consumed once by the loop before its first model call.
+	// Derived contexts leave it nil: only the resumed top-level run settles it.
+	inFlight *inFlightBatch
+
 	// continuedTurn marks a run that restarts a turn already begun — the only
 	// kind Agent.Resume produces. It fixes the first step's delivery phase: a
 	// next_turn message waits for the turn to actually restart, and a resume is

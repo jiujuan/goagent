@@ -583,7 +583,15 @@ type claimRecordingStore struct {
 	checkpoint.Durable
 	mu       sync.Mutex
 	commits  []checkpoint.CommitRequest
+	claims   []checkpoint.ClaimRequest
 	releases int
+}
+
+func (s *claimRecordingStore) Claim(ctx context.Context, req checkpoint.ClaimRequest) (checkpoint.Claim, error) {
+	s.mu.Lock()
+	s.claims = append(s.claims, req)
+	s.mu.Unlock()
+	return s.Durable.Claim(ctx, req)
 }
 
 func (s *claimRecordingStore) Commit(ctx context.Context, req checkpoint.CommitRequest) (checkpoint.CommitReceipt, error) {
@@ -604,6 +612,12 @@ func (s *claimRecordingStore) recordedCommits() []checkpoint.CommitRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]checkpoint.CommitRequest(nil), s.commits...)
+}
+
+func (s *claimRecordingStore) recordedClaims() []checkpoint.ClaimRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]checkpoint.ClaimRequest(nil), s.claims...)
 }
 
 func (s *claimRecordingStore) releaseCount() int {
