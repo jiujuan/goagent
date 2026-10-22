@@ -22,17 +22,26 @@ type runPreparation struct {
 	turnID string
 }
 
-func (r *Run) prepare() error {
-	if err := r.rc.Context.Err(); err != nil {
+func (r *Run) prepare() (err error) {
+	if err = r.rc.Context.Err(); err != nil {
 		return err
 	}
+	// The thread slot is taken before any store access: a run that must wait
+	// holds neither a claim nor a half-restored state.
+	if err = r.acquireAdmission(); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			r.releaseAdmission()
+		}
+	}()
 	if r.preparation == nil {
 		return nil
 	}
 
 	var (
 		state        *core.State
-		err          error
 		coordinator  checkpoint.ThreadCoordinator
 		claim        = copyClaim(r.preparation.claim)
 		headRevision = r.preparation.headRevision

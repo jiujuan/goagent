@@ -31,6 +31,9 @@ type Agent struct {
 	runnable Runnable
 	bus      *bus.Bus
 	store    checkpoint.Checkpointer
+	// gate admits one run per thread at a time. It is a value field so an
+	// Agent constructed directly (as tests do) can admit runs uninitialized.
+	gate threadGate
 }
 
 // New builds an Agent from functional options. WithModel is required.
@@ -182,7 +185,14 @@ func (a *Agent) Stream(ctx context.Context, input string, opts ...RunOption) *Ru
 }
 
 func resolveRunConfig(input, threadID string, opts ...RunOption) RunConfig {
-	rc := RunConfig{ThreadID: threadID, Message: core.UserText(input)}
+	rc := RunConfig{
+		ThreadID: threadID,
+		Message:  core.UserText(input),
+		admission: AdmissionOptions{
+			Policy:     AdmissionFail,
+			MaxWaiters: defaultAdmissionWaiters,
+		},
+	}
 	for _, o := range opts {
 		o(&rc)
 	}
@@ -193,6 +203,15 @@ func (a *Agent) streamConfigured(ctx context.Context, rc RunConfig) *Run {
 	// Validation and message freezing happen at handle creation. Store access is
 	// deferred until drive so lazily-created runs restore the current head.
 	err := core.CheckThreadID(rc.ThreadID)
+	if err == nil {
+		err = validateAdmission(rc.admission)
+	}
+	if err == nil {
+		// A call made from inside its own thread's run inherits that run's
+		// thread scope; it must be refused here, before it can wait on a slot
+		// the caller itself holds.
+		err = checkReentrant(ctx, rc.ThreadID)
+	}
 	message := core.Message{}
 	if err == nil {
 		message, err = core.CloneMessage(rc.Message)
@@ -201,6 +220,7 @@ func (a *Agent) streamConfigured(ctx context.Context, rc RunConfig) *Run {
 	if rc.childTask != nil {
 		run.rc.adoptChildTask(rc.taskTree, *rc.childTask, rc.ThreadID)
 	}
+	run.admission = rc.admission
 	run.startErr = err
 	run.preparation = &runPreparation{message: message, files: rc.Files, restoreCurrent: true}
 	return run
@@ -273,6 +293,10 @@ func (a *Agent) newRunHandle(ctx context.Context, threadID string, state *core.S
 // The id is fixed here and never regenerated or reassigned.
 func (a *Agent) newRunHandleWithID(ctx context.Context, runID, threadID string, state *core.State) *Run {
 	runCtx, cancel := context.WithCancel(ctx)
+	// The scope records which thread this run executes on. A nested call
+	// inheriting the run's context can then be refused as reentrant instead of
+	// queueing behind the run that made the call.
+	runCtx = withThreadScope(runCtx, threadID)
 	topic := bus.Topic(runID)
 	taskID := core.NewID("task")
 	rc := &RunContext{

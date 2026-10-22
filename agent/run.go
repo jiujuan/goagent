@@ -48,6 +48,9 @@ type Run struct {
 	cancel      context.CancelFunc
 	startErr    error
 	preparation *runPreparation
+	// admission is the same-thread admission policy resolved when the handle
+	// was created; prepare reads it before touching the thread.
+	admission AdmissionOptions
 
 	startOnce sync.Once
 	doneOnce  sync.Once
@@ -61,6 +64,10 @@ type Run struct {
 	lifecycleMu  sync.Mutex
 	driveStarted bool
 	cancelErr    error
+	// gateRelease frees the thread slot this run holds. It is nil until
+	// prepare acquires the slot (or a resume hands one over); lifecycleMu
+	// guards it.
+	gateRelease func()
 
 	// terminalMu guards the frozen end-of-run data. drive() fills it before it
 	// publishes any lifecycle event, so an observer that sees the terminal event
@@ -165,10 +172,15 @@ func (r *Run) Cancel() {
 	r.lifecycleMu.Lock()
 	r.cancel()
 	r.rc.steering.close(ErrRunStopped)
-	if !r.driveStarted {
+	undriven := !r.driveStarted
+	if undriven {
 		r.cancelErr = errors.Join(r.cancelErr, r.rc.releaseDurableClaim())
 	}
 	r.lifecycleMu.Unlock()
+	if undriven {
+		// A prepared resume may hold the thread slot before its first drive.
+		r.releaseAdmission()
+	}
 }
 
 // Paused reports whether this run ended by pausing for a human decision instead
@@ -248,6 +260,7 @@ func (r *Run) drive() {
 		r.driveStarted = true
 		r.lifecycleMu.Unlock()
 		go func() {
+			defer r.releaseAdmission()
 			r.bus.Publish(r.topic, core.RunStarted{RunID: r.identity.runID, ThreadID: r.identity.threadID})
 			if r.startErr != nil {
 				r.rc.steering.close(ErrRunClosed)
@@ -285,6 +298,10 @@ func (r *Run) drive() {
 			// outcome is frozen with it before any terminal event goes out.
 			boundaryID, boundaryRev, boundaryOK := r.rc.committedBoundary()
 			cleanupErr := r.rc.releaseDurableClaim()
+			// Release the thread only after the claim, so the next admitted
+			// run begins on a settled thread rather than colliding with a
+			// claim this one still holds.
+			r.releaseAdmission()
 			res, err, paused := terminalOutcome(out, cleanupErr)
 			r.freezeTerminal(boundaryID, boundaryRev, boundaryOK, res, err, paused)
 

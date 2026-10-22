@@ -50,6 +50,11 @@ func (s *Session) Send(ctx context.Context, input string, opts ...RunOption) (Ru
 		return RunResult{ThreadID: s.threadID}, fmt.Errorf(
 			"agent: session on thread %q: OnThread(%q) conflicts with the bound thread", s.threadID, rc.ThreadID)
 	}
+	// A session is a conversation on one thread, so a concurrent Send waits its
+	// turn by default instead of failing; an explicit policy still wins.
+	if !rc.admissionSet {
+		rc.admission.Policy = AdmissionQueue
+	}
 	run := s.agent.streamConfigured(ctx, rc)
 	_, err := run.Wait()
 	return run.DetailedResult(), err

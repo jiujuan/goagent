@@ -45,6 +45,65 @@ func WithAdmission(o AdmissionOptions) RunOption {
 	return func(r *RunConfig) { r.admission, r.admissionSet = o, true }
 }
 
+func validateAdmission(o AdmissionOptions) error {
+	switch o.Policy {
+	case AdmissionFail, AdmissionQueue:
+		return nil
+	default:
+		return fmt.Errorf("agent: unknown admission policy %d", o.Policy)
+	}
+}
+
+// threadScopeKey carries a run's thread through its context. A call made from
+// inside that run inherits the value and can be recognized before it waits for
+// a slot the run itself holds.
+type threadScopeKey struct{}
+
+type threadScope struct{ threadID string }
+
+func withThreadScope(ctx context.Context, threadID string) context.Context {
+	return context.WithValue(ctx, threadScopeKey{}, threadScope{threadID: threadID})
+}
+
+func checkReentrant(ctx context.Context, threadID string) error {
+	if s, ok := ctx.Value(threadScopeKey{}).(threadScope); ok && s.threadID == threadID {
+		return fmt.Errorf("agent: thread %q: %w", threadID, ErrAdmissionReentrant)
+	}
+	return nil
+}
+
+// acquireAdmission reserves this run's thread slot. A resume may already hold
+// the slot and have attached its release to the handle, in which case it is
+// reused rather than acquired twice.
+func (r *Run) acquireAdmission() error {
+	r.lifecycleMu.Lock()
+	held := r.gateRelease != nil
+	r.lifecycleMu.Unlock()
+	if held {
+		return nil
+	}
+	release, err := r.agent.gate.acquire(r.rc.Context, r.identity.threadID, r.admission.Policy, r.admission.MaxWaiters)
+	if err != nil {
+		return err
+	}
+	r.lifecycleMu.Lock()
+	r.gateRelease = release
+	r.lifecycleMu.Unlock()
+	return nil
+}
+
+// releaseAdmission frees the thread slot if this run holds it. Every exit calls
+// it; only the first call releases.
+func (r *Run) releaseAdmission() {
+	r.lifecycleMu.Lock()
+	release := r.gateRelease
+	r.gateRelease = nil
+	r.lifecycleMu.Unlock()
+	if release != nil {
+		release()
+	}
+}
+
 // threadGate serializes runs that target one thread. The zero value is ready to
 // use. A slot is always held by at most one run; releasing it hands it directly
 // to the oldest waiter so a newcomer cannot barge in.
