@@ -259,3 +259,38 @@ func TestToolBatchInFlightEventOmitsEmptyCalls(t *testing.T) {
 		}
 	}
 }
+
+func TestToolBatchRecoveredEventRoundTrip(t *testing.T) {
+	in := ToolBatchRecovered{Step: 3, Replayed: 1, Executed: 2, Unknown: 1, Rejected: 1}
+	data, err := MarshalEvent(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := out.(ToolBatchRecovered)
+	if !ok {
+		t.Fatalf("round trip type = %T, want ToolBatchRecovered", out)
+	}
+	if got != in {
+		t.Fatalf("round trip = %+v, want %+v", got, in)
+	}
+}
+
+func TestToolBatchRecoveredEventOmitsZeroCounts(t *testing.T) {
+	data, err := MarshalEvent(ToolBatchRecovered{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"step", "replayed", "executed", "unknown", "rejected"} {
+		if _, ok := raw[key]; ok {
+			t.Errorf("zero-valued %q should be omitted from %s", key, data)
+		}
+	}
+}

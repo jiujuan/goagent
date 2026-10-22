@@ -93,6 +93,7 @@ func (l *AgentLoop) execTools(rc *RunContext, lc *LoopContext, calls []core.Tool
 				out = awaitAbandoned(ch, callCtx, c, start)
 			}
 		}
+		lc.stats.add(out.class)
 		tr := out.tr
 		if out.err != nil {
 			recordRunErr(out.err)
@@ -216,7 +217,7 @@ func awaitAbandoned(ch <-chan toolOutcome, callCtx context.Context, c core.ToolC
 		// The run itself was cancelled, not the call out of time. That is not a
 		// rejection the loop is reporting on the tool's behalf — there is no later
 		// step left to act on it — so it carries no rejection.
-		return toolOutcome{tr: cancelledResult(c)}
+		return toolOutcome{tr: cancelledResult(c), class: classExecuted}
 	}
 }
 
@@ -258,6 +259,57 @@ func keepToolUpdates(ctx context.Context, rc *RunContext) context.Context {
 	return updaterContext{Context: ctx, up: rc}
 }
 
+// outcomeClass says how a call settled, for the recovery report. Only a
+// recovered batch keeps counters; every other batch leaves lc.stats nil and the
+// classification is discarded.
+type outcomeClass uint8
+
+const (
+	classUncounted outcomeClass = iota
+	classReplayed
+	classExecuted
+	classUnknown
+	classRejected
+)
+
+// batchStats accumulates how the calls of one recovered batch settled. It is
+// safe for concurrent use because a batch may run its calls in parallel
+// segments. Nil receivers accept every add, so ordinary steps need no guard.
+type batchStats struct {
+	mu       sync.Mutex
+	replayed int
+	executed int
+	unknown  int
+	rejected int
+}
+
+func (s *batchStats) add(c outcomeClass) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch c {
+	case classReplayed:
+		s.replayed++
+	case classExecuted:
+		s.executed++
+	case classUnknown:
+		s.unknown++
+	case classRejected:
+		s.rejected++
+	}
+}
+
+func (s *batchStats) snapshot() (replayed, executed, unknown, rejected int) {
+	if s == nil {
+		return 0, 0, 0, 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.replayed, s.executed, s.unknown, s.rejected
+}
+
 // toolOutcome is everything one tool call produces: the result the model sees,
 // plus the control directive and state mutations its handler requested, plus the
 // rejection the loop reports when the call never got a usable answer.
@@ -268,6 +320,7 @@ type toolOutcome struct {
 	rejection *ToolRejection
 	err       error
 	noResult  bool
+	class     outcomeClass
 
 	// skipAfter is used for a result restored from the durable journal. It has
 	// already passed AfterTool in the run that first completed it, and replaying
@@ -289,6 +342,7 @@ func abandonedAtBound(c core.ToolCall, d time.Duration) toolOutcome {
 	return toolOutcome{
 		tr:        errResult(c, msg),
 		rejection: &ToolRejection{Call: c, Class: RejectTimedOut, Detail: msg},
+		class:     classExecuted,
 	}
 }
 
@@ -358,7 +412,7 @@ func (l *AgentLoop) callOne(lc *LoopContext, callCtx context.Context, c core.Too
 		})
 		switch {
 		case errors.Is(err, checkpoint.ErrToolOutcomeUnknown):
-			return toolOutcome{tr: unknownToolResult(c, ex.IdempotencyKey)}
+			return toolOutcome{tr: unknownToolResult(c, ex.IdempotencyKey), class: classUnknown}
 		case err != nil:
 			return toolOutcome{
 				tr:  errResult(c, "tool execution could not be fenced: "+err.Error()),
@@ -372,7 +426,7 @@ func (l *AgentLoop) callOne(lc *LoopContext, callCtx context.Context, c core.Too
 					err: fmt.Errorf("tool %q has invalid durable result for invocation %q", c.Name, invocationID),
 				}
 			}
-			return toolOutcome{tr: tr, skipAfter: true}
+			return toolOutcome{tr: tr, skipAfter: true, class: classReplayed}
 		default:
 			execution = &ex
 		}
@@ -400,11 +454,15 @@ func (l *AgentLoop) callOne(lc *LoopContext, callCtx context.Context, c core.Too
 	if err != nil {
 		out := rejected(c, RejectHandlerError, err.Error())
 		out.execution = execution
+		// The handler was entered, so this counts as executed even though the
+		// call is also reported as rejected.
+		out.class = classExecuted
 		return out
 	}
 	if res == nil {
 		out := rejected(c, RejectHandlerError, "tool returned no result")
 		out.execution = execution
+		out.class = classExecuted
 		return out
 	}
 	// A handler that ran and reported its own failure (tool.ErrorResult, hence
@@ -416,6 +474,7 @@ func (l *AgentLoop) callOne(lc *LoopContext, callCtx context.Context, c core.Too
 		control:   res.Control,
 		ops:       res.State,
 		execution: execution,
+		class:     classExecuted,
 	}
 }
 
@@ -491,6 +550,7 @@ func rejected(c core.ToolCall, class RejectClass, msg string) toolOutcome {
 	return toolOutcome{
 		tr:        errResult(c, msg),
 		rejection: &ToolRejection{Call: c, Class: class, Detail: msg},
+		class:     classRejected,
 	}
 }
 

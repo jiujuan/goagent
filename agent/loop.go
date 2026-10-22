@@ -122,6 +122,50 @@ func (l *AgentLoop) prepareRun(rc *RunContext) (taskState, runOutcome, bool) {
 	history := append([]core.Message(nil), rc.State.Messages...)
 	startStep := 0
 
+	// A run resumed from an in-flight checkpoint continues the batch a crash
+	// interrupted. The batch already passed every execution-time gate before its
+	// checkpoint was written, so recovery executes the calls as decided: no policy
+	// check, no approval gate, no view re-freeze. Completed calls replay from the
+	// ledger, claimed/unknown ones are reported as unknown, and pending ones run
+	// now. The batch settles as the same logical step it was recorded under.
+	if ib := rc.inFlight; ib != nil {
+		rc.inFlight = nil
+		rlc := &LoopContext{RunContext: rc, Step: ib.step, MaxTurns: l.maxTurns, History: history}
+		rlc.view = l.resumeStepViewFor(ib.step, ib.calls, ib.snapshot)
+		rlc.stats = &batchStats{}
+		parts, dirs, rejects, execErr := l.execTools(rc, rlc, ib.calls)
+		l.mw.ToolReject(rlc, rejects)
+		if len(parts) > 0 {
+			history = append(history, core.Message{Role: core.RoleTool, Parts: parts})
+		}
+		if execErr != nil {
+			return taskState{}, l.fail(rc, ib.step, history, ib.snapshot, execErr), false
+		}
+		rc.State.Messages = history
+		next := core.Resolve(dirs...)
+		if err := l.checkpoint(rc, commitOptions{
+			Step:     ib.step,
+			Snapshot: ib.snapshot,
+			Release:  next.Kind != core.Continue,
+		}); err != nil {
+			return taskState{}, runOutcome{Err: err}, false
+		}
+		replayed, executed, unknown, rejected := rlc.stats.snapshot()
+		rc.publish(core.ToolBatchRecovered{
+			Step:     ib.step,
+			Replayed: replayed,
+			Executed: executed,
+			Unknown:  unknown,
+			Rejected: rejected,
+		})
+		if next.Kind != core.Continue {
+			return taskState{}, runOutcome{Result: core.Result{Message: ib.final}, Control: next}, false
+		}
+		// The batch belongs to ib.step; ask the model again at the next logical
+		// step so a reused tool-call ID cannot replay its durable result.
+		startStep = ib.step + 1
+	}
+
 	// A resumed run carries the tool batch its HITL pause left behind. Execute it
 	// before consulting the model, so approved calls behave exactly like a batch
 	// run inside a step (events, AfterTool, state, directives). A directive from

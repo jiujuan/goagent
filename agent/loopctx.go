@@ -19,6 +19,9 @@ type LoopContext struct {
 	History  []core.Message
 	view     *StepView
 	approved map[toolApprovalKey]struct{}
+	// stats is set only for a recovered in-flight batch; ordinary steps leave it
+	// nil, so execTools classifies calls for nothing.
+	stats *batchStats
 }
 
 // IsApproved reports whether this exact persisted tool call was explicitly

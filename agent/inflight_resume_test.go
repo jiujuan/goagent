@@ -402,8 +402,18 @@ func TestResumeInFlightDoesNotSetReplayBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := run.Wait(); err != nil {
+	res, err := run.Wait()
+	if err != nil {
 		t.Fatalf("run after an in-flight resume = %v, want no drift error", err)
+	}
+	// The completed call replays without touching the handler, and the model is
+	// asked only at the next step — where a replay baseline would have raised
+	// strict drift against the changed description.
+	if got := len(rec.invocations()); got != 0 {
+		t.Fatalf("handlers ran %d times, want the completed call replayed", got)
+	}
+	if got := res.Message.Text(); got != "done" {
+		t.Fatalf("result = %q, want the next step's answer", got)
 	}
 }
 
@@ -453,11 +463,18 @@ func TestResumeInFlightSummaryDriftAllowsPureReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.Resume(ctx, "inflight-drift-replay"); err != nil {
+	run, err := a.Resume(ctx, "inflight-drift-replay")
+	if err != nil {
 		t.Fatalf("Resume of a pure replay after a tool change = %v, want success", err)
 	}
 	if got := len(store.recordedClaims()); got != 1 {
 		t.Fatalf("claims = %d, want 1", got)
+	}
+	if _, err := run.Wait(); err != nil {
+		t.Fatalf("run after a pure replay = %v, want success", err)
+	}
+	if got := len(rec.invocations()); got != 0 {
+		t.Fatalf("handlers ran %d times, want a pure replay", got)
 	}
 }
 

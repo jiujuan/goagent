@@ -59,6 +59,11 @@ type eventWire struct {
 	Source     string   `json:"source,omitempty"`
 	MessageIDs []string `json:"message_ids,omitempty"`
 	Preempted  bool     `json:"preempted,omitempty"`
+
+	Replayed int `json:"replayed,omitempty"`
+	Executed int `json:"executed,omitempty"`
+	Unknown  int `json:"unknown,omitempty"`
+	Rejected int `json:"rejected,omitempty"`
 }
 
 // MarshalEvent encodes an Event to tagged JSON.
@@ -97,6 +102,10 @@ func MarshalEvent(ev Event) ([]byte, error) {
 			}
 			w.Message = &Message{Role: RoleAssistant, Parts: parts}
 		}
+	case ToolBatchRecovered:
+		w.Type, w.Step = "tool_batch_recovered", e.Step
+		w.Replayed, w.Executed = e.Replayed, e.Executed
+		w.Unknown, w.Rejected = e.Unknown, e.Rejected
 	case ToolUpdate:
 		w.Type, w.CallID = "tool_update", e.CallID
 		w.Message = &Message{Role: RoleTool, Parts: []Part{e.Partial}}
@@ -172,6 +181,11 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		return ToolStarted{Call: firstPartOf[ToolCall](w.Message)}, nil
 	case "tool_batch_in_flight":
 		return ToolBatchInFlight{Step: w.Step, Calls: deref(w.Message).ToolCalls()}, nil
+	case "tool_batch_recovered":
+		return ToolBatchRecovered{
+			Step: w.Step, Replayed: w.Replayed, Executed: w.Executed,
+			Unknown: w.Unknown, Rejected: w.Rejected,
+		}, nil
 	case "tool_update":
 		return ToolUpdate{CallID: w.CallID, Partial: firstPart(w.Message)}, nil
 	case "tool_done":

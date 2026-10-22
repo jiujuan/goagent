@@ -65,6 +65,22 @@ type ToolBatchInFlight struct {
 	Calls []ToolCall
 }
 
+// ToolBatchRecovered is emitted after a resumed run has settled the tool batch
+// its in-flight checkpoint left behind and committed the result. Replayed counts
+// calls whose stored result was reused, Executed counts calls that reached a
+// handler (whether it succeeded or failed), Unknown counts calls whose earlier
+// outcome could not be determined and were reported as such, and Rejected counts
+// calls refused before a handler ran. The counts are diagnostic: a call can fall
+// outside all four (for example a write-access failure before dispatch), so they
+// are not a conservation equation over the batch.
+type ToolBatchRecovered struct {
+	Step     int
+	Replayed int
+	Executed int
+	Unknown  int
+	Rejected int
+}
+
 // ToolUpdate carries a partial result streamed by a long-running tool.
 type ToolUpdate struct {
 	CallID  string
@@ -239,6 +255,7 @@ func (MessageDelta) isEvent()           {}
 func (MessageDone) isEvent()            {}
 func (ToolStarted) isEvent()            {}
 func (ToolBatchInFlight) isEvent()      {}
+func (ToolBatchRecovered) isEvent()     {}
 func (ToolUpdate) isEvent()             {}
 func (ToolDone) isEvent()               {}
 func (ApprovalDecided) isEvent()        {}
