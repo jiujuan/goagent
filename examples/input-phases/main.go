@@ -88,8 +88,9 @@ func main() {
 	}()
 
 	var (
-		delivered []core.InputDelivered
-		turnSteps []int
+		delivered    []core.InputDelivered
+		startedSteps []int
+		doneSteps    []int
 	)
 	for ev, err := range run.Iter() {
 		if err != nil {
@@ -98,8 +99,10 @@ func main() {
 		switch e := ev.(type) {
 		case core.InputDelivered:
 			delivered = append(delivered, e)
+		case core.TurnStarted:
+			startedSteps = append(startedSteps, e.Step)
 		case core.TurnDone:
-			turnSteps = append(turnSteps, e.Step)
+			doneSteps = append(doneSteps, e.Step)
 		}
 	}
 	result, err := run.Wait()
@@ -113,7 +116,7 @@ func main() {
 	fmt.Printf("默认未开启抢占：Preempt 请求被拒为 %v\n", got.preempt)
 
 	for _, d := range delivered {
-		fmt.Printf("投递：phase=%s step=%d count=%d\n", d.Phase, d.Step, d.Count)
+		fmt.Printf("投递：source=%s phase=%s step=%d count=%d\n", d.Source, d.Phase, d.Step, d.Count)
 	}
 	wantStep := map[core.InputPhase]int{
 		core.InputBeforeModel: 1,
@@ -136,11 +139,12 @@ func main() {
 			log.Fatalf("票据 %s = %+v，want step=%d 已投递",
 				rec.phase, outcome, wantStep[rec.phase])
 		}
-		fmt.Printf("票据：phase=%s delivered=%v step=%d\n",
-			rec.phase, outcome.Delivered, outcome.Step)
+		fmt.Printf("票据：phase=%s state=%s delivered=%v step=%d\n",
+			rec.phase, rec.ticket.State(), outcome.Delivered, outcome.Step)
 	}
 
-	fmt.Println("回合结束步骤：", turnSteps)
+	fmt.Println("TurnStarted 步骤：", startedSteps)
+	fmt.Println("TurnDone 步骤：", doneSteps)
 	fmt.Println("最终回答：", result.Message.Text())
 	if result.Message.Text() != "第二个回合的回答" {
 		log.Fatalf("最终回答 = %q，want 第二个回合的回答", result.Message.Text())
