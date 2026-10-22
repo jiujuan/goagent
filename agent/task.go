@@ -90,7 +90,7 @@ type TaskBudgetError struct {
 }
 
 func (e *TaskBudgetError) Error() string {
-	return fmt.Sprintf("agent: task budget exceeded: %s limit %d reached (used %d) at parent task %q (%s)",
+	return fmt.Sprintf("agent: task budget exceeded: %s limit %d reached (used %d) at task %q (%s)",
 		e.Dimension, e.Limit, e.Used, e.ParentID, e.Kind)
 }
 
@@ -175,19 +175,72 @@ func (rc *RunContext) taskState() (*taskRuntime, TaskInfo) {
 // admitChild registers a child task in the shared tree and returns its
 // identity. ThreadID/TurnID are left for the caller: a shared-thread
 // derivation fills the parent's, while an AsTool child run fills its own.
-// Budget checks land here in a later card.
+// Depth is checked before the units counter moves, so a rejected child costs
+// no quota; the units increment is a CAS loop that never overshoots.
 func (rc *RunContext) admitChild(kind TaskKind) (TaskInfo, error) {
-	rc.ensureTask()
+	task := rc.ensureTask()
 	parent := rc.taskInfo()
 	if kind == "" {
 		kind = TaskKindChat
+	}
+	depth := parent.Depth + 1
+	if depth > task.budget.MaxDepth {
+		return TaskInfo{}, &TaskBudgetError{
+			Dimension: "depth",
+			Limit:     task.budget.MaxDepth,
+			Used:      depth,
+			ParentID:  parent.ID,
+			Kind:      kind,
+		}
+	}
+	for {
+		old := task.units.Load()
+		if old+1 > int64(task.budget.MaxUnits) {
+			return TaskInfo{}, &TaskBudgetError{
+				Dimension: "units",
+				Limit:     task.budget.MaxUnits,
+				Used:      int(old),
+				ParentID:  parent.ID,
+				Kind:      kind,
+			}
+		}
+		if task.units.CompareAndSwap(old, old+1) {
+			break
+		}
 	}
 	return TaskInfo{
 		ID:       core.NewID("task"),
 		ParentID: parent.ID,
 		Kind:     kind,
-		Depth:    parent.Depth + 1,
+		Depth:    depth,
 	}, nil
+}
+
+// consumeTurn charges one model request to the shared tree budget. MaxTurns 0
+// means unlimited and leaves the counter alone. A refused request does not
+// increment, so Used always reports completed admissions.
+func (rc *RunContext) consumeTurn() error {
+	task := rc.ensureTask()
+	info := rc.taskInfo()
+	limit := int64(task.budget.MaxTurns)
+	if limit == 0 {
+		return nil
+	}
+	for {
+		old := task.turns.Load()
+		if old+1 > limit {
+			return &TaskBudgetError{
+				Dimension: "turns",
+				Limit:     int(limit),
+				Used:      int(old),
+				ParentID:  info.ID,
+				Kind:      info.Kind,
+			}
+		}
+		if task.turns.CompareAndSwap(old, old+1) {
+			return nil
+		}
+	}
 }
 
 // deriveChildTask admits a child and completes the identity a derived

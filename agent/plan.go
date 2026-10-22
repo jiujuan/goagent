@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -352,7 +353,17 @@ func (p *planRunner) run(rc *RunContext) runOutcome {
 }
 
 func (p *planRunner) applyResult(rc *RunContext, st *planState, node Node, d planResult, failFastErr *error) {
+	var budgetErr *TaskBudgetError
 	switch {
+	case d.err != nil && errors.As(d.err, &budgetErr):
+		// A budget error cannot recover by running the node again: the tree is
+		// already over quota, so retrying only burns another admission. Fail the
+		// node now; ContinueOnError lets skipBlocked cascade to its dependents.
+		st.Status[d.id] = "failed"
+		rc.publish(core.PlanNodeDone{NodeID: d.id, Status: "failed", Err: d.err})
+		if p.cfg.policy == FailFast {
+			*failFastErr = fmt.Errorf("plan %q: node %q failed: %w", p.name, d.id, d.err)
+		}
 	case d.err != nil && st.Attempts[d.id] < node.MaxRetries:
 		st.Attempts[d.id]++
 		st.Status[d.id] = "pending"
@@ -486,6 +497,10 @@ func (p *planRunner) maybeReplan(rc *RunContext, nodes map[string]Node, st *plan
 	out := runChild(child, p.cfg.replanner.runnable)
 	if out.Err != nil {
 		rc.publish(core.PlanNodeDone{NodeID: replanNodeID, Status: "failed", Err: out.Err})
+		var budgetErr *TaskBudgetError
+		if errors.As(out.Err, &budgetErr) {
+			return nil, out.Err
+		}
 		return nil, nil
 	}
 	delta := parseDelta(out.Result.Message.Text())

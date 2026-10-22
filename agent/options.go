@@ -100,10 +100,11 @@ func WithoutTransfer() Option { return func(c *config) { c.noTransfer = true } }
 func WithMaxTurns(n int) Option { return func(c *config) { c.maxTurns = n } }
 
 // WithTaskBudget bounds the whole task tree this agent starts: the nesting
-// depth, the number of derived child tasks, and the model requests made by
-// every task in the tree. A pause/resume begins a new tree and counts from
-// zero again. When this agent runs as somebody else's child task, the parent
-// tree's budget applies instead.
+// depth (default 8), the number of derived child tasks (default 64), and the
+// model requests made by every task in the tree (unlimited by default). A
+// pause/resume begins a new tree and counts from zero again, so a caller that
+// needs a cross-resume total must track it outside the agent. When this agent
+// runs as somebody else's child task, the parent tree's budget applies instead.
 //
 // This is separate from middleware.RunBudget, which bounds one run's turns,
 // tokens, cost and duration and can wrap up a reply. A task-tree budget is a

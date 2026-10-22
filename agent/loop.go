@@ -395,6 +395,9 @@ func (l *AgentLoop) runStep(rc *RunContext, st taskState) (runOutcome, taskState
 		final     core.Message
 	)
 	for {
+		if err := rc.consumeTurn(); err != nil {
+			return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
+		}
 		// An observability middleware (ModelContexter) injects its span here so
 		// the provider call — and any downstream traceparent — nests under it.
 		// Each attempt gets a fresh span and its own cancellable context, which
