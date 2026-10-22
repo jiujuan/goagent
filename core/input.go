@@ -36,12 +36,12 @@ const (
 type InputState string
 
 const (
-	// InputQueued means the input was accepted but not yet delivered.
-	InputQueued InputState = "queued"
-	// InputDelivered means the input entered a step's working history.
-	InputDelivered InputState = "delivered"
-	// InputRejected means the input was refused and never delivered.
-	InputRejected InputState = "rejected"
+	// InputStateQueued means the input was accepted but not yet delivered.
+	InputStateQueued InputState = "queued"
+	// InputStateDelivered means the input entered a step's working history.
+	InputStateDelivered InputState = "delivered"
+	// InputStateRejected means the input was refused and never delivered.
+	InputStateRejected InputState = "rejected"
 )
 
 // ErrUnknownInputPhase reports a phase outside the closed set.

@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"slices"
 	"testing"
 )
 
@@ -156,5 +157,53 @@ func TestContextOverflowRetriedEventOmitsUnknownFields(t *testing.T) {
 func TestUnmarshalEventRejectsUnknownType(t *testing.T) {
 	if _, err := UnmarshalEvent([]byte(`{"type":"context_overflow_retry"}`)); err == nil {
 		t.Fatal("unknown event type should still fail")
+	}
+}
+
+func TestInputDeliveredEventRoundTrip(t *testing.T) {
+	in := InputDelivered{
+		Step:       4,
+		Source:     InputDurable,
+		Phase:      InputNextTurn,
+		Count:      2,
+		MessageIDs: []string{"msg-a", "msg-b"},
+		Preempted:  true,
+	}
+	data, err := MarshalEvent(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := out.(InputDelivered)
+	if !ok {
+		t.Fatalf("round trip type = %T, want InputDelivered", out)
+	}
+	if got.Step != in.Step || got.Source != in.Source || got.Phase != in.Phase {
+		t.Fatalf("round trip = %+v, want %+v", got, in)
+	}
+	if got.Count != in.Count || got.Preempted != in.Preempted {
+		t.Fatalf("round trip = %+v, want %+v", got, in)
+	}
+	if !slices.Equal(got.MessageIDs, in.MessageIDs) {
+		t.Fatalf("message IDs = %v, want %v", got.MessageIDs, in.MessageIDs)
+	}
+}
+
+func TestInputDeliveredEventOmitsEmptyFields(t *testing.T) {
+	data, err := MarshalEvent(InputDelivered{Step: 1, Source: InputVolatile, Phase: InputBeforeModel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"count", "message_ids", "preempted"} {
+		if _, ok := raw[key]; ok {
+			t.Errorf("zero-valued %q should be omitted from %s", key, data)
+		}
 	}
 }

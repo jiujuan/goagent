@@ -90,12 +90,12 @@ func (t *SteerTicket) State() core.InputState {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if !t.settled {
-		return core.InputQueued
+		return core.InputStateQueued
 	}
 	if t.outcome.Err != nil {
-		return core.InputRejected
+		return core.InputStateRejected
 	}
-	return core.InputDelivered
+	return core.InputStateDelivered
 }
 
 // Wait blocks until the ticket settles or ctx ends, whichever comes first.
@@ -282,13 +282,13 @@ func (q *steeringQueue) close(err error) {
 // settleDelivered marks entries as delivered by the given step.
 func settleDelivered(entries []steerEntry, step int) {
 	for _, e := range entries {
-		e.ticket.settle(SteerOutcome{Delivered: true, Step: step, State: core.InputDelivered})
+		e.ticket.settle(SteerOutcome{Delivered: true, Step: step, State: core.InputStateDelivered})
 	}
 }
 
 // settleUndelivered marks entries as never delivered, with err as the reason.
 func settleUndelivered(entries []steerEntry, err error) {
 	for _, e := range entries {
-		e.ticket.settle(SteerOutcome{Err: err, State: core.InputRejected})
+		e.ticket.settle(SteerOutcome{Err: err, State: core.InputStateRejected})
 	}
 }

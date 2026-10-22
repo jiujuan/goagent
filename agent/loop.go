@@ -93,6 +93,10 @@ type taskState struct {
 	history   []core.Message
 	system    string
 	usePrompt bool
+	// newTurn reports whether this step is the first one of a turn. It decides
+	// which delivery phases may be satisfied: a mid-turn step keeps next_turn
+	// input queued, the first step of a turn takes everything.
+	newTurn bool
 }
 
 func (l *AgentLoop) run(rc *RunContext) (out runOutcome) {
@@ -184,6 +188,9 @@ func (l *AgentLoop) prepareRun(rc *RunContext) (taskState, runOutcome, bool) {
 		history:   history,
 		system:    system,
 		usePrompt: usePrompt,
+		// A resume continues the turn its checkpoint belongs to, so a next_turn
+		// message must wait for that turn's first real restart.
+		newTurn: !rc.continuedTurn,
 	}, runOutcome{}, true
 }
 
@@ -255,26 +262,29 @@ func (l *AgentLoop) runStep(rc *RunContext, st taskState) (runOutcome, taskState
 	lc := &LoopContext{RunContext: rc, Step: step, MaxTurns: l.maxTurns, History: history}
 	rc.publish(core.TurnStarted{Step: step})
 
-	// Phase 1 — PrepareTurn: drain volatile steering, then the durable inbox.
-	if steers := rc.steering.drain(); len(steers) > 0 {
+	// Phase 1 — PrepareTurn: deliver input through one read surface. Volatile
+	// steering goes first (it is in-process and never slow), then the durable
+	// inbox. Both are phase-filtered: mid-turn steps keep next_turn input queued.
+	q := rc.inputs()
+	if steers := q.takeVolatile(st.newTurn); len(steers) > 0 {
 		for _, e := range steers {
 			history = append(history, e.msg)
 		}
 		settleDelivered(steers, step)
+		rc.publishDeliveredVolatile(step, steers, false)
 	}
-	if durable, ok := rc.durableStore(); ok {
-		inbox, err := durable.Inbox(rc, rc.ThreadID)
-		if err != nil {
-			return l.fail(rc, step, history, nil, err), st, false
+	inbox, err := q.takeDurable(rc, st.newTurn)
+	if err != nil {
+		return l.fail(rc, step, history, nil, err), st, false
+	}
+	if len(inbox) > 0 {
+		ids := make([]string, 0, len(inbox))
+		for _, msg := range inbox {
+			history = append(history, msg.Message)
+			ids = append(ids, msg.ID)
 		}
-		if len(inbox) > 0 {
-			ids := make([]string, 0, len(inbox))
-			for _, msg := range inbox {
-				history = append(history, msg.Message)
-				ids = append(ids, msg.ID)
-			}
-			rc.addInboxAcks(ids)
-		}
+		rc.addInboxAcks(ids)
+		rc.publishDeliveredDurable(step, inbox, false)
 	}
 	// Let history-compacters (durable compaction) rewrite the working history
 	// before the model is consulted. The replacement flows into this step's
@@ -441,6 +451,7 @@ func (l *AgentLoop) runStep(rc *RunContext, st taskState) (runOutcome, taskState
 		}
 		if continuing {
 			settleDelivered(entries, step+1)
+			rc.publishDeliveredVolatile(step+1, entries, false)
 		}
 		rc.publish(core.TurnDone{Step: step})
 		if continuing {
@@ -450,6 +461,7 @@ func (l *AgentLoop) runStep(rc *RunContext, st taskState) (runOutcome, taskState
 				history:   nextHistory,
 				system:    st.system,
 				usePrompt: st.usePrompt,
+				newTurn:   true,
 			}, true
 		}
 		return runOutcome{Result: core.Result{Message: final}}, st, false
@@ -473,6 +485,7 @@ func (l *AgentLoop) runStep(rc *RunContext, st taskState) (runOutcome, taskState
 			history:   history,
 			system:    st.system,
 			usePrompt: st.usePrompt,
+			newTurn:   false,
 		}, true
 	}
 
@@ -533,6 +546,7 @@ func (l *AgentLoop) runStep(rc *RunContext, st taskState) (runOutcome, taskState
 		history:   history,
 		system:    st.system,
 		usePrompt: st.usePrompt,
+		newTurn:   false,
 	}, true
 }
 

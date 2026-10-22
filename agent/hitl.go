@@ -166,6 +166,9 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 	}
 	run := a.newRunHandle(ctx, threadID, &state)
 	run.rc.setDurableClaim(claim)
+	// Every exit below continues the turn the resumed checkpoint belongs to, so
+	// the loop's first delivery point keeps next_turn input queued.
+	run.rc.continuedTurn = true
 	// A resume continues the turn the paused checkpoint belongs to and parents its
 	// first commit onto that pause, so the thread stays one chain across the split
 	// into two runs (ADR-0034 D2). A store that cannot claim still gets this.

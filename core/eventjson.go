@@ -55,6 +55,10 @@ type eventWire struct {
 	Requested      int    `json:"requested,omitempty"`
 	MessagesBefore int    `json:"messages_before,omitempty"`
 	MessagesAfter  int    `json:"messages_after,omitempty"`
+
+	Source     string   `json:"source,omitempty"`
+	MessageIDs []string `json:"message_ids,omitempty"`
+	Preempted  bool     `json:"preempted,omitempty"`
 }
 
 // MarshalEvent encodes an Event to tagged JSON.
@@ -124,6 +128,10 @@ func MarshalEvent(ev Event) ([]byte, error) {
 		w.Type, w.Step, w.BaselineStep = "step_view_drifted", e.Step, e.BaselineStep
 		w.ExpectedToolDigest, w.ActualToolDigest = e.ExpectedToolDigest, e.ActualToolDigest
 		w.ExpectedSettingsDigest, w.ActualSettingsDigest = e.ExpectedSettingsDigest, e.ActualSettingsDigest
+	case InputDelivered:
+		w.Type, w.Step = "input_delivered", e.Step
+		w.Source, w.Phase = string(e.Source), string(e.Phase)
+		w.Count, w.MessageIDs, w.Preempted = e.Count, e.MessageIDs, e.Preempted
 	default:
 		return nil, fmt.Errorf("core: cannot marshal event of type %T", ev)
 	}
@@ -203,6 +211,15 @@ func UnmarshalEvent(data []byte) (Event, error) {
 			ActualToolDigest:       w.ActualToolDigest,
 			ExpectedSettingsDigest: w.ExpectedSettingsDigest,
 			ActualSettingsDigest:   w.ActualSettingsDigest,
+		}, nil
+	case "input_delivered":
+		return InputDelivered{
+			Step:       w.Step,
+			Source:     InputSource(w.Source),
+			Phase:      InputPhase(w.Phase),
+			Count:      w.Count,
+			MessageIDs: w.MessageIDs,
+			Preempted:  w.Preempted,
 		}, nil
 	default:
 		return nil, fmt.Errorf("core: unknown event type %q", w.Type)

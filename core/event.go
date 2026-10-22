@@ -199,6 +199,26 @@ type StepViewDrifted struct {
 	ActualSettingsDigest   string
 }
 
+// InputDelivered is emitted when inputs enter one step's working history, after
+// the step's PrepareTurn has appended them. Source says which channel they came
+// from, Phase is the normalized delivery phase, and Count is how many messages
+// arrived. MessageIDs is filled only for durable inputs: a volatile steering
+// message has no store identity. Preempted marks a delivery that a preempted
+// model call retried inside the same step.
+//
+// For durable inputs this is not a persistence acknowledgement: the inbox
+// acknowledgement commits with the next checkpoint, so a producer watching for
+// consumption must read the inbox and this event together, and accept
+// at-least-once delivery.
+type InputDelivered struct {
+	Step       int
+	Source     InputSource
+	Phase      InputPhase
+	Count      int
+	MessageIDs []string
+	Preempted  bool
+}
+
 // --- Marker -----------------------------------------------------------------
 
 func (RunStarted) isEvent()             {}
@@ -223,6 +243,7 @@ func (WindowTrimmed) isEvent()          {}
 func (ContextOverflowRetried) isEvent() {}
 func (ArgRejected) isEvent()            {}
 func (StepViewDrifted) isEvent()        {}
+func (InputDelivered) isEvent()         {}
 
 // --- Payload types ----------------------------------------------------------
 

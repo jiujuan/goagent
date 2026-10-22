@@ -249,11 +249,11 @@ func TestSteerKeepsLegacyDeliveryTiming(t *testing.T) {
 		if !out.Delivered || out.Step != 1 || out.Err != nil {
 			t.Fatalf("%s outcome = %+v, want delivered at step 1", s.name, out)
 		}
-		if out.State != core.InputDelivered {
-			t.Fatalf("%s outcome state = %q, want %q", s.name, out.State, core.InputDelivered)
+		if out.State != core.InputStateDelivered {
+			t.Fatalf("%s outcome state = %q, want %q", s.name, out.State, core.InputStateDelivered)
 		}
-		if got := s.ticket.State(); got != core.InputDelivered {
-			t.Fatalf("%s ticket state = %q, want %q", s.name, got, core.InputDelivered)
+		if got := s.ticket.State(); got != core.InputStateDelivered {
+			t.Fatalf("%s ticket state = %q, want %q", s.name, got, core.InputStateDelivered)
 		}
 	}
 

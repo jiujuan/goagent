@@ -34,6 +34,12 @@ type RunContext struct {
 	// and consumed once by the loop before its first model call (see hitl.go).
 	resumed *resumeBatch
 
+	// continuedTurn marks a run that restarts a turn already begun — the only
+	// kind Agent.Resume produces. It fixes the first step's delivery phase: a
+	// next_turn message waits for the turn to actually restart, and a resume is
+	// the same turn still finishing, not a new one.
+	continuedTurn bool
+
 	// replayBaseline is the step snapshot a resume without a pending batch
 	// compares its first frozen step against; the loop takes it once. It is
 	// deliberately not copied by deeper, subRun or forBranch: a derived run

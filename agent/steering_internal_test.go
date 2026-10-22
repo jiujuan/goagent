@@ -357,27 +357,27 @@ func TestSteerTicketStateLifecycle(t *testing.T) {
 		t.Fatalf("push: %v", err)
 	}
 
-	if got := delivered.State(); got != core.InputQueued {
-		t.Fatalf("unsettled ticket state = %q, want %q", got, core.InputQueued)
+	if got := delivered.State(); got != core.InputStateQueued {
+		t.Fatalf("unsettled ticket state = %q, want %q", got, core.InputStateQueued)
 	}
 	if got := delivered.Outcome(); got.Delivered || got.Step != 0 || got.Err != nil || got.State != "" {
 		t.Fatalf("unsettled outcome = %+v, want the zero value", got)
 	}
 
 	settleDelivered([]steerEntry{{ticket: delivered}}, 4)
-	if got := delivered.State(); got != core.InputDelivered {
-		t.Fatalf("delivered ticket state = %q, want %q", got, core.InputDelivered)
+	if got := delivered.State(); got != core.InputStateDelivered {
+		t.Fatalf("delivered ticket state = %q, want %q", got, core.InputStateDelivered)
 	}
 	out := delivered.Outcome()
-	if !out.Delivered || out.Step != 4 || out.Err != nil || out.State != core.InputDelivered {
+	if !out.Delivered || out.Step != 4 || out.Err != nil || out.State != core.InputStateDelivered {
 		t.Fatalf("delivered outcome = %+v, want delivered at step 4", out)
 	}
 
 	settleUndelivered([]steerEntry{{ticket: refused}}, ErrRunClosed)
-	if got := refused.State(); got != core.InputRejected {
-		t.Fatalf("refused ticket state = %q, want %q", got, core.InputRejected)
+	if got := refused.State(); got != core.InputStateRejected {
+		t.Fatalf("refused ticket state = %q, want %q", got, core.InputStateRejected)
 	}
-	if out := refused.Outcome(); out.Delivered || !errors.Is(out.Err, ErrRunClosed) || out.State != core.InputRejected {
+	if out := refused.Outcome(); out.Delivered || !errors.Is(out.Err, ErrRunClosed) || out.State != core.InputStateRejected {
 		t.Fatalf("refused outcome = %+v, want rejected with ErrRunClosed", out)
 	}
 

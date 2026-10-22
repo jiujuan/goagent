@@ -69,9 +69,9 @@ func TestInputPhaseValuesAreStable(t *testing.T) {
 	}
 
 	states := map[core.InputState]string{
-		core.InputQueued:    "queued",
-		core.InputDelivered: "delivered",
-		core.InputRejected:  "rejected",
+		core.InputStateQueued:    "queued",
+		core.InputStateDelivered: "delivered",
+		core.InputStateRejected:  "rejected",
 	}
 	for got, want := range states {
 		if string(got) != want {
