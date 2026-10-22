@@ -135,6 +135,9 @@ func (l *AgentLoop) prepareRun(rc *RunContext) (taskState, runOutcome, bool) {
 		rlc.stats = &batchStats{}
 		parts, dirs, rejects, execErr := l.execTools(rc, rlc, ib.calls)
 		l.mw.ToolReject(rlc, rejects)
+		if execErr != nil {
+			parts = l.completeFailedBatch(rc, ib.step, ib.calls, parts)
+		}
 		if len(parts) > 0 {
 			history = append(history, core.Message{Role: core.RoleTool, Parts: parts})
 		}
@@ -570,6 +573,10 @@ func (l *AgentLoop) runStep(rc *RunContext, st taskState) (runOutcome, taskState
 	// has no tool ledger to recover from. A batch naming a tool this step never
 	// advertised is skipped too — none of its unadvertised calls can run, and a
 	// recorded batch has to describe work the step could have started.
+	var (
+		wroteInFlight bool
+		inFlightCalls []core.ToolCall
+	)
 	if l.inFlightCheckpoint && rc.topLevel {
 		if _, ok := rc.durableStore(); ok && inFlightCallsAdvertised(lc, calls) {
 			if err := rc.checkWriteAccess(); err != nil {
@@ -588,12 +595,17 @@ func (l *AgentLoop) runStep(rc *RunContext, st taskState) (runOutcome, taskState
 			}); err != nil {
 				return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
 			}
+			wroteInFlight = true
+			inFlightCalls = batchCalls
 			rc.publish(core.ToolBatchInFlight{Step: step, Calls: cloneToolCalls(batchCalls)})
 		}
 	}
 
 	results, dirs, rejects, execErr := l.execTools(rc, lc, calls)
 	l.mw.ToolReject(lc, rejects)
+	if execErr != nil && wroteInFlight {
+		results = l.completeFailedBatch(rc, step, inFlightCalls, results)
+	}
 	if len(results) > 0 {
 		history = append(history, core.Message{Role: core.RoleTool, Parts: results})
 	}
