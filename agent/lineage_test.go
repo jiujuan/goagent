@@ -220,8 +220,8 @@ func TestLineageNormal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(hist) != 3 {
-		t.Fatalf("两次工具往返加收尾只提交了 %d 条, want 3 条: %v", len(hist), commitIDs(hist))
+	if len(hist) != 5 {
+		t.Fatalf("两次工具往返（各含在途与步骤两次提交）加收尾共提交 %d 条, want 5 条: %v", len(hist), commitIDs(hist))
 	}
 	assertChain(t, hist, run.ID)
 }

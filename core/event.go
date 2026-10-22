@@ -56,6 +56,15 @@ type MessageDone struct {
 // ToolStarted is emitted before a tool call executes.
 type ToolStarted struct{ Call ToolCall }
 
+// ToolBatchInFlight is emitted after a tool batch's checkpoint committed and
+// before any handler starts. Its presence on the event stream means the batch
+// can be recovered after a crash; it says nothing about whether the tools have
+// run yet.
+type ToolBatchInFlight struct {
+	Step  int
+	Calls []ToolCall
+}
+
 // ToolUpdate carries a partial result streamed by a long-running tool.
 type ToolUpdate struct {
 	CallID  string
@@ -229,6 +238,7 @@ func (TurnDone) isEvent()               {}
 func (MessageDelta) isEvent()           {}
 func (MessageDone) isEvent()            {}
 func (ToolStarted) isEvent()            {}
+func (ToolBatchInFlight) isEvent()      {}
 func (ToolUpdate) isEvent()             {}
 func (ToolDone) isEvent()               {}
 func (ApprovalDecided) isEvent()        {}

@@ -35,7 +35,7 @@ type Agent struct {
 
 // New builds an Agent from functional options. WithModel is required.
 func New(opts ...Option) (*Agent, error) {
-	c := config{maxTurns: defaultMaxTurns, contextOverflowRetry: 1, claimLease: checkpoint.DefaultLease}
+	c := config{maxTurns: defaultMaxTurns, contextOverflowRetry: 1, claimLease: checkpoint.DefaultLease, inFlightCheckpoint: true}
 	for _, o := range opts {
 		o(&c)
 	}

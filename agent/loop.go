@@ -46,6 +46,7 @@ type AgentLoop struct {
 
 	contextOverflowRetry int
 	stepSnapshotPolicy   StepSnapshotPolicy
+	inFlightCheckpoint   bool
 }
 
 func newLoop(c config) *AgentLoop {
@@ -71,6 +72,7 @@ func newLoop(c config) *AgentLoop {
 
 		contextOverflowRetry: c.contextOverflowRetry,
 		stepSnapshotPolicy:   c.stepSnapshotPolicy,
+		inFlightCheckpoint:   c.inFlightCheckpoint,
 	}
 }
 
@@ -517,6 +519,35 @@ func (l *AgentLoop) runStep(rc *RunContext, st taskState) (runOutcome, taskState
 		}
 	}
 
+	// Persist the batch before any handler starts, so a crash after this point
+	// leaves a batch a resume can settle instead of a thread stuck behind an
+	// unanswered assistant message. Only a top-level run of a durable store may
+	// write it: a derived run shares the parent's head, and a plain checkpointer
+	// has no tool ledger to recover from. A batch naming a tool this step never
+	// advertised is skipped too — none of its unadvertised calls can run, and a
+	// recorded batch has to describe work the step could have started.
+	if l.inFlightCheckpoint && rc.topLevel {
+		if _, ok := rc.durableStore(); ok && inFlightCallsAdvertised(lc, calls) {
+			if err := rc.checkWriteAccess(); err != nil {
+				return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
+			}
+			// The batch is cloned after the gate rewrote it: the assistant message
+			// keeps the model's arguments, the in-flight record and its ledger IDs
+			// use the arguments the handlers will receive.
+			batchCalls := cloneToolCalls(calls)
+			rc.State.Messages = history
+			if err := l.checkpoint(rc, commitOptions{
+				Step:       step,
+				Snapshot:   lc.viewSnapshot(),
+				InFlight:   &checkpoint.InFlightBatch{Step: step, Calls: batchCalls},
+				Executions: pendingExecutions(rc.ThreadID, step, batchCalls),
+			}); err != nil {
+				return l.fail(rc, step, history, lc.viewSnapshot(), err), st, false
+			}
+			rc.publish(core.ToolBatchInFlight{Step: step, Calls: cloneToolCalls(batchCalls)})
+		}
+	}
+
 	results, dirs, rejects, execErr := l.execTools(rc, lc, calls)
 	l.mw.ToolReject(lc, rejects)
 	if len(results) > 0 {
@@ -586,6 +617,7 @@ type commitOptions struct {
 	Step       int
 	Pending    *checkpoint.PendingHITL
 	Pause      *checkpoint.Pause
+	InFlight   *checkpoint.InFlightBatch
 	Snapshot   *checkpoint.StepSnapshot
 	Release    bool
 	Executions []checkpoint.ToolExecution
@@ -596,7 +628,7 @@ type commitOptions struct {
 // recoverable pause.
 func (l *AgentLoop) checkpoint(rc *RunContext, opts commitOptions) error {
 	if rc.Store == nil {
-		if opts.Pending != nil || opts.Pause != nil {
+		if opts.Pending != nil || opts.Pause != nil || opts.InFlight != nil {
 			return ErrCheckpointUnavailable
 		}
 		return nil
@@ -608,6 +640,7 @@ func (l *AgentLoop) checkpoint(rc *RunContext, opts commitOptions) error {
 		State:    *rc.State,
 		Pending:  opts.Pending,
 		Pause:    opts.Pause,
+		InFlight: opts.InFlight,
 		Snapshot: opts.Snapshot,
 	}, opts.Release, opts.Executions...)
 }

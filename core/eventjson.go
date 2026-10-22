@@ -88,6 +88,15 @@ func MarshalEvent(ev Event) ([]byte, error) {
 	case ToolStarted:
 		w.Type = "tool_started"
 		w.Message = &Message{Role: RoleAssistant, Parts: []Part{e.Call}}
+	case ToolBatchInFlight:
+		w.Type, w.Step = "tool_batch_in_flight", e.Step
+		if len(e.Calls) > 0 {
+			parts := make([]Part, len(e.Calls))
+			for i, c := range e.Calls {
+				parts[i] = c
+			}
+			w.Message = &Message{Role: RoleAssistant, Parts: parts}
+		}
 	case ToolUpdate:
 		w.Type, w.CallID = "tool_update", e.CallID
 		w.Message = &Message{Role: RoleTool, Parts: []Part{e.Partial}}
@@ -161,6 +170,8 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		return MessageDone{Message: deref(w.Message), Usage: w.Usage}, nil
 	case "tool_started":
 		return ToolStarted{Call: firstPartOf[ToolCall](w.Message)}, nil
+	case "tool_batch_in_flight":
+		return ToolBatchInFlight{Step: w.Step, Calls: deref(w.Message).ToolCalls()}, nil
 	case "tool_update":
 		return ToolUpdate{CallID: w.CallID, Partial: firstPart(w.Message)}, nil
 	case "tool_done":

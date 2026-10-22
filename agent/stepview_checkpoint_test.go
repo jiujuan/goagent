@@ -155,15 +155,21 @@ func TestNormalStepCheckpointCarriesSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(history) != 2 {
-		t.Fatalf("checkpoints = %d, want 2 (tool step + final)", len(history))
+	if len(history) != 3 {
+		t.Fatalf("checkpoints = %d, want 3 (in-flight batch + tool step + final)", len(history))
+	}
+	if history[0].InFlight == nil || history[0].InFlight.Step != 0 {
+		t.Fatalf("checkpoint 0 in-flight = %+v, want the step-0 tool batch", history[0].InFlight)
 	}
 	for i, cp := range history {
 		if cp.Snapshot == nil {
 			t.Fatalf("checkpoint %d has no snapshot: %+v", i, cp)
 		}
-		if !slices.Equal(cp.Snapshot.Advertised, advertised[i]) {
-			t.Fatalf("checkpoint %d advertised = %v, request advertised %v", i, cp.Snapshot.Advertised, advertised[i])
+		if cp.Snapshot.Step >= len(advertised) {
+			t.Fatalf("checkpoint %d step %d has no matching model request", i, cp.Snapshot.Step)
+		}
+		if !slices.Equal(cp.Snapshot.Advertised, advertised[cp.Snapshot.Step]) {
+			t.Fatalf("checkpoint %d advertised = %v, request advertised %v", i, cp.Snapshot.Advertised, advertised[cp.Snapshot.Step])
 		}
 		if cp.Snapshot.Model != "normal-model" {
 			t.Fatalf("checkpoint %d model = %q, want normal-model", i, cp.Snapshot.Model)

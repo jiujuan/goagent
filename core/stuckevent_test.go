@@ -207,3 +207,55 @@ func TestInputDeliveredEventOmitsEmptyFields(t *testing.T) {
 		}
 	}
 }
+
+func TestToolBatchInFlightEventRoundTrip(t *testing.T) {
+	in := ToolBatchInFlight{
+		Step: 2,
+		Calls: []ToolCall{
+			{ID: "c1", Name: "rec", Args: json.RawMessage(`{"v":1}`)},
+			{ID: "c2", Name: "rec", Args: json.RawMessage(`{}`)},
+		},
+	}
+	data, err := MarshalEvent(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := out.(ToolBatchInFlight)
+	if !ok {
+		t.Fatalf("round trip type = %T, want ToolBatchInFlight", out)
+	}
+	if got.Step != in.Step {
+		t.Fatalf("round trip step = %d, want %d", got.Step, in.Step)
+	}
+	if len(got.Calls) != len(in.Calls) {
+		t.Fatalf("round trip calls = %+v, want %+v", got.Calls, in.Calls)
+	}
+	for i := range in.Calls {
+		if got.Calls[i].ID != in.Calls[i].ID || got.Calls[i].Name != in.Calls[i].Name {
+			t.Fatalf("round trip call %d = %+v, want %+v", i, got.Calls[i], in.Calls[i])
+		}
+		if string(got.Calls[i].Args) != string(in.Calls[i].Args) {
+			t.Fatalf("round trip call %d args = %s, want %s", i, got.Calls[i].Args, in.Calls[i].Args)
+		}
+	}
+}
+
+func TestToolBatchInFlightEventOmitsEmptyCalls(t *testing.T) {
+	data, err := MarshalEvent(ToolBatchInFlight{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"message", "step"} {
+		if _, ok := raw[key]; ok {
+			t.Errorf("zero-valued %q should be omitted from %s", key, data)
+		}
+	}
+}

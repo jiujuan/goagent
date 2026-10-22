@@ -32,6 +32,7 @@ type config struct {
 	requireThreadCoordination bool
 	stepSnapshotPolicy        StepSnapshotPolicy
 	inputPreemption           bool
+	inFlightCheckpoint        bool
 
 	// delegation toggles (see transfer.go)
 	noTransfer       bool
@@ -153,6 +154,17 @@ func WithStepSnapshotPolicy(p StepSnapshotPolicy) Option {
 // costs nothing and gains nothing.
 func WithInputPreemption(enabled bool) Option {
 	return func(c *config) { c.inputPreemption = enabled }
+}
+
+// WithInFlightCheckpoint controls whether a tool batch is written to the
+// checkpoint before any handler starts. It defaults to true and only applies to
+// durable stores in top-level runs: a plain Checkpointer has no recoverable
+// tool ledger, and a derived run (delegation, DAG node) must not claim the
+// thread head for a batch the parent still owns. Passing false restores the
+// former one-commit-per-step behavior and gives up crash recovery for a running
+// batch.
+func WithInFlightCheckpoint(enabled bool) Option {
+	return func(c *config) { c.inFlightCheckpoint = enabled }
 }
 
 // WithOutputKey writes this agent's final answer text into State.KV under key,
