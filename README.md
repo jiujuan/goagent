@@ -185,6 +185,8 @@ go run ./examples/quickstart
 | --- | --- | --- |
 | `quickstart` | `go run ./examples/quickstart` | 离线冒烟测试：mock 模型上的类型化工具调用与流式事件。 |
 | `task-loop` | `go run ./examples/task-loop` | 终稿后的追加消息与投递票据：一次运行两个回合，`TurnDone` 可出现多次、`RunDone` 只出现一次。 |
+| `input-phases` | `go run ./examples/input-phases` | 四个投递阶段：`before_model`/`after_model`/`after_tools` 进入同一步，`next_turn` 等新回合；抢占默认关闭。 |
+| `inflight-recovery` | `go run ./examples/inflight-recovery` | 在途批次的崩溃恢复：`RunStatus.InFlight`、`Resume` 按台账执行 pending 调用且不重复副作用。 |
 | `quickstart-chat` | `go run ./examples/quickstart-chat` | 真实模型的最小聊天启动模板。 |
 | `quickstart-tool` | `go run ./examples/quickstart-tool` | 真实模型调用一个类型化工具的启动模板。 |
 | `quickstart-stream` | `go run ./examples/quickstart-stream` | 流式接收真实模型输出的启动模板。 |
@@ -293,6 +295,15 @@ go run ./examples/quickstart
 - Memory/File 默认实现线程协调。第三方 checkpointer 只有显式实现 `checkpoint.ThreadCoordinator` 才有同等跨实例保证；可用 `agent.WithThreadCoordinationRequired(true)` 在 `agent.New` 时强制检查。
 - `vfs.InState` 等 `core.Snapshottable` 后端会进入快照。真实目录或远端等外部托管后端需要在每个恢复进程重新传 `agent.WithRunFiles`，其内容不随时间旅行回滚。
 - `checkpoint.Fork` 现在返回 `(*checkpoint.Checkpoint, error)`，且只构造未保存的分支快照；调用方必须检查错误并显式 `Save`。完整迁移方式和并发边界见 [ADR-0032](docs/adr/ADR-0032-session-snapshot-consistency.md)。
+
+### 输入的投递阶段与崩溃恢复
+
+- 消息可以指定最晚投递点：`before_model`（默认）、`after_model`、`after_tools` 会在下一次 `PrepareTurn` 或工具批次结算后进入上下文；`next_turn` 只在新回合开始时投递，回合中途一直留在队列里。`Run.Steer(msg)` 等价于 `SteerWith(msg, SteerOptions{})`，需要别的阶段时用 `SteerWith`。
+- 票据只说明消息进入了哪一步的模型上下文，不代表检查点已提交。临时消息本身不落盘；持久收件箱的消息与消费它的那一步同一次提交（确认随检查点一起生效）。跨进程、跨暂停的输入用 `Durable.Deliver`/`Inbox`。
+- 模型调用抢占默认关闭。开启 `agent.WithInputPreemption(true)` 后，只有临时消息的 `before_model` 阶段可以带 `Preempt: true`，取消当前模型调用并重试同一步；未开启时 `SteerWith` 返回 `ErrPreemptionDisabled`，阶段不符返回 `ErrPreemptionPhase`，两者都不会生成票据。
+- 工具批次执行前会先把「这一步要执行哪些调用」写成 `InFlight` 边界。进程在批次中途消失时，head 停在 `InFlight`，`RunStatus.InFlight=true`、`Paused=false`；它与等待审批的暂停是两回事：暂停在等人作决定，在途没有人要等，直接用 `Agent.Resume` 继续。
+- `Resume` 按台账补齐：`pending` 调用执行一次，`completed` 结果直接回放且不再跑 handler；`claimed` 表示上次执行过但没有留下结果，框架不猜结局、不重放副作用，以错误结果交给模型，只有外部系统能查证时才由业务侧另行对账。
+- 恢复完成后每个计划调用仍然恰好一条结果，最终头部不再带 `InFlight`。可运行示例见 `go run ./examples/input-phases` 与 `go run ./examples/inflight-recovery`。
 
 ### 后台运行的终态与状态查询
 
