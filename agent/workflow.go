@@ -1,10 +1,11 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/jiujuan/goagent/bus"
 	"github.com/jiujuan/goagent/checkpoint"
@@ -54,10 +55,25 @@ const (
 	PreferLaterBranch
 )
 
-// ParallelOptions configures branch-merge behavior without changing the simple
-// Parallel constructor. The zero value rejects conflicting state writes.
+// FailurePolicy controls what a Parallel workflow does when a branch fails.
+type FailurePolicy int
+
+const (
+	// CancelSiblings cancels the remaining branches as soon as a branch fails.
+	// The run still waits for every started branch to exit before reporting.
+	CancelSiblings FailurePolicy = iota
+	// WaitForAll lets every branch run to completion before reporting the first
+	// failure in declaration order.
+	WaitForAll
+)
+
+// ParallelOptions configures branch execution and merge behavior without
+// changing the simple Parallel constructor. The zero value cancels siblings on
+// the first failure and rejects conflicting state writes.
 type ParallelOptions struct {
-	StateConflict StateConflictPolicy
+	Failure        FailurePolicy
+	MaxConcurrency int
+	StateConflict  StateConflictPolicy
 }
 
 // Loop runs sub-agents in sequence repeatedly until a sub escalates (a tool/
@@ -143,49 +159,152 @@ type parallelRunner struct {
 	opts ParallelOptions
 }
 
+// branchResult carries one branch's outcome back to the runner together with
+// its declaration index, so results are ordered deterministically regardless of
+// completion order.
+type branchResult struct {
+	index int
+	out   runOutcome
+}
+
+func isRealFailure(out runOutcome) bool { return out.Err != nil }
+
 func (p *parallelRunner) run(rc *RunContext) runOutcome {
 	// Baseline KV captured before any branch forks, so each branch's writes can
 	// be diffed against a common ancestor and folded deterministically.
 	baseline := cloneKV(rc.State.KV)
 
-	results := make([]runOutcome, len(p.subs))
-	branches := make([]*RunContext, len(p.subs))
-	for i := range p.subs {
-		child, err := rc.forBranch(p.subs[i].cfg.name, p.subs[i].taskKind())
-		if err != nil {
-			return runOutcome{Err: err}
+	// Branch failures cancel siblings through this context only; the parent run
+	// keeps running so it can collect results and report the root error.
+	branchCtx, cancelBranches := context.WithCancel(rc.Context)
+	defer cancelBranches()
+
+	limit := p.opts.MaxConcurrency
+	if limit <= 0 || limit > len(p.subs) {
+		limit = len(p.subs)
+	}
+	results := make(chan branchResult, len(p.subs))
+	children := make([]*RunContext, len(p.subs))
+	settled := make([]bool, len(p.subs))
+	announced := make([]bool, len(p.subs))
+	next, inflight := 0, 0
+	var collected []branchResult
+	var failure, launchErr error
+
+	// announceCanceled reports each started branch that has not yet returned,
+	// at most once, so both cancellation triggers publish a consistent set.
+	announceCanceled := func(reason error) {
+		for i, child := range children {
+			if child == nil || settled[i] || announced[i] {
+				continue
+			}
+			announced[i] = true
+			rc.publish(core.BranchCanceled{Name: child.branch, Reason: reason})
 		}
-		branches[i] = child
 	}
 
-	var wg sync.WaitGroup
-	for i := range p.subs {
-		info := branches[i].taskInfo()
-		rc.publish(core.TaskStarted{
-			TaskID:   info.ID,
-			ParentID: info.ParentID,
-			ThreadID: info.ThreadID,
-			Kind:     string(info.Kind),
-			Depth:    info.Depth,
-		})
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			out := runChild(branches[i], p.subs[i].runnable)
-			results[i] = out
-			rc.publish(core.TaskDone{
-				TaskID: info.ID,
-				Kind:   string(info.Kind),
-				Status: taskStatus(out),
-				Err:    out.Err,
+	for {
+		for next < len(p.subs) && inflight < limit && launchErr == nil &&
+			branchCtx.Err() == nil && (failure == nil || p.opts.Failure == WaitForAll) {
+			i := next
+			child, err := rc.forBranchWithContext(branchCtx, p.subs[i].cfg.name, p.subs[i].taskKind())
+			if err != nil {
+				launchErr = err
+				cancelBranches()
+				announceCanceled(err)
+				break
+			}
+			children[i] = child
+			next++
+			inflight++
+			info := child.taskInfo()
+			rc.publish(core.TaskStarted{
+				TaskID:   info.ID,
+				ParentID: info.ParentID,
+				ThreadID: info.ThreadID,
+				Kind:     string(info.Kind),
+				Depth:    info.Depth,
 			})
-		}(i)
+			go func(i int) {
+				out := runChild(children[i], p.subs[i].runnable)
+				results <- branchResult{index: i, out: out}
+			}(i)
+		}
+		if inflight == 0 {
+			break
+		}
+
+		r := <-results
+		inflight--
+		settled[r.index] = true
+		collected = append(collected, r)
+		// TaskDone is published when the result is collected, not inside the
+		// branch goroutine, so its order relative to BranchCanceled is stable.
+		info := children[r.index].taskInfo()
+		rc.publish(core.TaskDone{
+			TaskID: info.ID,
+			Kind:   string(info.Kind),
+			Status: taskStatus(r.out),
+			Err:    r.out.Err,
+		})
+		if failure == nil && isRealFailure(r.out) {
+			failure = r.out.Err
+			if p.opts.Failure == CancelSiblings {
+				cancelBranches()
+				announceCanceled(failure)
+			}
+		}
 	}
-	wg.Wait()
-	return p.merge(rc, baseline, branches, results)
+
+	if failure != nil || launchErr != nil || branchCtx.Err() != nil {
+		// Errors take priority over a pause: a failed run must not report a
+		// sibling's Interrupted outcome as the final state.
+		return runOutcome{Err: chooseRootError(rc.Context, collected, launchErr)}
+	}
+	outs := make([]runOutcome, len(p.subs))
+	for _, r := range collected {
+		outs[r.index] = r.out
+	}
+	return p.merge(rc, baseline, children, outs)
 }
 
 var _ Runnable = (*parallelRunner)(nil)
+
+// chooseRootError picks the error a failed Parallel run reports. The parent
+// context wins; then the first branch error in declaration order that is not a
+// cancellation; then the launch error (a budget refusal must not be hidden by
+// canceled siblings); then the first error at all, so a failure is never
+// reported as success. It deliberately does not use whether a branch's context
+// was canceled when it returned: a real failure that arrives after cancellation
+// is still the root cause.
+func chooseRootError(parentCtx context.Context, collected []branchResult, fallback error) error {
+	if err := parentCtx.Err(); err != nil {
+		return err
+	}
+	var root, anyErr error
+	rootIdx, anyIdx := 0, 0
+	for _, r := range collected {
+		if r.out.Err == nil {
+			continue
+		}
+		if anyErr == nil || r.index < anyIdx {
+			anyErr, anyIdx = r.out.Err, r.index
+		}
+		if errors.Is(r.out.Err, context.Canceled) {
+			continue
+		}
+		if root == nil || r.index < rootIdx {
+			root, rootIdx = r.out.Err, r.index
+		}
+	}
+	if root != nil {
+		return root
+	}
+	if fallback != nil {
+		return fallback
+	}
+	return anyErr
+}
 
 // merge folds parallel branch outcomes. The first error (or non-completion
 // control, e.g. Interrupt) short-circuits and propagates. Otherwise each
