@@ -279,7 +279,9 @@ func (w *ManagedRunWorker) drive(ctx context.Context, claimed runstore.RunRecord
 // says the run was cancelled (ADR-0033 D2).
 //
 // A paused run has nothing terminal to record; the same holds for a run that never got a
-// handle because the record's identity is one the agent refuses.
+// handle because the record's identity is one the agent refuses. detail.Paused is the run
+// outcome only: an in-flight checkpoint head is not a pause, because nothing there waits for
+// a human, and RunResult carries no in-flight bit to mistake for one.
 // A run that committed nothing of its own is refused by RecordCompletion with
 // ErrNoCommittedBoundary, which is not a write failure — the missing boundary is the truth,
 // and no checkpoint is invented for it.
@@ -359,7 +361,8 @@ func terminalTaskRecord(stored runstore.RunRecord, detail agent.RunResult, runEr
 	switch {
 	case detail.Paused:
 		// A pause ends this run; continuing it creates a new record whose ResumeOfRunID names
-		// this one, and no terminal checkpoint record exists for a pause.
+		// this one, and no terminal checkpoint record exists for a pause. An in-flight head
+		// is never mapped here: it did not stop for a decision.
 		next.Status = runstore.StatusPaused
 		next.Error = nil
 		next.FinishReason = runstore.FinishReasonPaused

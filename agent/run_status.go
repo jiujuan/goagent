@@ -10,6 +10,10 @@ import (
 // RunStatus is what one thread looks like in the checkpoint store right now:
 // a read-only snapshot of its head checkpoint. It is deliberately not a live
 // process view — see Agent.RunStatus for what it can and cannot say.
+//
+// Paused and InFlight are separate facts: a paused head waits for a person, an
+// in-flight head waits for a resume. README's "后台运行的终态与状态查询"
+// section has the comparison table.
 type RunStatus struct {
 	// ThreadID is the thread this status was read from.
 	ThreadID string
@@ -20,6 +24,11 @@ type RunStatus struct {
 	// successfully: approvals, claims, recovery kind and unknown tool outcomes
 	// still decide that.
 	Paused bool
+	// InFlight reports whether the head is the boundary written before a tool
+	// batch ran. Nothing is waiting for a human decision here: the next step is
+	// Agent.Resume, which settles the batch from its ledger. It is independent of
+	// Paused; the store rejects a checkpoint carrying both.
+	InFlight bool
 	// Revision is the head checkpoint's store revision, 0 when the thread has no
 	// checkpoint.
 	Revision uint64
@@ -64,5 +73,6 @@ func (a *Agent) RunStatus(ctx context.Context, threadID string) (RunStatus, erro
 	status.Latest = latest
 	status.Completion = latest.Completion
 	status.Paused = latest.Completion == nil && (latest.Pause != nil || latest.Pending != nil)
+	status.InFlight = latest.Completion == nil && latest.InFlight != nil
 	return status, nil
 }

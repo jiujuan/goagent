@@ -176,6 +176,9 @@ func buildTerminalRecord(
 	if base.Pause != nil || base.Pending != nil {
 		return nil, fmt.Errorf("agent: record completion: boundary %s is a pause point, not a committed step", boundaryID)
 	}
+	if base.InFlight != nil {
+		return nil, fmt.Errorf("agent: record completion: boundary %s has an unresolved tool batch; resume the thread before recording a terminal state: %w", boundaryID, checkpoint.ErrInFlightConflict)
+	}
 	state, err := core.CloneStateData(base.State)
 	if err != nil {
 		return nil, fmt.Errorf("agent: record completion: clone boundary state: %w", err)

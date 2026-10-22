@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"fmt"
+
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/vfs"
@@ -35,6 +37,7 @@ func (r *Run) prepare() error {
 		claim        = copyClaim(r.preparation.claim)
 		headRevision = r.preparation.headRevision
 		head         = r.preparation.head
+		plainHead    *checkpoint.Checkpoint
 	)
 	if coordinated, ok := r.agent.store.(checkpoint.ThreadCoordinator); ok {
 		coordinator = coordinated
@@ -57,12 +60,18 @@ func (r *Run) prepare() error {
 			}
 			state, err = restoreCheckpoint(begun.Checkpoint, r.preparation.files)
 		} else {
-			var latest *checkpoint.Checkpoint
-			state, latest, err = r.agent.restore(r.rc.Context, r.identity.threadID, r.preparation.files)
-			head = checkpointRef(latest)
+			state, plainHead, err = r.agent.restore(r.rc.Context, r.identity.threadID, r.preparation.files)
+			head = checkpointRef(plainHead)
 		}
 		if err != nil {
 			return err
+		}
+		// A store without BeginRun cannot refuse a thread whose recorded work is
+		// still unfinished, so this path has to refuse it itself: the in-flight
+		// batch must be settled by Resume before a new input may start.
+		if plainHead != nil && plainHead.InFlight != nil {
+			return fmt.Errorf("agent: prepare run on thread %q: head %s carries an unresolved tool batch; resume the thread before starting a new run: %w",
+				r.identity.threadID, plainHead.ID, checkpoint.ErrResumeRequired)
 		}
 		if r.preparation.files != nil {
 			state.Files = r.preparation.files

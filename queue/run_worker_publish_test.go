@@ -88,6 +88,46 @@ func TestManagedRunClearsDispatchError(t *testing.T) {
 	}
 }
 
+// TestQueueWorkerDoesNotMarkInFlightAsPaused：在途不是暂停。真实的在途头只有
+// 进程在批次中途被杀才会留下，队列夹具不制造进程崩溃，因此这里直接验证映射：
+// Paused=false 的运行无论成功、失败还是取消都不会写成 paused；真正的暂停仍走
+// paused 分支，证明这不是恒真断言。RunResult 没有在途字段，队列不拿
+// RunStatus.InFlight 推断暂停。
+func TestQueueWorkerDoesNotMarkInFlightAsPaused(t *testing.T) {
+	stored := managedRecord("inflight-mapping", "thread-inflight-mapping", "turn-1")
+	stored.Status = runstore.StatusRunning
+	for _, tc := range []struct {
+		name   string
+		runErr error
+		want   runstore.Status
+	}{
+		{"succeeded", nil, runstore.StatusSucceeded},
+		{"failed", errors.New("tool failed"), runstore.StatusFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := terminalTaskRecord(stored, agent.RunResult{RunID: stored.RunID, Paused: false}, tc.runErr, nil, nil)
+			if got.Status != tc.want {
+				t.Fatalf("status = %s, want %s", got.Status, tc.want)
+			}
+			if got.Status == runstore.StatusPaused || got.FinishReason == runstore.FinishReasonPaused {
+				t.Fatalf("非暂停运行被记成暂停: %+v", got)
+			}
+		})
+	}
+
+	cancelling := stored
+	cancelling.Status = runstore.StatusCancelling
+	cancelled := terminalTaskRecord(cancelling, agent.RunResult{Paused: false}, context.Canceled, nil, nil)
+	if cancelled.Status != runstore.StatusCancelled || cancelled.FinishReason == runstore.FinishReasonPaused {
+		t.Fatalf("取消的运行被记错: %+v", cancelled)
+	}
+
+	paused := terminalTaskRecord(stored, agent.RunResult{Paused: true}, nil, nil, nil)
+	if paused.Status != runstore.StatusPaused || paused.FinishReason != runstore.FinishReasonPaused {
+		t.Fatalf("对照用例：真正的暂停没有记成 paused: %+v", paused)
+	}
+}
+
 type failingPublicationStore struct {
 	runstore.Store
 	failRead          int

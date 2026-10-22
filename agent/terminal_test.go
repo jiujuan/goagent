@@ -628,6 +628,59 @@ func TestRecordCompletionRequiresOwnBoundary(t *testing.T) {
 	})
 }
 
+// TestRecordCompletionRejectsInFlightHead：边界停在工具批次上时，批次结果还没
+// 落账；终态记录必须拒绝，先恢复而不是给未完成的工作写结局。
+func TestRecordCompletionRejectsInFlightHead(t *testing.T) {
+	ctx := context.Background()
+	base := checkpoint.NewMemory()
+	store := &terminalStore{
+		ThreadCoordinator: base,
+		beforeCommit: func(req checkpoint.CommitRequest) error {
+			// 在途提交照常落盘；失败收尾的配对结果提交失败，让运行结束时的
+			// 边界停在批次上。
+			if req.Checkpoint != nil && req.Checkpoint.InFlight == nil {
+				return errors.New("存储不可用")
+			}
+			return nil
+		},
+	}
+	model := mock.New("m", func(*llm.Request) *llm.Response {
+		return mock.CallTool("c1", "rec", `{}`)
+	})
+	failing := tool.New("rec", "总是失败的工具", func(*tool.Context, struct{}) (string, error) {
+		return "", errors.New("工具故障")
+	})
+	a := terminalAgent(t, store, model, failing)
+	const threadID = "record-inflight"
+	run := a.Stream(ctx, "go", agent.OnThread(threadID))
+	if _, err := run.Wait(); err == nil {
+		t.Fatal("工具失败应让运行失败")
+	}
+
+	head := headCheckpoint(t, base, threadID)
+	if head.InFlight == nil {
+		t.Fatalf("夹具没有留下在途边界: %+v", head)
+	}
+	before := historyCount(t, base, threadID)
+
+	err := a.RecordCompletion(ctx, run)
+	if err == nil {
+		t.Fatal("在途边界上不应写出终态记录")
+	}
+	if !errors.Is(err, checkpoint.ErrInFlightConflict) {
+		t.Fatalf("记录错误 = %v, want ErrInFlightConflict", err)
+	}
+	if !strings.Contains(err.Error(), "resume") {
+		t.Fatalf("错误文案没有说明先恢复: %v", err)
+	}
+	if after := historyCount(t, base, threadID); after != before {
+		t.Fatalf("被拒绝的记录追加了历史: %d -> %d", before, after)
+	}
+	if after := headCheckpoint(t, base, threadID); after.Completion != nil {
+		t.Fatalf("被拒绝的记录写了终态: %+v", after.Completion)
+	}
+}
+
 // TestRecordCompletionRequiresDurable：只有基础 Checkpointer 的存储返回
 // ErrDurableUnavailable 且不回退成普通 Save；前台执行仍可用该存储。
 func TestRecordCompletionRequiresDurable(t *testing.T) {
