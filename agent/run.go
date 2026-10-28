@@ -105,7 +105,7 @@ func (r *Run) Iter() iter.Seq2[core.Event, error] {
 	return func(yield func(core.Event, error) bool) {
 		ch, cancel := r.subscribeRun(bus.Lossless)
 		defer cancel()
-		r.drive()
+		r.Start()
 		for ev, err := range bus.Adapt(ch) {
 			if !yield(ev, err) {
 				return
@@ -120,29 +120,37 @@ func (r *Run) Events(mode bus.DeliveryMode) (<-chan core.Event, func()) {
 	return r.subscribeRun(mode)
 }
 
-// Wait blocks until the run settles and returns its result or error. It drives
-// and drains the run itself if no Iter consumer is active.
-func (r *Run) Wait() (core.Result, error) {
+// Start requests execution once and returns without waiting for it. It does
+// not subscribe; register Events first when the initial events matter.
+func (r *Run) Start() { r.drive() }
+
+// Await waits for settlement without starting or canceling the run. Canceling
+// waitCtx only stops this waiter. A settled result takes precedence when both
+// settlement and waitCtx are ready. Every caller receives an independent copy.
+func (r *Run) Await(waitCtx context.Context) (core.Result, error) {
 	select {
 	case <-r.done:
-		return r.FrozenOutcome()
+		return r.settledCopy()
 	default:
 	}
-	ch, cancel := r.subscribeRun(bus.Lossless)
-	defer cancel()
-	r.drive()
-	for {
+	select {
+	case <-r.done:
+		return r.settledCopy()
+	case <-waitCtx.Done():
 		select {
 		case <-r.done:
-			return r.FrozenOutcome()
-		case ev, ok := <-ch:
-			if !ok {
-				<-r.done
-				return r.FrozenOutcome()
-			}
-			_ = ev // Observation does not decide settlement.
+			return r.settledCopy()
+		default:
+			return core.Result{}, waitCtx.Err()
 		}
 	}
+}
+
+// Wait starts the run if necessary, then waits for settlement. It creates no
+// observation subscription and does not wait for observers to drain the tail.
+func (r *Run) Wait() (core.Result, error) {
+	r.Start()
+	return r.Await(context.Background())
 }
 
 // Steer injects a message to be delivered before the next model call. The

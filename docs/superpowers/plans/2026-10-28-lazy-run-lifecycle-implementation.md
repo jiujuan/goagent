@@ -285,10 +285,10 @@ Bus.mu: 摘除当前 topic 的订阅集合 → 解锁
 
 **依赖：** T05。**文件：** 修改 `agent/run.go`、`agent/result.go`；新增 `agent/run_wait_internal_test.go`。
 
-- [ ] 测试：`TestStartIsIdempotentAndNonBlocking`、`TestAwaitDoesNotStartPreparedRun`、`TestAwaitContextDoesNotCancelExecution`、`TestAwaitPrefersSettledResultOnContextRace`、`TestManyAwaitersDoNotSubscribe`、`TestWaitStartsThenAwaits`、`TestAwaitResultsAreIndependent`、`TestIterSubscribesBeforeStart`。
-- [ ] 定义 `Start()` 为幂等、非阻塞启动入口；startErr 经结算后由 Await 返回。定义 `Await(ctx)` 为只等待 done，不隐式 Start/Cancel；ctx 错误返回不改变执行。内部先检查 done，再 select；ctx 分支再次检查 done，若仍未完成才返回 ctx.Err。
-- [ ] `settledCopy` 只从已冻结 outcome 构造独立结果。保持 pause 的零 Result + nil error，并以 `Paused`/`DetailedResult` 表达 pause。
-- [ ] `Wait()` 仅 `Start()` 然后 `Await(context.Background())`。移除 Wait 的 bus.Subscribe、事件 drain 与 capture。Iter 消费顺序固定为 subscribe→Start→消费。
+- [x] 测试：`TestStartIsIdempotentAndNonBlocking`、`TestAwaitDoesNotStartPreparedRun`、`TestAwaitContextDoesNotCancelExecution`、`TestAwaitPrefersSettledResultOnContextRace`、`TestManyAwaitersDoNotSubscribe`、`TestWaitStartsThenAwaits`、`TestAwaitResultsAreIndependent`、`TestIterSubscribesBeforeStart`。
+- [x] 定义 `Start()` 为幂等、非阻塞启动入口；startErr 经结算后由 Await 返回。定义 `Await(ctx)` 为只等待 done，不隐式 Start/Cancel；ctx 错误返回不改变执行。内部先检查 done，再 select；ctx 分支再次检查 done，若仍未完成才返回 ctx.Err。
+- [x] `settledCopy` 只从已冻结 outcome 构造独立结果。保持 pause 的零 Result + nil error，并以 `Paused`/`DetailedResult` 表达 pause。
+- [x] `Wait()` 仅 `Start()` 然后 `Await(context.Background())`。移除 Wait 的 bus.Subscribe、事件 drain 与 capture。Iter 消费顺序固定为 subscribe→Start→消费。
 
 Await/Wait 的实现形态固定如下，settledCopy 由本任务定义并委托已修正的 FrozenOutcome 独立复制；Start 的最终状态竞争在 T08 收敛：
 
@@ -322,9 +322,9 @@ func (r *Run) Wait() (core.Result, error) {
 }
 ```
 
-- [ ] 以 `Bus.Subscribers(topic)` 前后计数或同包订阅索引屏障验证 100 个并发 Await/Wait 读者不创建额外 Run 观察订阅；不要统计全局 goroutine 数量代替协议证明。
-- [ ] 运行 `go test ./agent -run 'Test(StartIs|Await|ManyAwaiters|WaitStarts|IterSubscribes)' -count=1 -timeout=90s`、`go test ./agent ./queue -count=1 -timeout=150s`。
-- [ ] 生成提交候选：`feat(agent): separate run start and await`。
+- [x] 以 `Bus.Subscribers(topic)` 前后计数或同包订阅索引屏障验证 100 个并发 Await/Wait 读者不创建额外 Run 观察订阅；不要统计全局 goroutine 数量代替协议证明。
+- [x] 运行 `go test ./agent -run 'Test(StartIs|Await|ManyAwaiters|WaitStarts|IterSubscribes)' -count=1 -timeout=90s`、`go test ./agent ./queue -count=1 -timeout=150s`。
+- [x] 生成提交候选：`feat(agent): separate run start and await`。
 
 **DoD：** Start 可重复无额外执行；Await 不启动不取消；Wait 是 Start+Await；waitCtx 只控制等待者；所有返回对象独立；100 个等待者 bus 订阅数不变。
 
@@ -606,3 +606,6 @@ T03 整包回归发现原 `TestPlanParentCancelReturnsContextError` 和 `TestRun
 
 | 2026-10-28，T04/T05 | 冻结失败、hook别名、prepare gate顺序红→绿；late/slow/seal/child定向通过；跨包对应race20轮 | 通过；done 不保证尾部已经进入或读出观察通道 |
 | 2026-10-28，M2 | go test ./agent ./queue -count=1 -timeout=150s | 通过；旧审批幂等测试按已批准sealed契约验证不重开流，保留durable幂等、冲突和Resume audit replay断言 |
+
+| 2026-10-28，T06 | Start/Await八项定向及race20轮；agent全包-json 14.987s；queue全包5.471s | 通过；并发100等待者不订阅，waitCtx不取消执行，done优先 |
+| 2026-10-28，M2独立审核 | outcome/observation/RunFinisher/审批幂等/queue定向race | 规格及质量通过，无未解决finding；范围eaac602..04f7b7c |

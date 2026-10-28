@@ -104,3 +104,5 @@ func (r *Run) freezeTerminal(boundaryID string, boundaryRev uint64, boundaryOK b
 	r.terminalTurnID = turnID
 	r.boundaryID, r.boundaryRev, r.boundaryOK = boundaryID, boundaryRev, boundaryOK
 }
+
+func (r *Run) settledCopy() (core.Result, error) { return r.FrozenOutcome() }
