@@ -1,11 +1,12 @@
-// Command background is a tutorial for the queue: fire-and-forget agent runs
-// processed by a bounded worker pool, off the caller's goroutine. Uses the mock
-// provider, so it runs offline.
+// Command background demonstrates offline queue execution with a bounded Pool.
+// Handle.Wait only awaits execution; WaitRecorded also awaits the worker's
+// terminal-record attempt. Neither method starts a job. The mock makes no
+// network calls, and the example waits for workers to exit before returning.
 //
 //	go run ./examples/background
 //
-// 这里只演示"入队 + worker 处理 + Handle.Wait 取结果"。要知道某次后台运行的终态
-// 是否已经写进检查点存储，看 examples/background-status（WaitRecorded 与 RunStatus）。
+// See examples/background-status for file-backed terminal records and RunStatus,
+// or examples/lazy-run-lifecycle for channel-controlled lifecycle assertions.
 package main
 
 import (
@@ -20,10 +21,14 @@ import (
 )
 
 func main() {
-	ctx := context.Background()
+	if err := demonstrate(); err != nil {
+		log.Fatal(err)
+	}
+}
 
-	// A worker that echoes its input (so we can tell jobs apart).
-	a, err := agent.New(agent.WithModel(mock.New("m", func(req *llm.Request) *llm.Response {
+func demonstrate() error {
+	ctx := context.Background()
+	a, err := agent.New(agent.WithModel(mock.New("offline-echo", func(req *llm.Request) *llm.Response {
 		for i := len(req.Messages) - 1; i >= 0; i-- {
 			if req.Messages[i].Role == "user" {
 				return mock.Text("处理完成:" + req.Messages[i].Text())
@@ -32,35 +37,48 @@ func main() {
 		return mock.Text("done")
 	})))
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
-	// Queue + bounded pool (2 at a time).
 	q := queue.NewMemQueue(16)
 	pool := queue.NewPool(q, 2)
+	workersDone := make(chan struct{})
+	go func() {
+		defer close(workersDone)
+		pool.Run(ctx)
+	}()
+	// On every return, close the queue and join the workers. Wait alone does
+	// not confirm a terminal record, nor does it guarantee the Pool has exited.
+	defer func() {
+		q.Close()
+		<-workersDone
+	}()
 
-	// Fire-and-forget several agent runs; each returns a Handle immediately.
 	tasks := []string{"任务A", "任务B", "任务C", "任务D", "任务E"}
 	var handles []*queue.Handle
 	for i, task := range tasks {
 		h, err := queue.EnqueueAgent(ctx, q, a, task, agent.OnThread(fmt.Sprintf("job-%d", i)))
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		handles = append(handles, h)
-		fmt.Printf("📥 已入队 %s(job %s)\n", task, h.ID)
+		fmt.Printf("已入队 %s (job %s)\n", task, h.ID)
 	}
-	q.Close() // no more jobs; pool returns once drained
+	q.Close()
 
-	// Run the pool in the background; collect results.
-	go pool.Run(ctx)
-
-	fmt.Println("--- 后台处理中(并发 2)---")
+	fmt.Println("--- 后台处理中（并发 2）---")
 	for _, h := range handles {
-		res, err := h.Wait()
+		res, err := h.Wait() // Pure wait; the Pool above owns starting the work.
 		if err != nil {
-			log.Fatal(err)
+			return fmt.Errorf("execution %s: %w", h.ID, err)
 		}
-		fmt.Println("✅", res.Message.Text())
+		fmt.Println("执行已结算:", res.Message.Text())
+		if _, err := h.WaitRecorded(); err != nil {
+			// Includes both runErr and recordErr; a completed run with nil
+			// error here confirms the record in this example's memory store.
+			return fmt.Errorf("record %s: %w", h.ID, err)
+		}
+		fmt.Println("终态记录已确认（内存存储）:", h.ID)
 	}
+	return nil
 }

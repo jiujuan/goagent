@@ -18,7 +18,7 @@
 
 | 能力 | 说明 |
 | --- | --- |
-| 单一执行包 | 无独立 `runtime`/`runner` 包：`agent.New` 构建 Agent，`Run`（阻塞返回答案）与 `Stream`（非阻塞事件流）即完整入口。 |
+| 单一执行包 | 无独立 `runtime`/`runner` 包：`agent.New` 构建 Agent，`Run`（阻塞返回答案）与 `Stream`（惰性运行句柄）即完整入口。 |
 | 类型安全工具 | 通过泛型 `tool.New` 定义 Go 函数；框架从输入结构体反射生成 JSON Schema，并负责参数校验、调用和结果回填。 |
 | 多轮工具循环 | LLM 请求工具后，运行时自动执行工具、把结果写入历史，并继续调用模型直到得到最终答复；用 `WithMaxTurns` 兜底。 |
 | 流式事件 | `Stream(...).Iter()` 产出一串类型化的 `core.Event`（`MessageDelta`、`MessageDone`、`ToolDone`、`Interrupted` 等），统一承载文本增量、工具调用与最终结果。 |
@@ -36,7 +36,7 @@
 
 ## 架构设计
 
-框架以 `core` 中的消息、事件、状态和指令作为公共语言。`agent` 既是 Agent 的声明（配置）也是可运行句柄——它自身就是运行时，没有独立的 runner/runtime 层：一次 `Run`/`Stream` 会加载状态、驱动模型与工具循环、发布事件并写检查点。
+框架以 `core` 中的消息、事件、状态和指令作为公共语言。`agent` 既是 Agent 的声明（配置）也是可运行句柄——它自身就是运行时，没有独立的 runner/runtime 层：`Run` 立即驱动执行；普通 `Stream` 创建冻结输入的惰性句柄，启动并获得 admission 后才加载状态、驱动模型与工具循环、发布事件并写检查点。
 
 ```mermaid
 flowchart TB
@@ -190,7 +190,8 @@ go run ./examples/quickstart
 | `runtime-hardening` | `go run ./examples/runtime-hardening` | 运行时加固：根 Task 与 `AsTool` 子 Task、任务树预算耗尽后的工具错误、`Parallel` 失败后取消兄弟分支、同一个 `Session` 两次 `Send` 的先进先出执行。 |
 | `quickstart-chat` | `go run ./examples/quickstart-chat` | 真实模型的最小聊天启动模板。 |
 | `quickstart-tool` | `go run ./examples/quickstart-tool` | 真实模型调用一个类型化工具的启动模板。 |
-| `quickstart-stream` | `go run ./examples/quickstart-stream` | 流式接收真实模型输出的启动模板。 |
+| `quickstart-stream` | `go run ./examples/quickstart-stream` | 流式接收真实模型输出的启动模板；显式持有 Run，说明 break 后的退订与取消。 |
+| `lazy-run-lifecycle` | `go run ./examples/lazy-run-lifecycle`（T10 完成后） | 全 mock 离线断言：零调用创建、单次启动、Await 超时隔离、有限尾部、worker 启动权与 Wait/WaitRecorded。 |
 | `agent-tutorial` | `go run ./examples/agent-tutorial` | 对公共 API 的引导式完整走读。 |
 | `react-agent` | `go run ./examples/react-agent` | 单 Agent 多轮“思考 → 工具 → 观察”的 ReAct 循环。 |
 
@@ -250,7 +251,7 @@ go run ./examples/quickstart
 | `persistent` | `go run ./examples/persistent` | 基于文件检查点的跨进程持久化运行；多次运行可见历史增长。 |
 | `session` | `go run ./examples/session`（加 `-dir ./tmp-session` 保留目录，换个进程还能读同一个线程） | 会话门面：`OpenSession`/`Send`/`GetHead`/`ForkFrom`/子分支再跑，以及不带正文的 `History` 摘要分页与 cursor 误用。 |
 | `managed-run` | `go run ./examples/managed-run`（`-dir` 保留共享目录；`-role submit\|worker\|status\|cancel` 配合 `-run`、`-redis` 分进程跑） | 受管任务：提交、worker 执行、只凭 RunID 重连等待、跨客户端取消、未知投递结果保持排队、显式修复与状态列表。 |
-| `background` | `go run ./examples/background` | 队列驱动的后台执行：入队任务由 Worker 处理。 |
+| `background` | `go run ./examples/background` | 离线 Pool 示例：Wait 取执行结果，WaitRecorded 等记录尝试，最后等待 worker 退出。 |
 | `background-status` | `go run ./examples/background-status` | 后台运行的落盘与查询：`Handle.WaitRecorded` 确认终态记录、`Agent.RunStatus` 从文件存储读回状态与文件。 |
 | `redis` | `go run ./examples/redis` | 基于 Redis 的持久化后台队列（需先启动 Redis）。 |
 | `resilience` | `go run ./examples/resilience` | LLM 韧性层：多供应商回退与熔断。 |
@@ -288,10 +289,52 @@ go run ./examples/quickstart
 
 完整可运行示例见 `go run ./examples/task-loop`。
 
+### Run 的启动、等待与观察
+
+生命周期的决策与兼容迁移见 [ADR-0035](docs/adr/ADR-0035-lazy-run-lifecycle.md) 和 [变更说明](docs/changes/2026-10-28-lazy-run-lifecycle.md)。
+
+普通 `Stream` 创建句柄时冻结输入，保留惰性；取得 admission 后才恢复 checkpoint 历史。方法职责如下：
+
+| 调用 | 启动 | 等待或观察 |
+| --- | --- | --- |
+| `run.Start()` | 幂等、非阻塞，只启动一次 | 不订阅，不等待 |
+| `run.Await(waitCtx)` | 否 | 只等内存结算；超时只结束当前等待者，结果副本独立 |
+| `run.Wait()` | 是 | `Start + Await(context.Background())`，无事件订阅 |
+| 消费 `run.Iter()` | 是 | 先订阅再 Start；break 自动退订，不自动取消执行 |
+| `run.Events(mode)` | 否 | 只订阅；调用方立即 `defer unsubscribe()` |
+| `handle.Wait()` / `WaitRecorded()` | 否 | 依赖队列 worker，分别等结算 / 记录尝试 |
+
+原始 channel 的用法是先订阅，再启动，并保持消费：
+
+```go
+run := a.Stream(ctx, "hello")
+events, unsubscribe := run.Events(bus.Lossless)
+defer unsubscribe() // 提前退出也要执行，解除背压或尾部交付等待。
+run.Start()
+for ev := range events { // 读到尾部后的 channel 关闭；按需处理 ev。
+    _ = ev
+}
+result, err := run.Await(ctx)
+_ = result
+_ = err
+```
+
+只限制等待时间，用 `run.Await(waitCtx)`；需要停止执行，则先 `run.Cancel()` 再 `run.Await(context.Background())` 等实际结算。Prepared Cancel 同步内存结算，不发布 RunStarted 或根 TaskDone，尾部只有 RunFailed；Started Cancel 只提出请求，模型、工具、hook 和 store 仍需协作响应 context。
+
+晚订阅活动 Run 不补历史进度；已封闭 Run 的 Iter/Events 仅返回有限尾部（根 TaskDone + 单个 RunDone/RunFailed/Interrupted；未进入根 Task 时只有 RunFailed），随后结束，多次消费不重跑。Wait 返回不保证观察者已读到尾部或尾部已进入 channel；不要在 Wait 后用非阻塞 select/default drain 判断流已结束。普通 Lossless 进度仍会背压，child TaskDone 仍是普通可取消事件。完整离线断言见 [lazy-run-lifecycle](examples/lazy-run-lifecycle/main.go)。
+
+RecordApproval 的持久 receipt 是权威事实；sealed Run 不因再次记录审批而重开流。继续执行用 Resume，不依赖重订阅旧流确认审批。
+
+### 生命周期观测
+
+生命周期只向已有 span 添加 events，不创建新 span。记录创建、启动请求、真实 admission、首个有效模型 response 和结算时点。四个秒单位 histogram 为 `agent.run.creation_to_start`、`agent.run.start_to_admission`、`agent.run.admission_to_first_response`、`agent.run.start_to_settlement`，不附加 runID/threadID/prompt/tool args 等高基数或内容 labels。
+
+生命周期 metrics 使用全局 `otel.GetMeterProvider()`，应用需通过 `otel.SetMeterProvider(...)` 配置；单独的 `obs/otel.WithMeterProvider` 仅影响 middleware。缺失阶段和负区间省略。Resume 可先 admission 再创建 Run，保留真实时间；首个有效 response 是非 nil 且无错误的 partial 或最终响应，不是首 token。
+
 ### 会话快照与并发
 
 - checkpoint 历史保持 append-only。Memory 和 File checkpointer 都会冻结状态数据与可快照文件，`Load`、`Latest`、`History` 和 Fork 返回的内容可独立修改，不会反向污染历史。
-- `Stream` 在创建句柄时不读取 checkpoint；第一次 `Wait`/`Iter` 才取得同线程执行名额并加载当前 head。
+- 普通 `Stream` 在创建句柄时冻结输入但不读取 checkpoint；`Start`、`Wait` 或消费 `Iter` 请求执行，取得 admission 后才加载当前 head；`Await`/`Events` 不启动。
 - 同线程准入：普通 `Agent.Run`/`Stream` 默认快速失败，忙时在模型和工具执行前返回 `checkpoint.ErrClaimConflict`；`Session.Send` 默认按先进先出排队，等前一次运行结束并提交后才开始；`Resume` 固定快速失败，不接受运行选项。
 - 排队默认允许每个线程 16 个等待者，超过返回 `agent.ErrAdmissionQueueFull`；在自己运行的线程里再次启动运行会直接返回 `agent.ErrAdmissionReentrant`，不会排队。不同线程互不影响。
 - 运行级覆盖用 `agent.WithAdmission(agent.AdmissionOptions{Policy: agent.AdmissionQueue})`（或 `AdmissionFail`），`Agent.Run`/`Stream` 与 `Session.Send` 都接受；`Session.Send` 不传时使用排队。
@@ -321,7 +364,8 @@ go run ./examples/quickstart
 ### 后台运行的终态与状态查询
 
 - 归属：入队成功后运行归队列所有。取消传给 `EnqueueAgent` 的 context 只结束提交这一侧；`Pool` 的 context 取消只是停止取新任务并等待在途任务。要中止一次已经跑起来的后台运行，用 `Handle.Cancel`（同时中止运行并释放队列持有的执行 context）。
-- 两个终点：`Handle.Wait` 只说"运行结束了"；`Handle.WaitRecorded` 还要等 worker 把这次运行的终态记录写进存储，返回 `errors.Join(运行错误, 记录错误)`。completed 且错误为 nil 才是"记录已确认"；暂停的运行没有终态可记，返回结果与 nil 记录错误。没有任何 worker 消费的任务，`WaitRecorded` 会一直等下去——它是等 worker，不自己驱动运行。
+- 启动权：`Handle.Wait` 改为纯等待，不能驱动运行；需要启动 `Pool`/worker，或改用直接执行的 `Agent.Run`。Handle 不提供 Start/Await。未消费的 prepared 任务取消后，Wait 可以返回；无 worker 的 WaitRecorded 仍等待。后续 worker 不执行模型，但仍尝试记录；无本次提交边界时保留 `agent.ErrNoCommittedBoundary`。
+- 两个终点：`Handle.Wait` 只说"运行已内存结算"；`Handle.WaitRecorded` 还要等 worker 尝试记录终态并保存收尾结果，返回 `errors.Join(运行错误, 记录错误)`。completed 且错误为 nil 才是"记录已确认"；暂停的运行没有终态可记，返回结果与 nil 记录错误。没有任何 worker 消费的任务，`WaitRecorded` 会一直等下去——它是等 worker，不自己驱动运行。
 - 谁写终态：只有 `Agent.RecordCompletion(ctx, run)`（队列在运行结束后调用它）。默认前台 `Run`/`Stream`/`Resume` 不写终态记录。它拒绝：`nil` 运行（`agent.ErrNoRun`）、别的 Agent 的运行（`agent.ErrRunNotOwned`）、未结束（`agent.ErrRunNotFinished`）、暂停（`agent.ErrRunPaused`）、这次运行没有自己的成功提交边界（`agent.ErrNoCommittedBoundary`）、边界停在未解决的工具批次（`checkpoint.ErrInFlightConflict`）、存储不支持原子追加（`checkpoint.ErrDurableUnavailable`，不会退回普通 `Save`）。
 - 怎么写：从冻结的提交边界 `Load` 并核对线程/ID/revision，克隆状态与文件快照，用 `ExpectedRevision` 追加一条带 `Completion` 的快照。head 已被别的运行推进 → `checkpoint.ErrRevisionConflict`；线程被别人占着 → `checkpoint.ErrClaimConflict`；本次租约过期 → `checkpoint.ErrStaleFencingToken`。框架不会读新 head 再把旧终态改写一遍——遇到冲突就接受冲突，用 `RunStatus` 看当前事实，要不要再记录由那一轮自己决定。
 - 崩溃窗口：进程在记录写完之前退出，这次运行就没有终态记录；存储里的 head 是运行中间提交的那一条，可以直接恢复继续跑，但不要把它当"本次运行的结果"。无人等待 `WaitRecorded` 时，框架不会主动通知记录失败。
