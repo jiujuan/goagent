@@ -267,7 +267,9 @@ func (rc *RunContext) requestPreemption(reason string) bool {
 }
 
 // publish is the loop's single-goroutine event sink.
-func (rc *RunContext) publish(ev core.Event) { rc.Bus.Publish(rc.Topic, ev) }
+func (rc *RunContext) publish(ev core.Event) {
+	_ = rc.Bus.PublishContext(rc.Context, rc.Topic, ev)
+}
 
 // dynamicTools is a goroutine-safe name-to-tool table of run-scoped tools. The loop
 // writes it while preparing a step and reads it from the tool goroutines, so both

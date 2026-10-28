@@ -75,6 +75,20 @@ func (s *subscriber) send(ctx context.Context, ev core.Event) error {
 	}
 }
 
+// trySend preserves ready diagnostics after cancellation without restoring
+// back-pressure. Registration still protects the send from channel closure.
+func (s *subscriber) trySend(ev core.Event) {
+	if !s.beginSend() {
+		return
+	}
+	defer s.endSend()
+	select {
+	case <-s.sendStop:
+	case s.ch <- ev:
+	default:
+	}
+}
+
 func (s *subscriber) cancel(remove func()) {
 	s.mu.Lock()
 	if s.phase == subscriptionCanceling || s.phase == subscriptionClosed {

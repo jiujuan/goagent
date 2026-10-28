@@ -101,17 +101,24 @@ func (b *Bus) Publish(topic Topic, ev core.Event) {
 
 // PublishContext fans ev out without holding the topic index lock while sending.
 // Cancellation can occur after delivery to some subscribers; retrying may
-// duplicate events. A canceled subscription is skipped without failing the call.
+// duplicate events. An already canceled context permits only immediately ready
+// sends and still returns its error. A canceled subscription is skipped.
 func (b *Bus) PublishContext(ctx context.Context, topic Topic, ev core.Event) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
+	startErr := ctx.Err()
 	b.mu.RLock()
 	subs := make([]*subscriber, 0, len(b.subs[topic]))
 	for s := range b.subs[topic] {
 		subs = append(subs, s)
 	}
 	b.mu.RUnlock()
+	// Preserve immediately deliverable cancellation diagnostics, while a canceled
+	// publisher never waits for buffer space. Delivery remains best effort.
+	if startErr != nil {
+		for _, s := range subs {
+			s.trySend(ev)
+		}
+		return startErr
+	}
 	for _, s := range subs {
 		if err := s.send(ctx, ev); err != nil {
 			return err

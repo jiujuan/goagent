@@ -594,3 +594,12 @@ git diff --check
 
 | 2026-10-28，T01/T02 | 新接口缺失红灯；bus 定向绿灯；go test -race ./bus -count=10 -timeout=120s；尾部/发送/取消 race 30 轮 | 全部通过；FanOutOrdered/Lossy/Adapt 保留 |
 | 2026-10-28，T01/T02 独立实现审核 | 规格和质量审核；补 detach 后 cancel-first 屏障后定向复核 | 无未解决 finding；审核者独立 race 30 轮、CPU 1/2/4 压力和 vet 通过 |
+
+### 实施偏差：取消后的即时诊断交付
+
+T03 整包回归发现原 `TestPlanParentCancelReturnsContextError` 和 `TestRunCancelWordsCancellationNotTimeout` 要求已取消 context 上仍可观察到取消诊断。严格的入口短路会必然丢失这些普通事件。保留原断言并避免扩大固定尾部：`PublishContext` 开始检查取消；若已经取消，仅对当前活动订阅尝试不阻塞的发送，随后仍返回原 context 错误；缓冲已满时立即返回。在途普通阻塞发送仍直接受取消中断。没有重试或切换 Background，也没有把子 TaskDone 提升为根尾部。该修订扩展了取消时可能部分交付的明确契约。
+
+| 日期/阶段 | 验证 | 结果 |
+| --- | --- | --- |
+| 2026-10-28，T03 | FrameworkPublish/ApprovalReceipt 定向红→绿，synctest 确定性等待；取消诊断新测试红→绿 | 通过；durable receipt 不受通知取消影响 |
+| 2026-10-28，M1 | go test ./agent ./queue -count=1 -timeout=120s；go test -race ./bus ./agent -count=1 -timeout=180s | 通过；原取消诊断断言保留，两项定向另重复20轮通过 |

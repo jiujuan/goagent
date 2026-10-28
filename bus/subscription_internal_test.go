@@ -238,3 +238,31 @@ func TestFinishTopicDetachedCancelWinsBeforeSeal(t *testing.T) {
 		}
 	})
 }
+
+func TestPublishContextCanceledKeepsReadyDiagnostics(t *testing.T) {
+	for _, mode := range []DeliveryMode{Lossless, Lossy} {
+		b := New(WithBufferSize(1))
+		ch, stop := b.Subscribe("run", mode)
+		defer stop()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := b.PublishContext(ctx, "run", core.TaskDone{Status: "canceled"}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("error=%v", err)
+		}
+		select {
+		case ev := <-ch:
+			if ev.(core.TaskDone).Status != "canceled" {
+				t.Fatal(ev)
+			}
+		default:
+			t.Fatal("ready cancellation diagnostic lost")
+		}
+		b.Publish("run", core.RunStarted{})
+		if err := b.PublishContext(ctx, "run", core.TaskDone{}); !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+		if len(ch) != 1 {
+			t.Fatal("canceled send blocked or changed full buffer")
+		}
+	}
+}

@@ -261,7 +261,7 @@ func (r *Run) drive() {
 		r.lifecycleMu.Unlock()
 		go func() {
 			defer r.releaseAdmission()
-			r.bus.Publish(r.topic, core.RunStarted{RunID: r.identity.runID, ThreadID: r.identity.threadID})
+			_ = r.bus.PublishContext(r.rc.Context, r.topic, core.RunStarted{RunID: r.identity.runID, ThreadID: r.identity.threadID})
 			if r.startErr != nil {
 				r.rc.steering.close(ErrRunClosed)
 				err := errors.Join(r.startErr, r.rc.releaseDurableClaim())
@@ -282,7 +282,7 @@ func (r *Run) drive() {
 				return
 			}
 			task := r.rc.taskInfo()
-			r.bus.Publish(r.topic, core.TaskStarted{
+			_ = r.bus.PublishContext(r.rc.Context, r.topic, core.TaskStarted{
 				TaskID:   task.ID,
 				ParentID: task.ParentID,
 				ThreadID: task.ThreadID,
@@ -290,7 +290,7 @@ func (r *Run) drive() {
 				Depth:    task.Depth,
 			})
 			for _, ev := range r.rc.drainApprovalEvents() {
-				r.bus.Publish(r.topic, ev)
+				_ = r.bus.PublishContext(r.rc.Context, r.topic, ev)
 			}
 			out := r.runnable.run(r.rc)
 			r.rc.steering.close(out.inputCloseReason())
