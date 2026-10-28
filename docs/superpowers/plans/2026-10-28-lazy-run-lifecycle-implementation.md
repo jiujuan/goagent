@@ -12,10 +12,10 @@
 
 ## 1. 依据、范围与执行约束
 
-- 日期：2026-10-28；计划状态：Ready for implementation（核心任务独立复核通过），所有执行框均未勾选。
+- 日期：2026-10-28；计划状态：Implementing；执行分支 `fix/lazy-run-lifecycle-7Ps`（用户指定）。
 - 唯一实施规格：[惰性 Run 生命周期设计](../specs/2026-10-28-lazy-run-lifecycle-design.md)。计划基线 HEAD：`5e7b603`；执行前重新核验。相对路径均相对于仓库根目录 `D:\codeproject\mygo\goagent`。
 - 本次交付是实施计划；下列新接口、新测试和验收结论均为待执行项。设计阶段通过的既有测试只算旧实现基线。
-- 当前有预先存在的未跟踪文档及 `.scratch/`。执行时逐文件暂存，不使用 `git add .`，不清理或覆盖这些内容；分支采用 `codex/` 前缀。
+- 当前有预先存在的未跟踪文档及 `.scratch/`。执行时逐文件暂存，不使用 `git add .`，不清理或覆盖这些内容；按用户要求使用 `fix/lazy-run-lifecycle-7Ps` 分支，`.scratch/` 不提交。
 - 不改变输入在创建时冻结、历史在获得 admission 后恢复的时点；不增加全历史回放、Handle.Start、公开 Done/Result/WaitContext 或实时 RunStatus API。
 - 保留普通 Lossless 背压。只有根 TaskDone 与 RunDone/RunFailed/Interrupted 尾部交付不阻塞运行结算；workflow/plan 的子 TaskDone 仍走可取消的普通发送。
 - 外部模型、工具、hook 或 store 必须协作响应 context；本计划不承诺强制抢占忽略 context 的外部代码。
@@ -160,11 +160,11 @@ func (r *Run) Await(ctx context.Context) (core.Result, error)
 
 **依赖：** 无。**代码改动：** 无。**交付：** 执行记录写在本计划末尾的证据表。
 
-- [ ] 核验 `git status --short`、`git rev-parse HEAD`、`go version`、`go env GOOS GOARCH CGO_ENABLED CC`，记录预先存在的修改和未跟踪文件。
-- [ ] 执行 `go test ./bus ./agent ./queue -count=1 -timeout=90s`；预期三个包通过。若现有基线失败，先定位并记录，不能把失败归到新协议。
-- [ ] 执行 `go test -race ./bus -count=1 -timeout=90s`；预期通过。Windows 缺可用 C 工具链时，配置支持 race 的 Windows 环境或使用受支持的 Linux runner；不能把普通 test 当作 race 等价证明。
-- [ ] 核验 `bus/bus.go`、`agent/run.go`、`agent/run_prepare.go`、`agent/hitl.go`、`queue/agent_bridge.go` 与设计一致；若 HEAD 改变，先更新落点和依赖。
-- [ ] 新增测试使用 package 内部测试访问私有同步点；默认用 `testing/synctest`、已有 store spy 或 channel 屏障。不增加公开调试 API。
+- [x] 核验 `git status --short`、`git rev-parse HEAD`、`go version`、`go env GOOS GOARCH CGO_ENABLED CC`，记录预先存在的修改和未跟踪文件。
+- [x] 执行 `go test ./bus ./agent ./queue -count=1 -timeout=90s`；预期三个包通过。若现有基线失败，先定位并记录，不能把失败归到新协议。
+- [x] 执行 `go test -race ./bus -count=1 -timeout=90s`；预期通过。Windows 缺可用 C 工具链时，配置支持 race 的 Windows 环境或使用受支持的 Linux runner；不能把普通 test 当作 race 等价证明。
+- [x] 核验 `bus/bus.go`、`agent/run.go`、`agent/run_prepare.go`、`agent/hitl.go`、`queue/agent_bridge.go` 与设计一致；若 HEAD 改变，先更新落点和依赖。
+- [x] 新增测试使用 package 内部测试访问私有同步点；默认用 `testing/synctest`、已有 store spy 或 channel 屏障。不增加公开调试 API。
 
 **DoD：** 基线和竞态环境证据完整；后续实施只暂存明确列出的路径；当前最低 Go 版本可编译所用测试设施。
 
@@ -172,10 +172,10 @@ func (r *Run) Await(ctx context.Context) (core.Result, error)
 
 **依赖：** T00。**文件：** 修改 `bus/bus.go`、`bus/bus_test.go`；新增 `bus/subscription.go`、`bus/subscription_internal_test.go`。
 
-- [ ] 先新增 `TestPublishContextCancelledWhenFull`、`TestUnsubscribeUnblocksRegisteredPublish`、`TestSlowTopicDoesNotBlockOtherTopic`，保留 FanOutOrdered/LossyDropsWhenFull。
-- [ ] 用容量 1 的订阅填满缓冲；在同包测试中取得该订阅，先调用 beginSend 精确固定“发送已登记”，再并发退订。不要用延时猜测发送者是否已经进入 select。
-- [ ] 运行失败测试：`go test ./bus -run 'Test(PublishContextCancelledWhenFull|UnsubscribeUnblocksRegisteredPublish|SlowTopicDoesNotBlockOtherTopic)$' -count=1 -timeout=30s`。预期新接口不存在或旧实现不能满足取消用例；只针对目标缺口解释失败。
-- [ ] 将订阅的关闭权与发送登记放入 subscription.go。最小核心如下；sendStop 的关闭也必须在此锁下受状态转换保护。
+- [x] 先新增 `TestPublishContextCancelledWhenFull`、`TestUnsubscribeUnblocksRegisteredPublish`、`TestSlowTopicDoesNotBlockOtherTopic`，保留 FanOutOrdered/LossyDropsWhenFull。
+- [x] 用容量 1 的订阅填满缓冲；在同包测试中取得该订阅，先调用 beginSend 精确固定“发送已登记”，再并发退订。不要用延时猜测发送者是否已经进入 select。
+- [x] 运行失败测试：`go test ./bus -run 'Test(PublishContextCancelledWhenFull|UnsubscribeUnblocksRegisteredPublish|SlowTopicDoesNotBlockOtherTopic)$' -count=1 -timeout=30s`。预期新接口不存在或旧实现不能满足取消用例；只针对目标缺口解释失败。
+- [x] 将订阅的关闭权与发送登记放入 subscription.go。最小核心如下；sendStop 的关闭也必须在此锁下受状态转换保护。
 
 ```go
 func (s *subscriber) beginSend() bool {
@@ -193,11 +193,11 @@ func (s *subscriber) endSend() { s.normalWG.Done() }
 
 新增私有 `subscriptionPhase` 与 `subscriptionActive/subscriptionSealing/subscriptionCanceling/subscriptionClosed`。字段至少包括 mu、phase、ch、mode、normalWG、sendStop、cancelSignal、closed，以及 T02 使用的 tailDone。退订是 active→canceling 或 sealing→canceling；后者不能再次关闭 sendStop。
 
-- [ ] PublishContext 在 Bus.mu 下复制 `[]*subscriber` 后释放锁，逐订阅调用 send；开始时检查 ctx.Err，Lossless 的 select 同时等待 ch、ctx.Done、sendStop。Lossy 在相同登记协议下尝试发送/取消/default，满缓冲丢普通事件。某订阅已退订/封闭直接跳过，不成为运行错误。
-- [ ] 退订先在订阅锁内禁止登记并发出取消信号，锁外删除总线索引，再在锁外等待 normalWG；无尾部发送者时由退订路径关闭数据 channel 和 closed。并发退订调用都等待 closed 后返回。不能持有 Bus.mu 等待，不能用 recover 隐藏关闭竞争。
-- [ ] 保留 `Publish(topic, ev)`，实现为调用 PublishContext(Background, topic, ev) 的兼容包装。说明部分 fan-out 后可返回 ctx.Err，调用方不能据此无条件重试。
-- [ ] 执行上面的定向命令及 `go test -race ./bus -count=10 -timeout=120s`；预期通过，无 race/panic。
-- [ ] 生成提交候选：`fix(bus): make publish and unsubscribe cancellation safe`。
+- [x] PublishContext 在 Bus.mu 下复制 `[]*subscriber` 后释放锁，逐订阅调用 send；开始时检查 ctx.Err，Lossless 的 select 同时等待 ch、ctx.Done、sendStop。Lossy 在相同登记协议下尝试发送/取消/default，满缓冲丢普通事件。某订阅已退订/封闭直接跳过，不成为运行错误。
+- [x] 退订先在订阅锁内禁止登记并发出取消信号，锁外删除总线索引，再在锁外等待 normalWG；无尾部发送者时由退订路径关闭数据 channel 和 closed。并发退订调用都等待 closed 后返回。不能持有 Bus.mu 等待，不能用 recover 隐藏关闭竞争。
+- [x] 保留 `Publish(topic, ev)`，实现为调用 PublishContext(Background, topic, ev) 的兼容包装。说明部分 fan-out 后可返回 ctx.Err，调用方不能据此无条件重试。
+- [x] 执行上面的定向命令及 `go test -race ./bus -count=10 -timeout=120s`；预期通过，无 race/panic。
+- [x] 生成提交候选：`fix(bus): make publish and unsubscribe cancellation safe`。
 
 **DoD：** 已登记发送不会与 close 并发；退订返回意味着发送结束且数据 channel 已关闭；满缓冲取消/跨 topic 操作通过；Lossy 和串行发布顺序不变。
 
@@ -205,9 +205,9 @@ func (s *subscriber) endSend() { s.normalWG.Done() }
 
 **依赖：** T01。**文件：** 修改 `bus/bus.go`、`bus/subscription.go`、`bus/subscription_internal_test.go`；新增 `bus/terminal_tail.go`。
 
-- [ ] 新增 `TestFinishTopicReturnsWithFullBuffer`、`TestFinishTopicPreservesQueuedOrder`、`TestFinishTopicLossyStillDeliversTail`、`TestFinishTopicCancelJoinsTailSender`、`TestFinishTopicCancelRegisteredSendRace`、`TestFinishTopicDoesNotKeepTombstone`、`TestFinishTopicTailCopiesAreIndependent`。
-- [ ] 用 beginSend 固定一条在途普通发送，再让 FinishTopic 和退订竞争；分别强制 cancel 先获锁与 seal 先获锁。所有已登记发送、tailDone、closed 都必须最终退出。自然收尾、提前取消、重复调用三组分别覆盖。
-- [ ] 运行 `go test ./bus -run '^TestFinishTopic' -count=1 -timeout=30s`，先确认新接口/新契约导致失败，再实现下列顺序。
+- [x] 新增 `TestFinishTopicReturnsWithFullBuffer`、`TestFinishTopicPreservesQueuedOrder`、`TestFinishTopicLossyStillDeliversTail`、`TestFinishTopicCancelJoinsTailSender`、`TestFinishTopicCancelRegisteredSendRace`、`TestFinishTopicDoesNotKeepTombstone`、`TestFinishTopicTailCopiesAreIndependent`。
+- [x] 用 beginSend 固定一条在途普通发送，再让 FinishTopic 和退订竞争；分别强制 cancel 先获锁与 seal 先获锁。所有已登记发送、tailDone、closed 都必须最终退出。自然收尾、提前取消、重复调用三组分别覆盖。
+- [x] 运行 `go test ./bus -run '^TestFinishTopic' -count=1 -timeout=30s`，先确认新接口/新契约导致失败，再实现下列顺序。
 
 ```text
 Bus.mu: 摘除当前 topic 的订阅集合 → 解锁
@@ -216,12 +216,12 @@ Bus.mu: 摘除当前 topic 的订阅集合 → 解锁
 收尾 goroutine：close(ch) → close(closed) → close(tailDone)
 ```
 
-- [ ] seal 在订阅锁内先发布 tailDone，再在锁外启动 goroutine；cancel 看见已安装 tailDone 时只能唤醒并等待它，不得自己 close(ch)。cancel 先获胜则 seal 不启动收尾者。重复 FinishTopic 不能重新获取已摘除订阅。
-- [ ] tail 只占固定 1～2 个事件的 Run 尾部空间。terminal_tail.go 对框架已经规范化的 RunDone 消息、Interrupted.Pending 的切片及嵌套可变内容做每订阅副本；Run 缓存、不同订阅、FrozenOutcome 之间不能共享可变 payload。error 对象按现有只读约定传递，不尝试复制任意自定义 error。
-- [ ] 所有可失败的框架消息规范化在 T04 冻结前完成。Bus 的尾部复制仅复制已验证的 core 数据变体，不新做会改变结局的序列化或业务校验；禁止克隆失败后回退共享原始消息。普通事件仍按既有只读契约，未承诺每次 Publish 深拷贝。
-- [ ] 验证 FinishTopic 不等待 normalWG 或 channel 消费，Bus 不存结束 topic 的 tombstone；generic Subscribe 在其后仍是新订阅，不具回放能力。
-- [ ] 执行 `go test -race ./bus -run 'Test(FinishTopic|Unsubscribe|PublishContext)' -count=30 -timeout=180s` 及 `go test ./bus -count=1 -timeout=60s`。
-- [ ] 生成提交候选：`feat(bus): seal subscriptions with ordered terminal tails`。
+- [x] seal 在订阅锁内先发布 tailDone，再在锁外启动 goroutine；cancel 看见已安装 tailDone 时只能唤醒并等待它，不得自己 close(ch)。cancel 先获胜则 seal 不启动收尾者。重复 FinishTopic 不能重新获取已摘除订阅。
+- [x] tail 只占固定 1～2 个事件的 Run 尾部空间。terminal_tail.go 对框架已经规范化的 RunDone 消息、Interrupted.Pending 的切片及嵌套可变内容做每订阅副本；Run 缓存、不同订阅、FrozenOutcome 之间不能共享可变 payload。error 对象按现有只读约定传递，不尝试复制任意自定义 error。
+- [x] 所有可失败的框架消息规范化在 T04 冻结前完成。Bus 的尾部复制仅复制已验证的 core 数据变体，不新做会改变结局的序列化或业务校验；禁止克隆失败后回退共享原始消息。普通事件仍按既有只读契约，未承诺每次 Publish 深拷贝。
+- [x] 验证 FinishTopic 不等待 normalWG 或 channel 消费，Bus 不存结束 topic 的 tombstone；generic Subscribe 在其后仍是新订阅，不具回放能力。
+- [x] 执行 `go test -race ./bus -run 'Test(FinishTopic|Unsubscribe|PublishContext)' -count=30 -timeout=180s` 及 `go test ./bus -count=1 -timeout=60s`。
+- [x] 生成提交候选：`feat(bus): seal subscriptions with ordered terminal tails`。
 
 **DoD：** 尾部收尾者最多每订阅一个；Lossy 的尾部也可靠；退订能唤醒并等待收尾者；正常排空后自动关闭 channel；三方竞争无 race/双重 close；FinishTopic 返回不依赖消费者。
 
@@ -588,3 +588,9 @@ git diff --check
 | store Commit=0 不能证明 RecordCompletion 未提前进入 | 绑定私有记录函数；worker 启动前包装入口计数，同时断言 worker/WaitRecorded 仍阻塞 | 定向复核通过 |
 
 独立审核范围为 T00～T11；T12a/T12b/T12c/T13a/T13b/T14 的观测/文档/交付任务由主执行者完成规格、现有 span 树、时点和验证方式自检。独立审核者重跑旧实现基线 `go test ./bus ./agent ./queue -count=1 -timeout=90s`，三个包通过；未运行本计划尚未建立的新协议测试。
+
+| 2026-10-28，T00 Windows/amd64 | HEAD a9ad9f9；go1.26.4；CGO_ENABLED=1，CC=gcc；工作区干净 | 目标分支已建立；源码落点与计划一致 |
+| 2026-10-28，T00 基线 | go test ./bus ./agent ./queue -count=1 -timeout=90s；go test -race ./bus -count=1 -timeout=90s | 全部通过，race 环境可用 |
+
+| 2026-10-28，T01/T02 | 新接口缺失红灯；bus 定向绿灯；go test -race ./bus -count=10 -timeout=120s；尾部/发送/取消 race 30 轮 | 全部通过；FanOutOrdered/Lossy/Adapt 保留 |
+| 2026-10-28，T01/T02 独立实现审核 | 规格和质量审核；补 detach 后 cancel-first 屏障后定向复核 | 无未解决 finding；审核者独立 race 30 轮、CPU 1/2/4 压力和 vet 通过 |
