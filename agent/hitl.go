@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
@@ -90,6 +91,7 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 	if err != nil {
 		return nil, err
 	}
+	admittedAt := time.Now()
 	// Every error path below drops the slot; it is handed to the returned run
 	// only once one exists, and that run releases it when driven or canceled.
 	handedOff := false
@@ -108,7 +110,7 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 	if cp.InFlight != nil {
 		// resumeInFlight owns the slot from here and attaches it to the run.
 		handedOff = true
-		return a.resumeInFlight(ctx, cp, approvals, releaseGate)
+		return a.resumeInFlight(ctx, cp, approvals, releaseGate, admittedAt)
 	}
 	if err := validatePause(cp); err != nil {
 		return nil, err
@@ -186,6 +188,7 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		state.KV[approvalsKey] = merged
 	}
 	run := a.newRunHandle(ctx, threadID, &state)
+	run.rc.timing.Admitted(admittedAt)
 	run.setGateRelease(releaseGate)
 	handedOff = true
 	run.rc.setDurableClaim(claim)
@@ -245,7 +248,7 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 // The caller hands in the thread slot it acquired before reading the head; this
 // function owns it from here, releases it on every error path, and attaches it
 // to the returned run.
-func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, approvals []Approval, releaseGate func()) (*Run, error) {
+func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, approvals []Approval, releaseGate func(), admittedAt time.Time) (*Run, error) {
 	if cp.Pending != nil || cp.Pause != nil || cp.Completion != nil {
 		releaseGate()
 		return nil, fmt.Errorf("%w: checkpoint %s carries work state that conflicts with an in-flight batch", ErrInFlightUnrecoverable, cp.ID)
@@ -301,6 +304,7 @@ func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, a
 	}
 	batch.final = final
 	run := a.newRunHandle(ctx, cp.ThreadID, &state)
+	run.rc.timing.Admitted(admittedAt)
 	run.setGateRelease(releaseGate)
 	run.rc.setDurableClaim(claim)
 	run.rc.continuedTurn = true

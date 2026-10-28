@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/jiujuan/goagent/checkpoint"
 )
@@ -86,9 +87,11 @@ func (r *Run) acquireAdmission() error {
 	if err != nil {
 		return err
 	}
+	admittedAt := time.Now()
 	r.lifecycleMu.Lock()
 	r.gateRelease = release
 	r.lifecycleMu.Unlock()
+	r.rc.timing.Admitted(admittedAt)
 	return nil
 }
 

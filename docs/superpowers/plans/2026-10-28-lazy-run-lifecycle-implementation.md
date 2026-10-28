@@ -460,11 +460,11 @@ func (r *Recorder) Settled()
 
 **依赖：** T12b。**文件：** 修改 `agent/admission.go`、`agent/hitl.go`、`agent/loop.go`；扩展 `agent/run_observability_internal_test.go`。
 
-- [ ] 普通运行在 acquireAdmission 成功后记录 AdmittedAt。Resume 在已有 gate acquisition 成功处捕获时间，随后附加到完整句柄 recorder，激活前完成；held gate 快路径不能再次用 Start 时刻覆盖真实时点。
-- [ ] `AgentLoop.streamModel` 接收第一个非 nil 且 err=nil 的 response 时标记 FirstModelResponse；partial 与最终 response 都可成为首个响应，不能把此值称为首 token 延迟。多个 retry/分支只对同一 Run 记录一次首响应。
-- [ ] 测试：`TestAdmissionWaitRecordedSeparately`（held gate）、`TestFirstResponseOnlyAfterModelReply`（受控 model gate）、`TestPreparedCancelHasNoAdmissionTiming`、`TestResumeTimingRetainsPreacquiredAdmission`、`TestWorkflowFirstResponseRecordedOnce`。
-- [ ] 执行 `go test ./internal/runobs ./agent ./obs/otel -count=1 -timeout=150s`、`go test -race ./agent -run 'Test(AdmissionWaitRecorded|FirstResponseOnly|PreparedCancelHasNoAdmission|ResumeTimingRetains|WorkflowFirstResponse)' -count=15 -timeout=180s` 和 `go test ./examples/otel -run '^$'`。
-- [ ] 生成提交候选：`feat(agent): distinguish admission and first response timing`。
+- [x] 普通运行在 acquireAdmission 成功后记录 AdmittedAt。Resume 在已有 gate acquisition 成功处捕获时间，随后附加到完整句柄 recorder，激活前完成；held gate 快路径不能再次用 Start 时刻覆盖真实时点。
+- [x] `AgentLoop.streamModel` 接收第一个非 nil 且 err=nil 的 response 时标记 FirstModelResponse；partial 与最终 response 都可成为首个响应，不能把此值称为首 token 延迟。多个 retry/分支只对同一 Run 记录一次首响应。
+- [x] 测试：`TestAdmissionWaitRecordedSeparately`（held gate）、`TestFirstResponseOnlyAfterModelReply`（受控 model gate）、`TestPreparedCancelHasNoAdmissionTiming`、`TestResumeTimingRetainsPreacquiredAdmission`、`TestWorkflowFirstResponseRecordedOnce`。
+- [x] 执行 `go test ./internal/runobs ./agent ./obs/otel -count=1 -timeout=150s`、`go test -race ./agent -run 'Test(AdmissionWaitRecorded|FirstResponseOnly|PreparedCancelHasNoAdmission|ResumeTimingRetains|WorkflowFirstResponse)' -count=15 -timeout=180s` 和 `go test ./examples/otel -run '^$'`。
+- [x] 生成提交候选：`feat(agent): distinguish admission and first response timing`。
 
 **DoD：** 普通 lazy Run 与预占 gate 的 Resume 均记录实际时点；无负间隔和重复首响应；成功、失败、暂停、未启动取消只包含经历过的阶段。
 
@@ -628,3 +628,5 @@ T03 整包回归发现原 `TestPlanParentCancelReturnsContextError` 和 `TestRun
 | 2026-10-28，T12a | Recorder五家族红→绿；go test ./internal/runobs -count=1 -timeout=60s；race10轮 | 通过；短锁登记、锁外输出、已有span不新增、无负interval/高基数标签，nil-safe |
 
 | 2026-10-28，T12b | timing字段缺失红→绿；internal/runobs+agent+obs/otel全包；五家族race15轮 | 通过；Start唯一owner和Settled时点、派生指针继承、无新增span，原OTel父子树回归通过 |
+
+| 2026-10-28，T12c | 准入/first-response/Resume真实时点红→绿；internal/runobs+agent+obs/otel全包；五家族race15轮；otel example编译 | 通过；忽略nil response、不改span父子树，Resume pre-acquired时间保留；raw inflight fixture显式未知admission零值 |

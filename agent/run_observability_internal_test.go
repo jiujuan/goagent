@@ -2,6 +2,9 @@ package agent
 
 import (
 	"context"
+	"github.com/jiujuan/goagent/bus"
+	"github.com/jiujuan/goagent/checkpoint"
+	"iter"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -116,5 +119,167 @@ func TestRunTimingKeepsModelSpanParent(t *testing.T) {
 	events := spans[0].Events()
 	if len(events) < 3 {
 		t.Fatalf("lifecycle events=%d", len(events))
+	}
+}
+
+func TestAdmissionWaitRecordedSeparately(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		a, err := New(WithModel(mock.New("timing", func(*llm.Request) *llm.Response { return mock.Text("done") })))
+		if err != nil {
+			t.Fatal(err)
+		}
+		release, err := a.gate.acquire(context.Background(), "held", AdmissionFail, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := a.Stream(context.Background(), "hi", OnThread("held"), WithAdmission(AdmissionOptions{Policy: AdmissionQueue, MaxWaiters: 1}))
+		r.Start()
+		synctest.Wait()
+		before := r.rc.timing.Snapshot()
+		if before.StartRequestedAt.IsZero() || !before.AdmittedAt.IsZero() {
+			t.Fatalf("before admission=%+v", before)
+		}
+		timer := time.NewTimer(time.Second)
+		<-timer.C
+		release()
+		r.Await(context.Background())
+		after := r.rc.timing.Snapshot()
+		if after.AdmittedAt.Sub(after.StartRequestedAt) != time.Second || after.FirstModelResponseAt.IsZero() {
+			t.Fatalf("after admission=%+v", after)
+		}
+	})
+}
+
+type timingGatedModel struct{ entered, reply chan struct{} }
+
+func (*timingGatedModel) Name() string { return "gated" }
+func (m *timingGatedModel) Generate(context.Context, *llm.Request) iter.Seq2[*llm.Response, error] {
+	return func(yield func(*llm.Response, error) bool) {
+		close(m.entered)
+		<-m.reply
+		if !yield(nil, nil) {
+			return
+		}
+		if !yield(&llm.Response{Partial: true, Message: core.AssistantText("part")}, nil) {
+			return
+		}
+		yield(mock.Text("done"), nil)
+	}
+}
+func TestFirstResponseOnlyAfterModelReply(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		model := &timingGatedModel{entered: make(chan struct{}), reply: make(chan struct{})}
+		a, err := New(WithModel(model))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := a.Stream(context.Background(), "hi")
+		t.Cleanup(func() {
+			select {
+			case <-model.reply:
+			default:
+				close(model.reply)
+			}
+			r.Cancel()
+			r.Await(context.Background())
+		})
+		r.Start()
+		<-model.entered
+		before := r.rc.timing.Snapshot()
+		if !before.FirstModelResponseAt.IsZero() || before.AdmittedAt.IsZero() {
+			t.Fatalf("before=%+v", before)
+		}
+		timer := time.NewTimer(time.Second)
+		<-timer.C
+		close(model.reply)
+		if _, err := r.Await(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		after := r.rc.timing.Snapshot()
+		if after.FirstModelResponseAt.Sub(after.AdmittedAt) != time.Second {
+			t.Fatalf("after=%+v", after)
+		}
+	})
+}
+func TestPreparedCancelHasNoAdmissionTiming(t *testing.T) {
+	a, err := New(WithModel(mock.New("timing", nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := a.Stream(context.Background(), "hi")
+	r.Cancel()
+	times := r.rc.timing.Snapshot()
+	if !times.AdmittedAt.IsZero() || !times.FirstModelResponseAt.IsZero() {
+		t.Fatalf("unexecuted timing=%+v", times)
+	}
+}
+
+type timingResumeStore struct {
+	checkpoint.Checkpointer
+	entered, release chan struct{}
+}
+
+func (s *timingResumeStore) Latest(ctx context.Context, thread string) (*checkpoint.Checkpoint, error) {
+	close(s.entered)
+	<-s.release
+	return s.Checkpointer.Latest(ctx, thread)
+}
+func TestResumeTimingRetainsPreacquiredAdmission(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		memory := checkpoint.NewMemory()
+		memory.Save(context.Background(), &checkpoint.Checkpoint{ID: "pause", ThreadID: "resume-timing"})
+		store := &timingResumeStore{Checkpointer: memory, entered: make(chan struct{}), release: make(chan struct{})}
+		a := &Agent{bus: bus.New(), store: store, runnable: lifecycleRunnable(func(*RunContext) runOutcome { return runOutcome{} })}
+		acquiredAt := time.Now()
+		resumed := make(chan *Run, 1)
+		go func() {
+			r, err := a.Resume(context.Background(), "resume-timing")
+			if err != nil {
+				t.Error(err)
+			}
+			resumed <- r
+		}()
+		<-store.entered
+		timer := time.NewTimer(time.Second)
+		<-timer.C
+		close(store.release)
+		r := <-resumed
+		if r == nil {
+			t.Fatal("no resume handle")
+		}
+		before := r.rc.timing.Snapshot()
+		if !before.AdmittedAt.Equal(acquiredAt) || before.CreatedAt.Sub(acquiredAt) != time.Second {
+			t.Fatalf("resume=%+v", before)
+		}
+		r.Wait()
+		after := r.rc.timing.Snapshot()
+		if !after.AdmittedAt.Equal(acquiredAt) {
+			t.Fatalf("start replaced preacquired admission=%+v", after)
+		}
+	})
+}
+func TestWorkflowFirstResponseRecordedOnce(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	defer tp.Shutdown(context.Background())
+	ctx, root := tp.Tracer("test").Start(context.Background(), "caller")
+	worker, err := New(WithModel(mock.New("timing", func(*llm.Request) *llm.Response { return mock.Text("done") })))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := Sequential("workflow", worker, worker)
+	r := workflow.Stream(ctx, "hi")
+	if _, err := r.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	root.End()
+	n := 0
+	for _, ev := range sr.Ended()[0].Events() {
+		if ev.Name == "agent.run.first_model_response" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("first responses=%d", n)
 	}
 }
