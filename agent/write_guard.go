@@ -167,7 +167,9 @@ func (g *writeGuard) err() error {
 
 func (g *writeGuard) stopAndRelease(ctx context.Context) error {
 	g.stopOnce.Do(func() {
-		g.stopErr = g.stop(ctx)
+		cleanupCtx, cancel := newRunCleanupContext(ctx)
+		defer cancel()
+		g.stopErr = g.stop(cleanupCtx)
 	})
 	return g.stopErr
 }
@@ -203,12 +205,7 @@ func (g *writeGuard) stop(ctx context.Context) error {
 	claim := g.claim
 	g.mu.Unlock()
 
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeGuardReleaseTimeout)
-	err := g.store.ReleaseClaim(releaseCtx, claim)
-	cancel()
+	err := g.store.ReleaseClaim(ctx, claim)
 	if err != nil {
 		g.recordError(err)
 	}

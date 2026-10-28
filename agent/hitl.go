@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jiujuan/goagent/checkpoint"
@@ -120,6 +121,14 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		claim            *checkpoint.Claim
 		durableDecisions []core.ApprovalDecision
 	)
+	release := func() error {
+		if claim == nil {
+			return nil
+		}
+		cleanupCtx, cancel := newRunCleanupContext(ctx)
+		defer cancel()
+		return durable.ReleaseClaim(cleanupCtx, *claim)
+	}
 	if store, ok := a.store.(checkpoint.Durable); ok {
 		durable = store
 		claimed, err := durable.Claim(ctx, checkpoint.ClaimRequest{
@@ -135,30 +144,20 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		claim = &claimed
 		durableDecisions, err = durable.Decisions(ctx, threadID, claimed.PauseID)
 		if err != nil {
-			_ = durable.ReleaseClaim(context.Background(), claimed)
-			return nil, err
+			return nil, errors.Join(err, release())
 		}
 	}
 	durableApprovals, err := approvalsFromDurable(cp, durableDecisions)
 	if err != nil {
-		if claim != nil {
-			_ = durable.ReleaseClaim(context.Background(), *claim)
-		}
-		return nil, err
+		return nil, errors.Join(err, release())
 	}
 	allApprovals := append(durableApprovals, approvals...)
 	state, err := cloneState(cp.State)
 	if err != nil {
-		if claim != nil {
-			_ = durable.ReleaseClaim(context.Background(), *claim)
-		}
-		return nil, err
+		return nil, errors.Join(err, release())
 	}
 	if err := applyFileSnapshot(&state, cp.FileSnapshot); err != nil {
-		if claim != nil {
-			_ = durable.ReleaseClaim(context.Background(), *claim)
-		}
-		return nil, err
+		return nil, errors.Join(err, release())
 	}
 	if state.Files == nil {
 		state.Files = vfs.NewInState()
@@ -270,15 +269,19 @@ func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, a
 		return nil, err
 	}
 	claim := &claimed
-	release := func() { _ = durable.ReleaseClaim(context.Background(), *claim) }
+	release := func() error {
+		cleanupCtx, cancel := newRunCleanupContext(ctx)
+		defer cancel()
+		return durable.ReleaseClaim(cleanupCtx, *claim)
+	}
 	state, err := cloneState(cp.State)
 	if err != nil {
-		release()
+		err = errors.Join(err, release())
 		releaseGate()
 		return nil, err
 	}
 	if err := applyFileSnapshot(&state, cp.FileSnapshot); err != nil {
-		release()
+		err = errors.Join(err, release())
 		releaseGate()
 		return nil, err
 	}
@@ -289,7 +292,7 @@ func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, a
 	// issued it is matched there rather than in the preflight copy.
 	final, err := matchInFlightMessage(state.Messages, batch.calls)
 	if err != nil {
-		release()
+		err = errors.Join(err, release())
 		releaseGate()
 		return nil, err
 	}

@@ -332,15 +332,15 @@ func (r *Run) Wait() (core.Result, error) {
 
 **依赖：** T04。**文件：** 修改 `agent/durable_runtime.go`、`agent/write_guard.go`、`agent/hitl.go`；新增 `agent/run_cleanup.go`、`agent/run_cleanup_internal_test.go`。
 
-- [ ] 测试：`TestGuardedReleaseUsesExistingTimeout`、`TestUnguardedReleaseUsesCleanupTimeout`、`TestCanceledCleanupStillReleasesClaim`、`TestCleanupWaitsForRenewalBeforeRelease`、`TestCleanupFailureIncludedInFrozenOutcome`、`TestResumeConstructionFailureUsesBoundedCleanup`、`TestResumeInFlightConstructionFailureUsesBoundedCleanup`。
-- [ ] 重用 `agent/write_guard.go` 已存在的 `writeGuardReleaseTimeout = 5 * time.Second`，不要创建第二套不一致常量。用 `context.WithoutCancel(parent)` 保留 context values，随后建立 5s deadline；不得在 deadline 上再 `WithoutCancel` 丢掉期限。
-- [ ] guarded 分支保留先停止 renewal、等待 renewDone、再在有界 context 下 ReleaseClaim 的顺序。只有 store/context 合作时 5s 才是严格上界；明确忽略 deadline 的 store 不在抢占承诺内。
-- [ ] 无 guard 但仍持有 claim 的 Resume/prepare failure 路径也使用同一有界 context，不能在 parent 已取消时退化为无限期 Background。
-- [ ] 补齐 hitl.go 中所有直接 `ReleaseClaim(context.Background(), ...)`：普通 Resume 的 Decisions/审批校验/cloneState/文件恢复失败，以及 resumeInFlight 的 release 闭包。统一使用 newRunCleanupContext；构造失败返回 errors.Join(原错误, releaseErr)，先等待 claim 释放尝试结束再放 gate，不能因为不返回 Run 就绕过清理期限。
-- [ ] 每条调用链只创建一次清理 context：guard.stopAndRelease 建立 helper 后传给 stop；stop 直接使用该 context，不再 WithoutCancel；无 guard 与工厂本地清理各在入口创建 helper。测试验证传到 ReleaseClaim 的 deadline 未被第二层重置。
-- [ ] 测试不得为缩短生产清理时间而暴露运行时公共参数；用 store spy 检查实际传入 deadline 和调用顺序，测试外部超时只作保护。
-- [ ] 执行 `go test ./agent -run 'Test(GuardedRelease|UnguardedRelease|CanceledCleanup|CleanupWaits|CleanupFailure|ResumeConstructionFailure|ResumeInFlightConstructionFailure|WriteGuard|ResumeCancel)' -count=1 -timeout=90s` 和 `go test -race ./agent -run 'Test(GuardedRelease|UnguardedRelease|CleanupWaits|ResumeConstructionFailure|ResumeInFlightConstructionFailure|WriteGuard|ResumeCancel)' -count=20 -timeout=180s`。
-- [ ] 生成提交候选：`fix(agent): bound durable claim cleanup after cancellation`。
+- [x] 测试：`TestGuardedReleaseUsesExistingTimeout`、`TestUnguardedReleaseUsesCleanupTimeout`、`TestCanceledCleanupStillReleasesClaim`、`TestCleanupWaitsForRenewalBeforeRelease`、`TestCleanupFailureIncludedInFrozenOutcome`、`TestResumeConstructionFailureUsesBoundedCleanup`、`TestResumeInFlightConstructionFailureUsesBoundedCleanup`。
+- [x] 重用 `agent/write_guard.go` 已存在的 `writeGuardReleaseTimeout = 5 * time.Second`，不要创建第二套不一致常量。用 `context.WithoutCancel(parent)` 保留 context values，随后建立 5s deadline；不得在 deadline 上再 `WithoutCancel` 丢掉期限。
+- [x] guarded 分支保留先停止 renewal、等待 renewDone、再在有界 context 下 ReleaseClaim 的顺序。只有 store/context 合作时 5s 才是严格上界；明确忽略 deadline 的 store 不在抢占承诺内。
+- [x] 无 guard 但仍持有 claim 的 Resume/prepare failure 路径也使用同一有界 context，不能在 parent 已取消时退化为无限期 Background。
+- [x] 补齐 hitl.go 中所有直接 `ReleaseClaim(context.Background(), ...)`：普通 Resume 的 Decisions/审批校验/cloneState/文件恢复失败，以及 resumeInFlight 的 release 闭包。统一使用 newRunCleanupContext；构造失败返回 errors.Join(原错误, releaseErr)，先等待 claim 释放尝试结束再放 gate，不能因为不返回 Run 就绕过清理期限。
+- [x] 每条调用链只创建一次清理 context：guard.stopAndRelease 建立 helper 后传给 stop；stop 直接使用该 context，不再 WithoutCancel；无 guard 与工厂本地清理各在入口创建 helper。测试验证传到 ReleaseClaim 的 deadline 未被第二层重置。
+- [x] 测试不得为缩短生产清理时间而暴露运行时公共参数；用 store spy 检查实际传入 deadline 和调用顺序，测试外部超时只作保护。
+- [x] 执行 `go test ./agent -run 'Test(GuardedRelease|UnguardedRelease|CanceledCleanup|CleanupWaits|CleanupFailure|ResumeConstructionFailure|ResumeInFlightConstructionFailure|WriteGuard|ResumeCancel)' -count=1 -timeout=90s` 和 `go test -race ./agent -run 'Test(GuardedRelease|UnguardedRelease|CleanupWaits|ResumeConstructionFailure|ResumeInFlightConstructionFailure|WriteGuard|ResumeCancel)' -count=20 -timeout=180s`。
+- [x] 生成提交候选：`fix(agent): bound durable claim cleanup after cancellation`。
 
 **DoD：** guarded、unguarded 及无句柄返回的 Resume 构造失败均使用相同有限期限；续租停止先于 release；失败出现在结局中；没有超越已存在 5 秒上限的隐藏无界等待。
 
@@ -609,3 +609,5 @@ T03 整包回归发现原 `TestPlanParentCancelReturnsContextError` 和 `TestRun
 
 | 2026-10-28，T06 | Start/Await八项定向及race20轮；agent全包-json 14.987s；queue全包5.471s | 通过；并发100等待者不订阅，waitCtx不取消执行，done优先 |
 | 2026-10-28，M2独立审核 | outcome/observation/RunFinisher/审批幂等/queue定向race | 规格及质量通过，无未解决finding；范围eaac602..04f7b7c |
+
+| 2026-10-28，T07 | 七组清理用例红→绿；父执行者重跑定向及race20轮 | 通过；有/无guard、Resume五处失败路径统一5s，保留values，释放失败Join，renewDone先于ReleaseClaim |

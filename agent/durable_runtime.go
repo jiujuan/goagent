@@ -472,10 +472,8 @@ func (rc *RunContext) releaseDurableClaim() error {
 	if claim == nil {
 		return nil
 	}
-	ctx := rc.Context
-	if ctx == nil || ctx.Err() != nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := newRunCleanupContext(rc.Context)
+	defer cancel()
 	if err := durable.ReleaseClaim(ctx, *claim); err != nil {
 		return err
 	}
