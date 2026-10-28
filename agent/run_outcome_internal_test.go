@@ -169,3 +169,41 @@ func TestPrepareFailureReleasesClaimBeforeAdmission(t *testing.T) {
 		}
 	})
 }
+
+func TestCleanupFailureTurnsPauseTaskIntoFailure(t *testing.T) {
+	releaseErr := errors.New("claim cleanup failed")
+	r := outcomeFixture(runOutcome{Control: core.Directive{Kind: core.Interrupt}})
+	store := &guardTestCoordinator{ThreadCoordinator: checkpoint.NewMemory(), releaseFn: func(context.Context, checkpoint.Claim) error { return releaseErr }}
+	r.rc.Store = store
+	r.agent.store = store
+	claim := guardTestClaim(1)
+	r.rc.setDurableClaim(&claim)
+	ch, stop := r.Events(bus.Lossless)
+	defer stop()
+	if _, err := r.Wait(); !errors.Is(err, releaseErr) {
+		t.Fatal(err)
+	}
+	if r.Paused() {
+		t.Fatal("cleanup failure retained pause outcome")
+	}
+	tasks, failures := 0, 0
+	for ev := range ch {
+		switch value := ev.(type) {
+		case core.TaskDone:
+			tasks++
+			if value.Status != "failed" || !errors.Is(value.Err, releaseErr) {
+				t.Fatalf("task=%+v", value)
+			}
+		case core.RunFailed:
+			failures++
+			if !errors.Is(value.Err, releaseErr) {
+				t.Fatal(value.Err)
+			}
+		case core.Interrupted:
+			t.Fatal("failed pause emitted Interrupted")
+		}
+	}
+	if tasks != 1 || failures != 1 {
+		t.Fatalf("tasks=%d failures=%d", tasks, failures)
+	}
+}

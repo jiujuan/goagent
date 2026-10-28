@@ -71,6 +71,9 @@ func (r *Run) terminalTail(out runOutcome, res core.Result, err error, paused, r
 		task := r.rc.taskInfo()
 		statusOut := out
 		statusOut.Err = err
+		if err != nil {
+			statusOut.Control = core.Directive{}
+		}
 		if paused {
 			statusOut.Control = core.Directive{Kind: core.Interrupt}
 		}

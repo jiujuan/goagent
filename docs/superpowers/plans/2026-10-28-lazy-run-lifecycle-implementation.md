@@ -406,12 +406,12 @@ h.recordCompletion = func(ctx context.Context, run *agent.Run) error {
 
 **依赖：** T10、T09。**文件：** `agent/run_integration_internal_test.go`、`agent/run_observation_internal_test.go`、`queue/agent_ownership_test.go`、`queue/agent_bridge_test.go`、`queue/agent_terminal_test.go`。
 
-- [ ] 用障碍矩阵明确“普通发送已登记、FinishTopic 已摘除、tailDone 已安装、订阅已 cancel、Run 已 Settling、外部 cleanup 仍阻塞、done 已关闭、worker 正记录”的屏障；逐一建立两种锁获胜次序，不以概率循环代替确定性屏障。
-- [ ] 完整场景：满 Lossless + 取消；普通 send/FinishTopic/unsubscribe 三方竞争；Wait 无消费者且 run 完成；Wait 已返回但慢观察者仍未收到尾部；活动晚订阅只收后续与尾部；Lossy 收尾；Iter 提前 break；子 TaskDone 满缓冲后运行取消；所有公开工厂 parent deadline；queue waiter 与 worker 并发；未消费 job Cancel/Wait/WaitRecorded。
-- [ ] 覆盖结果隔离：Wait 调用方、FrozenOutcome、DetailedResult、多个 late Iter、多个 Events、多个 FinishRun hook、队列 WaitRecorded 各持有可变结果时，互相修改不影响其他副本或已冻结 boundary。
-- [ ] 覆盖持久化边界：无 worker 的 canceled Prepared Handle.Wait 可结束但 WaitRecorded 仍等 worker；worker 后续不得凭空生成提交边界，保留 `ErrNoCommittedBoundary`；取消已请求但 settlement 尚未完成时，私有入口计数器观测到 RecordCompletion 调用数为 0，worker 只能在 settlement 后决定是否记录。
-- [ ] 执行 `go test ./bus ./agent ./queue -count=1 -timeout=240s` 和 `go test -race ./bus ./agent ./queue -count=1 -timeout=10m`；新竞争用例另执行 `go test -race ./bus ./agent ./queue -run 'Test(PublishContext|Unsubscribe|FinishTopic|SubscribeAndSeal|StartCancelRace|ConcurrentPrepared|AfterFunc|ConcurrentContextCancel|HandleWait|CanceledRunIsNotRecorded)' -count=20 -timeout=240s`。race 环境不可用时本任务 DoD 不成立，移交支持 race 的环境取得证据后再关闭。
-- [ ] 独立审核者按测试场景与同步协议做一次只读 adversarial review；只提交确切可复现的缺陷报告。修复每项 findings 后重跑对应 race 用例，并复核 fix。
+- [x] 用障碍矩阵明确“普通发送已登记、FinishTopic 已摘除、tailDone 已安装、订阅已 cancel、Run 已 Settling、外部 cleanup 仍阻塞、done 已关闭、worker 正记录”的屏障；逐一建立两种锁获胜次序，不以概率循环代替确定性屏障。
+- [x] 完整场景：满 Lossless + 取消；普通 send/FinishTopic/unsubscribe 三方竞争；Wait 无消费者且 run 完成；Wait 已返回但慢观察者仍未收到尾部；活动晚订阅只收后续与尾部；Lossy 收尾；Iter 提前 break；子 TaskDone 满缓冲后运行取消；所有公开工厂 parent deadline；queue waiter 与 worker 并发；未消费 job Cancel/Wait/WaitRecorded。
+- [x] 覆盖结果隔离：Wait 调用方、FrozenOutcome、DetailedResult、多个 late Iter、多个 Events、多个 FinishRun hook、队列 WaitRecorded 各持有可变结果时，互相修改不影响其他副本或已冻结 boundary。
+- [x] 覆盖持久化边界：无 worker 的 canceled Prepared Handle.Wait 可结束但 WaitRecorded 仍等 worker；worker 后续不得凭空生成提交边界，保留 `ErrNoCommittedBoundary`；取消已请求但 settlement 尚未完成时，私有入口计数器观测到 RecordCompletion 调用数为 0，worker 只能在 settlement 后决定是否记录。
+- [x] 执行 `go test ./bus ./agent ./queue -count=1 -timeout=240s` 和 `go test -race ./bus ./agent ./queue -count=1 -timeout=10m`；新竞争用例另执行 `go test -race ./bus ./agent ./queue -run 'Test(PublishContext|Unsubscribe|FinishTopic|SubscribeAndSeal|StartCancelRace|ConcurrentPrepared|AfterFunc|ConcurrentContextCancel|HandleWait|CanceledRunIsNotRecorded)' -count=20 -timeout=240s`。race 环境不可用时本任务 DoD 不成立，移交支持 race 的环境取得证据后再关闭。
+- [x] 独立审核者按测试场景与同步协议做一次只读 adversarial review；只提交确切可复现的缺陷报告。修复每项 findings 后重跑对应 race 用例，并复核 fix。
 
 **DoD：** 七项优先级和四条设计复核修订均映射到通过的自动化用例；race detector 无报告；每条 waiter/send/finisher/callback 都有可观测退出屏障；未把外部忽略 context 的行为纳入保证。
 
@@ -620,3 +620,7 @@ T03 整包回归发现原 `TestPlanParentCancelReturnsContextError` 和 `TestRun
 
 | 2026-10-28，T10/M3 | 无worker旧Wait执行模型红灯；queue七项定向、queue整包、ownership race20轮；三包普通/race全量 | 通过；192waiters受3worker限额，cleanup屏障前记录入口/Commit均0、放行后各1 |
 | 2026-10-28，T07-T09独立审核 | 清理、唯一owner、六工厂激活、stop=false callback屏障，定向race20/30轮 | 通过，无未解决finding |
+
+| 2026-10-28，T11/M4 | go test ./bus ./agent ./queue -count=1 -timeout=240s；三包race全量一次；计划新竞争模式race20轮 | 全通过；含callback等done、Lossy可靠tail、100并发可变读副本、hook/Wait修改不污染RecordCompletion |
+| 2026-10-28，T11修复 | TestCleanupFailureTurnsPauseTaskIntoFailure 红→绿及race20轮 | 释放失败时清除旧Interrupt，TaskDone/RunFailed各1、Err一致、无Interrupted |
+| 2026-10-28，T10/T11独立审核 | worker入口/cleanup屏障/并发上限/终态一致性与跨层退出定向race20轮 | 通过，无未解决finding；M4 P0/P1完成 |

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"testing/synctest"
 
@@ -174,4 +175,135 @@ func TestApprovalReceiptSurvivesObserverCancellation(t *testing.T) {
 			t.Fatalf("approval caller error = %v, want context.Canceled", ctx.Err())
 		}
 	})
+}
+
+func TestAfterFuncAlreadyRunningDoesNotBlockSettlement(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := outcomeFixture(runOutcome{})
+		callbackEntered := make(chan struct{})
+		callbackDone := make(chan struct{})
+		r.lifecycleMu.Lock()
+		r.activated = true
+		r.stopParent = context.AfterFunc(r.rc.Context, func() { close(callbackEntered); r.Cancel(); close(callbackDone) })
+		r.lifecycleMu.Unlock()
+		cleanupEntered := make(chan struct{})
+		release := make(chan struct{})
+		store := &guardTestCoordinator{ThreadCoordinator: checkpoint.NewMemory(), releaseFn: func(context.Context, checkpoint.Claim) error { close(cleanupEntered); <-release; return nil }}
+		r.rc.Store = store
+		r.agent.store = store
+		claim := guardTestClaim(1)
+		r.rc.setDurableClaim(&claim)
+		returned := make(chan struct{})
+		go func() { r.Cancel(); close(returned) }()
+		<-cleanupEntered
+		<-callbackEntered
+		synctest.Wait()
+		select {
+		case <-callbackDone:
+			t.Fatal("prepared callback returned before settlement")
+		default:
+		}
+		close(release)
+		<-returned
+		<-callbackDone
+		select {
+		case <-r.done:
+		default:
+			t.Fatal("settlement did not publish done")
+		}
+	})
+}
+
+func TestLossyObserverReceivesReliableRunTail(t *testing.T) {
+	r := outcomeFixture(runOutcome{Result: core.Result{Message: core.AssistantText("done")}})
+	r.bus = bus.New(bus.WithBufferSize(1))
+	r.rc.Bus = r.bus
+	ch, stop := r.Events(bus.Lossy)
+	defer stop()
+	r.Wait()
+	events := []core.Event{}
+	for ev := range ch {
+		events = append(events, ev)
+	}
+	if len(events) != 3 {
+		t.Fatalf("events=%d", len(events))
+	}
+	if _, ok := events[0].(core.RunStarted); !ok {
+		t.Fatal("missing buffered progress")
+	}
+	if _, ok := events[1].(core.TaskDone); !ok {
+		t.Fatal("missing root tail")
+	}
+	if _, ok := events[2].(core.RunDone); !ok {
+		t.Fatal("missing success tail")
+	}
+}
+
+func TestConcurrentTerminalReadersOwnPayloads(t *testing.T) {
+	r := outcomeFixture(runOutcome{Result: core.Result{Message: core.Message{Parts: []core.Part{core.ToolResult{Content: []core.Part{core.Image{Data: []byte{1}}}}}}}})
+	r.Wait()
+	var wg sync.WaitGroup
+	for i := range 100 {
+		wg.Go(func() {
+			var result core.Result
+			switch i % 5 {
+			case 0:
+				result, _ = r.Wait()
+			case 1:
+				result, _ = r.FrozenOutcome()
+			case 2:
+				result = r.DetailedResult().Result
+			case 3:
+				for ev := range r.Iter() {
+					if done, ok := ev.(core.RunDone); ok {
+						result = done.Result
+					}
+				}
+			case 4:
+				ch, stop := r.Events(bus.Lossless)
+				defer stop()
+				for ev := range ch {
+					if done, ok := ev.(core.RunDone); ok {
+						result = done.Result
+					}
+				}
+			}
+			data := result.Message.Parts[0].(core.ToolResult).Content[0].(core.Image).Data
+			if data[0] != 1 {
+				t.Errorf("reader received mutated payload=%d", data[0])
+			}
+			data[0] = byte(i + 2)
+		})
+	}
+	wg.Wait()
+	frozen, _ := r.FrozenOutcome()
+	if frozen.Message.Parts[0].(core.ToolResult).Content[0].(core.Image).Data[0] != 1 {
+		t.Fatal("readers changed frozen outcome")
+	}
+}
+
+func TestHookAndWaitEditsDoNotChangeCompletionRecord(t *testing.T) {
+	message := core.Message{Role: core.RoleAssistant, Parts: []core.Part{core.Image{Data: []byte{1}}}}
+	hook := &lifecycleFinisher{fn: func(_ *RunContext, result core.Result, _ error) { result.Message.Parts[0].(core.Image).Data[0] = 9 }}
+	r := outcomeFixture(runOutcome{}, hook)
+	r.runnable = lifecycleRunnable(func(rc *RunContext) runOutcome {
+		rc.State.Messages = []core.Message{message}
+		err := rc.commitCheckpoint(&checkpoint.Checkpoint{ID: "hook-boundary", ThreadID: r.identity.threadID, State: *rc.State}, false)
+		return runOutcome{Result: core.Result{Message: message}, Err: err}
+	})
+	result, err := r.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Message.Parts[0].(core.Image).Data[0] = 8
+	if err := r.agent.RecordCompletion(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	head, err := r.agent.store.Latest(context.Background(), r.identity.threadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head.Completion == nil || head.Completion.Result == nil || head.Completion.Result.Message.Parts[0].(core.Image).Data[0] != 1 {
+		t.Fatalf("completion=%+v", head.Completion)
+	}
 }
