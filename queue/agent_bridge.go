@@ -76,10 +76,11 @@ func (h *Handle) WaitRecorded() (core.Result, error) {
 
 	// Waiters must not share mutable parts: one caller editing the result cannot
 	// reach another's copy.
-	if cloned, cloneErr := core.CloneMessage(res.Message); cloneErr == nil {
-		res = core.Result{Message: cloned}
+	cloned, cloneErr := core.CloneMessage(res.Message)
+	if cloneErr != nil {
+		return core.Result{}, errors.Join(err, cloneErr)
 	}
-	return res, err
+	return core.Result{Message: cloned}, err
 }
 
 // Events subscribes to the run's live events (e.g. bus.Lossy for a UI).

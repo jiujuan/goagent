@@ -11,6 +11,7 @@ import (
 
 	"github.com/jiujuan/goagent/agent"
 	"github.com/jiujuan/goagent/checkpoint"
+	"github.com/jiujuan/goagent/core"
 	"github.com/jiujuan/goagent/llm"
 	"github.com/jiujuan/goagent/llm/mock"
 )
@@ -425,4 +426,17 @@ func TestCanceledRunIsNotRecordedBeforeSettlement(t *testing.T) {
 			t.Fatalf("terminal record inherited execution cancellation: %v", recordCtxErr)
 		}
 	})
+}
+
+func TestHandleWaitRecordedCloneFailureNeverSharesResult(t *testing.T) {
+	originalErr := errors.New("record failed")
+	h := &Handle{settle: make(chan struct{})}
+	h.recordSettled(core.Result{Message: core.Message{Parts: []core.Part{&core.Image{Data: []byte{1}}}}}, originalErr)
+	result, err := h.WaitRecorded()
+	if !errors.Is(err, originalErr) || !errors.Is(err, core.ErrStateNotCloneable) {
+		t.Fatalf("error=%v", err)
+	}
+	if len(result.Message.Parts) != 0 {
+		t.Fatal("uncopyable result escaped to a waiter")
+	}
 }
