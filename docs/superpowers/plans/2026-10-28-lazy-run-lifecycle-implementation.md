@@ -348,14 +348,14 @@ func (r *Run) Wait() (core.Result, error) {
 
 **依赖：** T06、T07。**文件：** 修改 `agent/run.go`；新增 `agent/run_lifecycle.go`、`agent/run_lifecycle_internal_test.go`。
 
-- [ ] 测试：`TestPreparedCancelSettlesWithoutStarting`、`TestConcurrentPreparedCancelHasSingleOwner`、`TestStartCancelRaceHasOneOwner`、`TestStartedCancelAwaitsExternalExit`、`TestCancelClosesSteeringOnce`、`TestUnstartedCancelHasNoTaskOrStartedEvent`、`TestPreparedCancelReleasesClaimBeforeGate`。
-- [ ] 将 `startOnce`/`driveStarted` 替换为单一阶段 `Prepared → Starting → Running → Settling → Settled`。Start 与 Cancel 都在 lifecycleMu 下竞争；赢得 Prepared→Starting 者持有唯一启动权；Prepared Cancel 赢得 Prepared→Settling 者持有唯一同步结算权。
-- [ ] 锁内只转阶段、摘取资源引用、关闭内部一次性信号和发布取消请求；RunContext cancel、store I/O、等待、hook、订阅收尾全部在锁外。并发 Prepared Cancel 调用者等 done，但结算者必须先 close(done)，不能等待正在等 done 的 cancellation callback。
-- [ ] Prepared Cancel 同步完成清理尝试和冻结内存 outcome 后返回；成功取消只代表清理尝试结束，不代表外部 store 一定释放成功。它不启动 runnable、不发布 RunStarted/TaskStarted/TaskDone；只有 RunFailed 迟到尾部。
-- [ ] Started Cancel 只请求 run context/steering 取消，不承诺非合作 runnable 已停；Await 等唯一执行者执行 cleanup 和结算。重复 Cancel 不重复 release/close。
-- [ ] 确认恢复 Resume 提前拥有的 claim 即使 Start 尚未发生也归 Run 的结算 owner；资源只能由 owner 移交/清理一次。
-- [ ] 执行 `go test ./agent -run 'Test(PreparedCancel|ConcurrentPrepared|StartCancelRace|StartedCancel|CancelCloses|UnstartedCancel)' -count=1 -timeout=90s`，再执行 `go test ./agent ./queue -count=1 -timeout=150s`。
-- [ ] 生成提交候选：`feat(agent): settle prepared run cancellation exactly once`。
+- [x] 测试：`TestPreparedCancelSettlesWithoutStarting`、`TestConcurrentPreparedCancelHasSingleOwner`、`TestStartCancelRaceHasOneOwner`、`TestStartedCancelAwaitsExternalExit`、`TestCancelClosesSteeringOnce`、`TestUnstartedCancelHasNoTaskOrStartedEvent`、`TestPreparedCancelReleasesClaimBeforeGate`。
+- [x] 将 `startOnce`/`driveStarted` 替换为单一阶段 `Prepared → Starting → Running → Settling → Settled`。Start 与 Cancel 都在 lifecycleMu 下竞争；赢得 Prepared→Starting 者持有唯一启动权；Prepared Cancel 赢得 Prepared→Settling 者持有唯一同步结算权。
+- [x] 锁内只转阶段、摘取资源引用、关闭内部一次性信号和发布取消请求；RunContext cancel、store I/O、等待、hook、订阅收尾全部在锁外。并发 Prepared Cancel 调用者等 done，但结算者必须先 close(done)，不能等待正在等 done 的 cancellation callback。
+- [x] Prepared Cancel 同步完成清理尝试和冻结内存 outcome 后返回；成功取消只代表清理尝试结束，不代表外部 store 一定释放成功。它不启动 runnable、不发布 RunStarted/TaskStarted/TaskDone；只有 RunFailed 迟到尾部。
+- [x] Started Cancel 只请求 run context/steering 取消，不承诺非合作 runnable 已停；Await 等唯一执行者执行 cleanup 和结算。重复 Cancel 不重复 release/close。
+- [x] 确认恢复 Resume 提前拥有的 claim 即使 Start 尚未发生也归 Run 的结算 owner；资源只能由 owner 移交/清理一次。
+- [x] 执行 `go test ./agent -run 'Test(PreparedCancel|ConcurrentPrepared|StartCancelRace|StartedCancel|CancelCloses|UnstartedCancel)' -count=1 -timeout=90s`，再执行 `go test ./agent ./queue -count=1 -timeout=150s`。
+- [x] 生成提交候选：`feat(agent): settle prepared run cancellation exactly once`。
 
 **DoD：** 所有入口共享阶段锁和唯一 owner；Started Cancel 等执行器收尾；Prepared Cancel 完整结束且可 Await；没有重复 cleanup/hook/tail/done；无伪造 task lifecycle。
 
@@ -611,3 +611,6 @@ T03 整包回归发现原 `TestPlanParentCancelReturnsContextError` 和 `TestRun
 | 2026-10-28，M2独立审核 | outcome/observation/RunFinisher/审批幂等/queue定向race | 规格及质量通过，无未解决finding；范围eaac602..04f7b7c |
 
 | 2026-10-28，T07 | 七组清理用例红→绿；父执行者重跑定向及race20轮 | 通过；有/无guard、Resume五处失败路径统一5s，保留values，释放失败Join，renewDone先于ReleaseClaim |
+
+| 2026-10-28，T08 | Prepared Cancel 原实现不能关闭done的红灯；状态机七项绿灯；agent/queue全包；生命周期race20轮 | 通过；Prepared Cancel同步清理且并发调用等done，Started Cancel等实际执行者，claim先于gate |
+| 2026-10-28，M1独立审核 | eaac602及取消即时诊断兼容修正，bus/agent定向race30轮 | 通过，无未解决finding |

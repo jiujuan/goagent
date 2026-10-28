@@ -47,6 +47,7 @@ func (r *Run) prepareOutcomeCopies(res core.Result, hooksEligible bool) (core.Re
 // settleExecution belongs exclusively to the producer (or the prepared cancel
 // owner). Resource I/O, hooks and observation delivery never hold Run locks.
 func (r *Run) settleExecution(out runOutcome, rootStarted, hooksEligible bool) {
+	r.beginSettlement()
 	r.rc.steering.close(out.inputCloseReason())
 	boundaryID, boundaryRev, boundaryOK := r.rc.committedBoundary()
 	cleanupErr := r.rc.releaseDurableClaim()
@@ -61,7 +62,7 @@ func (r *Run) settleExecution(out runOutcome, rootStarted, hooksEligible bool) {
 	r.freezeTerminal(boundaryID, boundaryRev, boundaryOK, frozen, err, paused)
 	r.agent.finishRun(r.rc, calls, err)
 	r.sealEvents(tail)
-	close(r.done)
+	r.completeSettlement()
 }
 
 func (r *Run) terminalTail(out runOutcome, res core.Result, err error, paused, rootStarted bool) []core.Event {

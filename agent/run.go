@@ -52,8 +52,7 @@ type Run struct {
 	// was created; prepare reads it before touching the thread.
 	admission AdmissionOptions
 
-	startOnce sync.Once
-	done      chan struct{}
+	done chan struct{}
 
 	mu        sync.Mutex
 	decisions []Approval
@@ -62,9 +61,9 @@ type Run struct {
 	eventsSealed  bool
 	eventTail     []core.Event
 
-	lifecycleMu  sync.Mutex
-	driveStarted bool
-	cancelErr    error
+	lifecycleMu        sync.Mutex
+	phase              runPhase
+	preparedSettlement bool
 	// gateRelease frees the thread slot this run holds. It is nil until
 	// prepare acquires the slot (or a resume hands one over); lifecycleMu
 	// guards it.
@@ -122,7 +121,16 @@ func (r *Run) Events(mode bus.DeliveryMode) (<-chan core.Event, func()) {
 
 // Start requests execution once and returns without waiting for it. It does
 // not subscribe; register Events first when the initial events matter.
-func (r *Run) Start() { r.drive() }
+func (r *Run) Start() {
+	r.lifecycleMu.Lock()
+	if r.phase != runPrepared {
+		r.lifecycleMu.Unlock()
+		return
+	}
+	r.phase = runStarting
+	r.lifecycleMu.Unlock()
+	go r.execute()
+}
 
 // Await waits for settlement without starting or canceling the run. Canceling
 // waitCtx only stops this waiter. A settled result takes precedence when both
@@ -170,25 +178,6 @@ func (r *Run) SteerWith(msg core.Message, opts SteerOptions) (*SteerTicket, erro
 // prepare resolves it, so it may be empty before the run is driven.
 func (r *Run) Task() TaskInfo { return r.rc.taskInfo() }
 
-// Cancel aborts the run. A Resume owns a durable claim before lazy execution
-// starts, so canceling that prepared handle releases the claim synchronously.
-// The steering queue closes in the same call, so a message that will never be
-// delivered settles as stopped instead of waiting for the run to wind down.
-func (r *Run) Cancel() {
-	r.lifecycleMu.Lock()
-	r.cancel()
-	r.rc.steering.close(ErrRunStopped)
-	undriven := !r.driveStarted
-	if undriven {
-		r.cancelErr = errors.Join(r.cancelErr, r.rc.releaseDurableClaim())
-	}
-	r.lifecycleMu.Unlock()
-	if undriven {
-		// A prepared resume may hold the thread slot before its first drive.
-		r.releaseAdmission()
-	}
-}
-
 // Paused reports whether this run ended by pausing for a human decision instead
 // of finishing. It reads the outcome drive() froze, not the store: while the run
 // is still going (or before anything has driven it) it reports false, so the
@@ -218,31 +207,26 @@ func (r *Run) FrozenOutcome() (core.Result, error) {
 	return out, r.terminalErr
 }
 
-// drive launches the execution owner once. Observers never settle a run.
-func (r *Run) drive() {
-	r.startOnce.Do(func() {
-		r.lifecycleMu.Lock()
-		r.driveStarted = true
-		r.lifecycleMu.Unlock()
-		go func() {
-			r.rc.publish(core.RunStarted{RunID: r.identity.runID, ThreadID: r.identity.threadID})
-			if r.startErr != nil {
-				r.settleExecution(runOutcome{Err: r.startErr}, false, false)
-				return
-			}
-			if err := r.prepare(); err != nil {
-				r.lifecycleMu.Lock()
-				cancelErr := r.cancelErr
-				r.lifecycleMu.Unlock()
-				r.settleExecution(runOutcome{Err: errors.Join(err, cancelErr)}, false, false)
-				return
-			}
-			task := r.rc.taskInfo()
-			r.rc.publish(core.TaskStarted{TaskID: task.ID, ParentID: task.ParentID, ThreadID: task.ThreadID, Kind: string(task.Kind), Depth: task.Depth})
-			for _, ev := range r.rc.drainApprovalEvents() {
-				r.rc.publish(ev)
-			}
-			r.settleExecution(r.runnable.run(r.rc), true, true)
-		}()
-	})
+// drive remains an internal alias for fixtures and legacy package helpers.
+func (r *Run) drive() { r.Start() }
+
+func (r *Run) execute() {
+	r.rc.publish(core.RunStarted{RunID: r.identity.runID, ThreadID: r.identity.threadID})
+	if r.startErr != nil {
+		r.settleExecution(runOutcome{Err: r.startErr}, false, false)
+		return
+	}
+	if err := r.prepare(); err != nil {
+		r.settleExecution(runOutcome{Err: err}, false, false)
+		return
+	}
+	r.lifecycleMu.Lock()
+	r.phase = runRunning
+	r.lifecycleMu.Unlock()
+	task := r.rc.taskInfo()
+	r.rc.publish(core.TaskStarted{TaskID: task.ID, ParentID: task.ParentID, ThreadID: task.ThreadID, Kind: string(task.Kind), Depth: task.Depth})
+	for _, ev := range r.rc.drainApprovalEvents() {
+		r.rc.publish(ev)
+	}
+	r.settleExecution(r.runnable.run(r.rc), true, true)
 }
