@@ -12,10 +12,10 @@
 
 ## 1. 依据、范围与执行约束
 
-- 日期：2026-10-28；计划状态：Implementing；执行分支 `fix/lazy-run-lifecycle-7Ps`（用户指定）。
-- 唯一实施规格：[惰性 Run 生命周期设计](../specs/2026-10-28-lazy-run-lifecycle-design.md)。计划基线 HEAD：`5e7b603`；执行前重新核验。相对路径均相对于仓库根目录 `D:\codeproject\mygo\goagent`。
-- 本次交付是实施计划；下列新接口、新测试和验收结论均为待执行项。设计阶段通过的既有测试只算旧实现基线。
-- 当前有预先存在的未跟踪文档及 `.scratch/`。执行时逐文件暂存，不使用 `git add .`，不清理或覆盖这些内容；按用户要求使用 `fix/lazy-run-lifecycle-7Ps` 分支，`.scratch/` 不提交。
+- 日期：2026-10-28；计划状态：Completed（T00～T14 共 18 项完成，最终独立实现审核通过）；执行分支 `fix/lazy-run-lifecycle-7Ps`（用户指定）。
+- 唯一实施规格：[惰性 Run 生命周期设计](../specs/2026-10-28-lazy-run-lifecycle-design.md)。规划基线 HEAD：`5e7b603`；实施开始重新核验为 `a9ad9f99351b3aa5dc2ed9b8faa8c69e3a07a3d3`。相对路径均相对于仓库根目录 `D:\codeproject\mygo\goagent`。
+- 本文件记录实施步骤、逐项完成状态和验收证据；T00～T14 均已完成并按阶段提交，最终独立实现审核发现的 1 项 P2 已修复并复核通过。设计与计划编制阶段的旧实现基线和审核保留为历史记录，最终实现证据见第 11、12 节。
+- 实施开始时工作区干净，原文档已在实施基线中提交；`.scratch/` 已忽略且未跟踪。实施全程逐文件暂存，不使用 `git add .`，不清理或覆盖本地临时内容；按用户要求使用 `fix/lazy-run-lifecycle-7Ps` 分支，`.scratch/` 不提交。
 - 不改变输入在创建时冻结、历史在获得 admission 后恢复的时点；不增加全历史回放、Handle.Start、公开 Done/Result/WaitContext 或实时 RunStatus API。
 - 保留普通 Lossless 背压。只有根 TaskDone 与 RunDone/RunFailed/Interrupted 尾部交付不阻塞运行结算；workflow/plan 的子 TaskDone 仍走可取消的普通发送。
 - 外部模型、工具、hook 或 store 必须协作响应 context；本计划不承诺强制抢占忽略 context 的外部代码。
@@ -77,7 +77,7 @@ flowchart LR
 
 关键路径为 T00→T01→T03→T04→T05→T06→T08→T09→T10→T11；T02、T07 必须在汇合前完成。队列改动 T10 在 T09 后合并，避免纯 Await 接入后未消费任务取消仍无法结束 Wait。
 
-允许并行：T02 与 T03 写集独立；T12a 与主线独立；T10 与 T07 写集独立，但合并受 T09 前置条件约束。T04～T06、T08/T09 共享 Run，必须串行；T12b/T12c 不与它们同时改动。T11 回归矩阵可分包执行，仍需最终跨包 race。文档可预写，行为定稿后统一校准。是否启用子代理由实施方式决定，计划编制仅委托只读独立审核，不启动生产开发代理。
+允许并行：T02 与 T03 写集独立；T12a 与主线独立；T10 与 T07 写集独立，但合并受 T09 前置条件约束。T04～T06、T08/T09 共享 Run，必须串行；T12b/T12c 不与它们同时改动。T11 回归矩阵可分包执行，仍需最终跨包 race。文档可预写，行为定稿后统一校准。计划编制阶段仅委托只读独立审核；实施阶段按 subagent-driven-development 分配互不重叠的任务，并在集成后进行独立审核。
 
 ## 3. 文件职责与改动落点
 
@@ -498,25 +498,25 @@ func (r *Recorder) Settled()
 
 **依赖：** T11、T12c、T13b。**文件：** 只改执行计划证据区；如发现代码问题，回到对应任务修复。
 
-- [ ] 从干净的实施变更集合执行 `go test ./... -count=1 -timeout=10m`，预期所有包通过。
-- [ ] 在支持 race detector 的已记录环境执行 `go test -race ./bus ./agent ./queue ./internal/runobs -count=1 -timeout=10m`，预期零 race；未安装 race 支持时设置为未完成，不能跳过；全包 race 一次加新竞争测试重复 20 次共同构成证据。
-- [ ] 执行 `go vet ./...`、`gofmt -w`（仅明确的 Go 改动文件）、`git diff --check`；gofmt 后重跑受影响包。
-- [ ] 编译示例：`go test ./examples/... -run '^$'`；单独执行 `go run ./examples/lazy-run-lifecycle`，预期输出零启动、单次启动、有限尾部和 worker 所有权断言且退出码为 0。不运行调用真实 provider 的需凭据示例。
-- [ ] 审核 git diff、状态与 `git diff --stat`；确认只包含计划内生产代码、测试、README、ADR、变更说明，且未误暂存本轮之前的 `.scratch/` 和未跟踪用户文档。
-- [ ] 建立 traceability：P0-1↔T01/T03/T11，P0-2↔T02/T04/T05/T11，P0-3↔T06/T10/T08/T09/T11，P1-1↔T06/T08，P1-2↔T04/T05/T06/T11，P1-3↔T07/T08/T09/T11，P2-1↔T12a/T12b/T12c/T13a/T13b；独立复核四项均指向屏障测试。
-- [ ] 最终独立 code-review 检查范围聚焦本轮 diff：同步状态、错误/cleanup 可见性、对外兼容、race 覆盖与 migration。每个 finding 定位文件/测试，修复后重跑聚焦验证；设计审查通过不替代实现审查。
-- [ ] 生成提交候选（按用户授权与仓库工作流提交）：`feat(agent): separate run execution observation and settlement`。不要 squash 或重写用户已有提交；按仓库策略由用户决定最终合并。
+- [x] 从干净的实施变更集合执行 `go test ./... -count=1 -timeout=10m`，预期所有包通过。
+- [x] 在支持 race detector 的已记录环境执行 `go test -race ./bus ./agent ./queue ./internal/runobs -count=1 -timeout=10m`，预期零 race；未安装 race 支持时设置为未完成，不能跳过；全包 race 一次加新竞争测试重复 20 次共同构成证据。
+- [x] 执行 `go vet ./...`、仅对明确的 Go 改动文件检查 gofmt、`git diff --check`；实施中格式化后重跑受影响包，最终 `gofmt -l` 无输出。
+- [x] 编译示例：`go test ./examples/... -run '^$'`；单独执行 `go run ./examples/lazy-run-lifecycle`，预期输出零启动、单次启动、有限尾部和 worker 所有权断言且退出码为 0。不运行调用真实 provider 的需凭据示例。
+- [x] 审核 git diff、状态与 `git diff --stat`；确认只包含计划内生产代码、测试、README、ADR、变更说明，且未误暂存本轮之前的 `.scratch/` 和未跟踪用户文档。
+- [x] 建立 traceability：P0-1↔T01/T03/T11，P0-2↔T02/T04/T05/T11，P0-3↔T06/T10/T08/T09/T11，P1-1↔T06/T08，P1-2↔T04/T05/T06/T11，P1-3↔T07/T08/T09/T11，P2-1↔T12a/T12b/T12c/T13a/T13b；独立复核四项均指向屏障测试。
+- [x] 最终独立 code-review 检查范围聚焦本轮 diff：同步状态、错误/cleanup 可见性、对外兼容、race 覆盖与 migration。每个 finding 定位文件/测试，修复后重跑聚焦验证；设计审查通过不替代实现审查。
+- [x] 生成提交候选（按用户授权与仓库工作流提交）：各阶段已分别提交（见第 12 节），最终验收文档单独提交 `docs: record final lazy run lifecycle acceptance`。不 squash 或重写用户已有提交，保留在用户指定分支供后续集成。
 
 **全局 DoD：**
 
-- [ ] 7 个设计优先项和 4 个独立审核修订都有自动化证据。
-- [ ] 对外签名兼容；新增 Bus/Run API 恰为设计定义的 4 个接口；无新增第三方依赖、无全历史回放和永久 topic tombstone。
-- [ ] 普通 Agent.Stream 仍惰性；队列 Handle.Wait 不启动；Await 仅等待；Run.done 与 worker.recorded 分离。
-- [ ] claim 在 gate 前尝试释放；结果/身份/boundary 在 hook、尾部、done 前冻结；复制错误不可退回共享引用。
-- [ ] cancellation、send/close、seal/unsubscribe、Start/Cancel、AfterFunc 注册/停止所有并发边界有屏障回归和 race 证据。
-- [ ] 完整包测试、race、vet、示例编译及 diff 检查全通过；独立实现审核无未解决 finding。
-- [ ] README/GoDoc/ADR/变更说明明确行为差异、迁移、required unsubscribe、队列 worker 与持久化边界。
-- [ ] 结果报告严格区分已执行命令、未执行命令、受环境阻塞项目；不把计划写成已实现或已通过。
+- [x] 7 个设计优先项和 4 个独立审核修订都有自动化证据。
+- [x] 对外签名兼容；新增 Bus/Run API 恰为设计定义的 4 个接口；无新增第三方依赖、无全历史回放和永久 topic tombstone。
+- [x] 普通 Agent.Stream 仍惰性；队列 Handle.Wait 不启动；Await 仅等待；Run.done 与 worker.recorded 分离。
+- [x] claim 在 gate 前尝试释放；结果/身份/boundary 在 hook、尾部、done 前冻结；复制错误不可退回共享引用。
+- [x] cancellation、send/close、seal/unsubscribe、Start/Cancel、AfterFunc 注册/停止所有并发边界有屏障回归和 race 证据。
+- [x] 完整包测试、race、vet、示例编译及 diff 检查全通过；独立实现审核无未解决 finding。
+- [x] README/GoDoc/ADR/变更说明明确行为差异、迁移、required unsubscribe、队列 worker 与持久化边界。
+- [x] 结果报告严格区分已执行命令、未执行命令、受环境阻塞项目；不把计划写成已实现或已通过。
 
 ## 6. 验证命令汇总
 
@@ -525,7 +525,7 @@ func (r *Recorder) Settled()
 ```powershell
 go test ./bus ./agent ./queue -count=1 -timeout=240s
 go test -race ./bus ./agent ./queue -count=1 -timeout=10m
-go test -race ./bus ./agent ./queue -run 'Test(PublishContext|Unsubscribe|FinishTopic|SubscribeAndSeal|StartCancelRace|ConcurrentPrepared|AfterFunc|ConcurrentContextCancel|HandleWait|CanceledRunIsNotRecorded)' -count=20 -timeout=240s
+go test -race ./bus ./agent ./queue -run 'Test(PublishContext|Unsubscribe|FinishTopic|SubscribeAndSeal|StartCancelRace|ConcurrentPrepared|AfterFunc|ConcurrentContextCancel|HandleWait|CanceledRunIsNotRecorded|CancelAtFinalTurnDone|CancelRequestPrecedes|CancelBeforeSettlement|CancelDuringSettlement)' -count=20 -timeout=240s
 go test ./internal/runobs ./obs/otel -count=1 -timeout=150s
 go test -race ./internal/runobs -count=10 -timeout=180s
 go test ./examples/... -run '^$'
@@ -534,7 +534,7 @@ go vet ./...
 git diff --check
 ```
 
-上述均为后续实施命令，不代表当前实现已经通过；race 命令必须在支持 CGO/race 的 Go 环境执行。全量 `go test ./... -count=1 -timeout=10m` 另为 T14 强制门禁。
+上述命令已在实施阶段执行，具体阶段证据见第 11 节；T14 最终门禁的实际命令和结果见第 12 节。race 在支持 CGO/race 的 Windows/amd64 环境执行；全量测试使用 `-json` 保存逐项结果，不改变 `-count=1 -timeout=10m` 的门禁语义。
 
 ## 7. 决策风险与执行停止条件
 
@@ -564,10 +564,11 @@ git diff --check
 | 审核修订：hook 先于冻结 | TestFreezeFailurePrecedesFinishRun；T04 | RunFinisherOnCompletion/OnFailure/NotOnInterrupt/Order |
 | 审核修订：子任务尾部范围 | TestWorkflowChildTaskDoneRemainsCancelable；T05/T11 | workflow.go/plan.go 子任务正常事件与兄弟取消 |
 | 审核修订：AfterFunc 登记握手 | TestAfterFuncRegistrationHandshake；T09 | Resume 各成功返回分支与 raw fixture 激活行为 |
+| 最终实现审核：取消截止点 | TestCancelAtFinalTurnDoneFreezesCanceledOutcome、TestCancelRequestPrecedesContextCancellation、TestCancelBeforeSettlementPreservesRunnableError、TestCancelDuringSettlementDoesNotRewriteOutcome；T14 修订 | 真实 LLM 最终 checkpoint 后的 TurnDone 背压，Await/hook/尾部/RecordCompletion 一致性 |
 
 表中未写 Test 前缀的是测试名短写或家族前缀；执行精确名称以对应任务为准。旧回归不因 API 重构删除断言，只把依赖旧交付时序的 helper 改成真实等待。
 
-## 9. 执行证据（执行时填写）
+## 9. 计划编制阶段证据
 
 | 日期/环境 | 命令或审核 | 结果/备注 |
 | --- | --- | --- |
@@ -577,7 +578,7 @@ git diff --check
 | 2026-10-28，独立定向复核 | T00～T11 核心计划的三个 finding | 已修订且复核通过，详见第 10 节 |
 
 
-## 10. 本轮计划审核结论
+## 10. 计划编制阶段的独立审核结论
 
 已按 writing-plans / planning-and-task-breakdown 完成计划编制和自检，并由独立上下文大模型按 code-review-and-quality 对 T00～T11、核心 API、任务依赖和文件落点进行复核。首次发现 1 个 P1、2 个 P2，三项修订后定向复核通过；未将设计审核或计划审核等同于实现测试。
 
@@ -587,8 +588,12 @@ git diff --check
 | T07 漏掉 Resume 构造失败直接 Background 释放 claim | 纳入 hitl.go 五处路径，有界清理、Join 错误、释放尝试先于 gate | 定向复核通过 |
 | store Commit=0 不能证明 RecordCompletion 未提前进入 | 绑定私有记录函数；worker 启动前包装入口计数，同时断言 worker/WaitRecorded 仍阻塞 | 定向复核通过 |
 
-独立审核范围为 T00～T11；T12a/T12b/T12c/T13a/T13b/T14 的观测/文档/交付任务由主执行者完成规格、现有 span 树、时点和验证方式自检。独立审核者重跑旧实现基线 `go test ./bus ./agent ./queue -count=1 -timeout=90s`，三个包通过；未运行本计划尚未建立的新协议测试。
+本次计划编制审核范围为 T00～T11；这不限定后续实现审核范围。T12a/T12b/T12c/T13a/T13b/T14 的观测/文档/交付任务在实施后完成规格、现有 span 树、时点和验证方式自检，并纳入最终独立实现审核。独立审核者重跑旧实现基线 `go test ./bus ./agent ./queue -count=1 -timeout=90s`，三个包通过；未运行本计划尚未建立的新协议测试。
 
+## 11. 实施与阶段审核证据
+
+| 日期/阶段 | 命令或审核 | 结果/备注 |
+| --- | --- | --- |
 | 2026-10-28，T00 Windows/amd64 | HEAD a9ad9f9；go1.26.4；CGO_ENABLED=1，CC=gcc；工作区干净 | 目标分支已建立；源码落点与计划一致 |
 | 2026-10-28，T00 基线 | go test ./bus ./agent ./queue -count=1 -timeout=90s；go test -race ./bus -count=1 -timeout=90s | 全部通过，race 环境可用 |
 
@@ -633,3 +638,62 @@ T03 整包回归发现原 `TestPlanParentCancelReturnsContextError` 和 `TestRun
 
 | 2026-10-28，T13a/T13b | GoDoc逐条核对；ADR0033仅D5替代说明；ADR0035/迁移说明；中英文README；所有example编译、离线lifecycle和background运行 | 通过；草稿状态已校准；普通Stream/等待/队列/观察/指标契约等价，无真实provider请求 |
 | 2026-10-28，补强副本出口 | WaitRecorded无法复制时共享fallback红→绿；queue定向race20轮及整包 | 通过；返回零结果并Join复制错误，保留原记录错误 |
+
+
+## 12. T14 最终验收记录
+
+**环境与范围：** 2026-10-28，Windows/amd64，Go 1.26.4，CGO_ENABLED=1、CC=gcc。执行分支为 `fix/lazy-run-lifecycle-7Ps`，实施基线为 `a9ad9f9`，示例提交为 `c578bef`，最终审核修复提交为 `3a89228`。完整实施 diff 为 46 个文件；`go.mod`、`go.sum` 无变更，`.scratch/` 无被跟踪文件，`main` 保持实施基线。测试未访问真实模型 provider。
+
+### 最终门禁证据
+
+| 实际命令/检查 | 结果 |
+| --- | --- |
+| `go test ./... -json -count=1 -timeout=10m` | 退出 0；35 个带测试包通过，2,005 个测试及子测试通过、0 失败、3 项条件 skip，详见下表；JSON 仅保存在被忽略的 `.scratch/final-all-tests.json` |
+| `go test -race ./bus ./agent ./queue ./internal/runobs -count=1 -timeout=10m` | 四包全量通过，零 race；分别耗时 1.259s、21.379s、18.258s、1.336s |
+| `go test -race ./bus ./agent ./queue -run 'Test(PublishContext\|Unsubscribe\|FinishTopic\|SubscribeAndSeal\|StartCancelRace\|ConcurrentPrepared\|AfterFunc\|ConcurrentContextCancel\|HandleWait\|CanceledRunIsNotRecorded\|CancelAtFinalTurnDone\|CancelRequestPrecedes\|CancelBeforeSettlement\|CancelDuringSettlement)' -count=20 -timeout=240s` | 三包全部通过，零 race；重复验证发送/取消、封闭/退订、Start/Cancel、AfterFunc 握手、队列所有权及最终取消 cutoff |
+| `go vet ./...` | 退出 0，无诊断 |
+| `go test ./examples/... -run '^$'` | 所有示例包编译通过 |
+| `go run ./examples/lazy-run-lifecycle` | 退出 0；Stream/Await 不启动、重复 Start 单次执行、waitCtx 不取消执行、晚订阅有限结束、无 worker 不启动、Prepared Cancel 内存结算、Wait/WaitRecorded 边界断言全部通过 |
+| `go run ./examples/background` | 退出 0；五个任务完成并确认 WaitRecorded，等待 worker 退出 |
+| `git diff a9ad9f9 --check`、改动 Go 文件 `gofmt -l` | 通过，无输出 |
+| README/新增 ADR/迁移说明的本地 Markdown 链接与锚点 | 27 个引用检查通过 |
+| `git diff a9ad9f9 --name-only -- go.mod go.sum`、`git ls-files -- .scratch` | 均无输出，无新增依赖、无临时文件入库 |
+
+Markdown 表格中的正则分隔符使用转义形式显示；实际执行的是第 6 节同一模式。全量 race 一次与新竞争测试重复 20 次均已实际执行，生命周期验收用例没有因环境跳过。
+
+| 既有条件测试 | 未执行条件与范围 |
+| --- | --- |
+| `tool/file TestSymlinkCannotEscape` | Windows 未授予创建符号链接权限：`A required privilege is not held by the client.`；由既有测试自动 skip |
+| `tool/file TestSymlinkedDirCannotEscape` | 同上；由既有测试自动 skip |
+| `queue TestManagedRunThroughRedisQueue` | 未配置 `GOAGENT_REDIS_URL` 或 `REDIS_URL`；既有 Redis 集成测试自动 skip，Memory/File 路径和本次生命周期测试已执行 |
+
+### 阶段提交
+
+| 阶段/修订 | 已提交 SHA | 交付内容 |
+| --- | --- | --- |
+| T01/T02 | `c18cb62` | 可取消发布、退订协议与可靠有限尾部 |
+| T03 | `eaac602` | 框架普通事件取消与原诊断兼容 |
+| T04/T05 | `04f7b7c` | 单一结算、冻结隔离与 Run 观察封闭 |
+| T06 | `a7f1a58` | Start/Await、纯等待与幂等启动 |
+| T07 | `752b1ca` | durable claim 有界清理 |
+| T08 | `e8509fc` | 生命周期状态机、Prepared Cancel 唯一结算 |
+| T09 | `f5d0713` | 完整构造后的父取消激活与 AfterFunc 握手 |
+| T10 | `780a744` | worker 独占启动与真实结算后记录 |
+| T11 | `a23708d` | 跨层对抗回归与失败暂停终态修复 |
+| T12a | `f7507ac` | 基于现有 OTel 的内部时点记录器 |
+| T12b | `cb42a40` | 创建、启动请求、结算时点接入 |
+| T12c | `2694adc` | 真实 admission 和首模型 response 时点 |
+| 结果出口补强 | `4d962b5` | WaitRecorded 副本失败返回零结果并保留错误 |
+| T13a | `6c99954` | GoDoc、ADR-0035 与迁移说明 |
+| T13b | `c578bef` | 中英文 README、流式与离线队列示例 |
+| T14 审核修复 | `3a89228` | Settling 前取消请求原子参与 outcome，补最终 TurnDone 背压与 cutoff 回归 |
+
+T00 为基线核验，无生产改动；T14 最终验收文档单独提交。七项优先级及四项计划审核修订与自动化证据的对应关系见第 2、8、11 节，所有阶段提交保留原有粒度。
+
+### 最终独立实现审核
+
+最终审核采用全新上下文的独立大模型，只读审查 `a9ad9f9..c578bef` 的全部实现、测试和迁移文档，重点检查同步状态、终态与 cleanup 一致性、公共兼容、指标时点和 race 覆盖。首次发现 1 项 P2：真实 LLM 已提交最后 checkpoint、最终 TurnDone 因 Lossless 满缓冲而阻塞时，取消解除发送后 runnable 仍返回成功，Settling 未纳入之前的取消请求。
+
+该问题先由确定性回归复现，再于 `3a89228` 修复：Cancel 在 lifecycleMu 下登记取消错误，beginSettlement 同锁取得请求并补读 context.Err，合并原执行错误后进入原结算流水线；Settling 后的取消保持不改判。新增四项测试（含显式/父 context 两个真实 LLM 子用例）覆盖 Await、hook、TaskDone/RunFailed、RecordCompletion 一致性、请求登记早于底层 context 取消、原错误保留和 cutoff 后成功不被改写。
+
+独立审核者复核实际修订并另跑新增四项及 Prepared Cancel、构造激活/AfterFunc 相关回归，`-race -count=10` 全通过；结论为原 P2 已关闭、未发现新增 P0/P1/P2。主执行者在修订后重新执行上表全部代码门禁：全量测试、四包全量 race、新竞争测试 20 轮、vet、示例编译与离线示例全部通过。最终无未解决 finding，T14 与全局 DoD 验收通过，三个既有环境条件 skip 保留为明确验证限制。
