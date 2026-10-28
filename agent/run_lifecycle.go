@@ -52,6 +52,7 @@ func (r *Run) completeSettlement() {
 		stop()
 	}
 	r.cancel()
+	r.rc.timing.Settled()
 	// A callback can be waiting on done. Never join it before publishing done.
 	r.lifecycleMu.Lock()
 	r.phase = runSettled

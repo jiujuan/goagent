@@ -446,13 +446,13 @@ func (r *Recorder) Settled()
 
 **依赖：** T09、T12a。**文件：** 修改 `agent/agent.go`、`agent/runtime.go`、`agent/run_lifecycle.go`、`agent/run_outcome.go`；新增 `agent/run_observability_internal_test.go`。
 
-- [ ] 在 newRunHandleWithID 完整创建 RunContext 时建立 Recorder，存入 RunContext 的私有 `timing *runobs.Recorder` 字段；nil-safe 用于尚未激活的原始测试 fixture，不提前 activateLifecycle。
-- [ ] `deeper`、`subRunWithContext`、`forBranchWithContext` 等同一 Run 的派生上下文继承同一 recorder 指针；有独立 RunID 的 AsTool 子 Run 自己创建 recorder。不能复制含 mutex 的 recorder 值。
-- [ ] 唯一赢得 Prepared→Starting 的 Start owner 标记 StartRequested；唯一 settlement owner 在 close(done) 前标记 Settled。Stream 仅有 Created，Prepared Cancel 仅有 Created/Settled，不制造一次启动。
-- [ ] 无任何 context 改写，不调整 queue workCtx、admission、store/model 延迟或 tracing 父子关系。观测标记不能负责启动、结算或资源清理。
-- [ ] 测试：`TestLazyRunTimingSeparatesCreatedAndStarted`（Stream 后 model 未调用）、`TestPreparedCancelHasNoStartTiming`、`TestDerivedContextsShareTimingRecorder`、`TestTimingSettlementRecordedOnce`、`TestRunTimingKeepsModelSpanParent`。
-- [ ] 执行 `go test ./internal/runobs ./agent ./obs/otel -count=1 -timeout=150s` 和 `go test -race ./agent -run 'Test(LazyRunTiming|PreparedCancelHasNoStartTiming|DerivedContextsShareTiming|TimingSettlement|RunTimingKeeps)' -count=15 -timeout=180s`。
-- [ ] 生成提交候选：`feat(agent): record lazy run creation start and settlement`。
+- [x] 在 newRunHandleWithID 完整创建 RunContext 时建立 Recorder，存入 RunContext 的私有 `timing *runobs.Recorder` 字段；nil-safe 用于尚未激活的原始测试 fixture，不提前 activateLifecycle。
+- [x] `deeper`、`subRunWithContext`、`forBranchWithContext` 等同一 Run 的派生上下文继承同一 recorder 指针；有独立 RunID 的 AsTool 子 Run 自己创建 recorder。不能复制含 mutex 的 recorder 值。
+- [x] 唯一赢得 Prepared→Starting 的 Start owner 标记 StartRequested；唯一 settlement owner 在 close(done) 前标记 Settled。Stream 仅有 Created，Prepared Cancel 仅有 Created/Settled，不制造一次启动。
+- [x] 无任何 context 改写，不调整 queue workCtx、admission、store/model 延迟或 tracing 父子关系。观测标记不能负责启动、结算或资源清理。
+- [x] 测试：`TestLazyRunTimingSeparatesCreatedAndStarted`（Stream 后 model 未调用）、`TestPreparedCancelHasNoStartTiming`、`TestDerivedContextsShareTimingRecorder`、`TestTimingSettlementRecordedOnce`、`TestRunTimingKeepsModelSpanParent`。
+- [x] 执行 `go test ./internal/runobs ./agent ./obs/otel -count=1 -timeout=150s` 和 `go test -race ./agent -run 'Test(LazyRunTiming|PreparedCancelHasNoStartTiming|DerivedContextsShareTiming|TimingSettlement|RunTimingKeeps)' -count=15 -timeout=180s`。
+- [x] 生成提交候选：`feat(agent): record lazy run creation start and settlement`。
 
 **DoD：** 观测字段不改变执行；普通/派生上下文 recorder 所有权正确；旧模型/工具 span parent 断言保持通过。
 
@@ -626,3 +626,5 @@ T03 整包回归发现原 `TestPlanParentCancelReturnsContextError` 和 `TestRun
 | 2026-10-28，T10/T11独立审核 | worker入口/cleanup屏障/并发上限/终态一致性与跨层退出定向race20轮 | 通过，无未解决finding；M4 P0/P1完成 |
 
 | 2026-10-28，T12a | Recorder五家族红→绿；go test ./internal/runobs -count=1 -timeout=60s；race10轮 | 通过；短锁登记、锁外输出、已有span不新增、无负interval/高基数标签，nil-safe |
+
+| 2026-10-28，T12b | timing字段缺失红→绿；internal/runobs+agent+obs/otel全包；五家族race15轮 | 通过；Start唯一owner和Settled时点、派生指针继承、无新增span，原OTel父子树回归通过 |

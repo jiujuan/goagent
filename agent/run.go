@@ -131,6 +131,7 @@ func (r *Run) Start() {
 	}
 	r.phase = runStarting
 	r.lifecycleMu.Unlock()
+	r.rc.timing.StartRequested()
 	go r.execute()
 }
 

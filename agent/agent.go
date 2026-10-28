@@ -17,6 +17,7 @@ import (
 	"github.com/jiujuan/goagent/bus"
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
+	"github.com/jiujuan/goagent/internal/runobs"
 	"github.com/jiujuan/goagent/vfs"
 )
 
@@ -306,6 +307,7 @@ func (a *Agent) newRunHandleWithID(ctx context.Context, runID, threadID string, 
 		Topic:    topic,
 		Store:    a.store,
 		State:    state,
+		timing:   runobs.New(runCtx, runID, threadID),
 		task:     &taskRuntime{rootID: taskID, budget: normalizeTaskBudget(a.cfg.taskBudget)},
 		info:     TaskInfo{ID: taskID, ThreadID: threadID, Kind: a.taskKind()},
 		durable:  newDurableRunState(),
