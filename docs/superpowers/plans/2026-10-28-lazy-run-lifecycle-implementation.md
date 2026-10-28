@@ -472,12 +472,12 @@ func (r *Recorder) Settled()
 
 **依赖：** T11、T12c。**文件：** 修改各公共 GoDoc、`docs/adr/ADR-0033-background-run-context-and-status.md`；新增 ADR 与变更说明。实施前执行 `rg --files docs/adr` 和 `Test-Path -LiteralPath docs/changes` 核验编号及发布说明目录；若编号与第 3 节中的建议路径冲突，只改计划/路径，不重写既有 ADR。
 
-- [ ] GoDoc 覆盖 Run/Stream/Start/Await/Wait/Iter/Events/Cancel、queue.Handle.Wait/WaitRecorded：开始时点、waitCtx 不取消运行、订阅 unsubscribe 义务、没有 replay、尾部后 channel 自动关闭、done 不等于消费者排空、queue Wait 需要 worker。
-- [ ] 给 ADR-0033 D5 新增带日期的“由后续决策替代”说明与新 ADR 链接；保留其余 D1-D4 和背景，不静默改历史决策。
-- [ ] 新 ADR 正式决定：普通 Run.Wait 仍惰性启动；queue.Handle.Wait 纯等待；queue worker 取得 slot 后启动；Prepared cancel 只产生内存结局，无 worker 不写 terminal checkpoint；重复 Iter 不重跑；Lossless 普通进度仍可能背压。
-- [ ] 发布说明含可执行迁移步骤：原靠 Handle.Wait 驱动的调用方启动 Pool/worker；需要直接执行则调用普通 Agent.Run；普通 Run 的等待超时使用 Run.Await(waitCtx)；queue.Handle 没有 Await/Start，停止其工作用 Handle.Cancel，不能把 Handle.Wait 当成超时/取消 API；Events 退出始终 unsubscribe；改掉非阻塞 drain 终态模式。
-- [ ] 执行 `git diff --check` 与 markdown 链接/路径核验；新 ADR 决策和生产代码最终逐条比对。
-- [ ] 生成提交候选：`docs(agent): document lazy run and queue lifecycle contracts`。
+- [x] GoDoc 覆盖 Run/Stream/Start/Await/Wait/Iter/Events/Cancel、queue.Handle.Wait/WaitRecorded：开始时点、waitCtx 不取消运行、订阅 unsubscribe 义务、没有 replay、尾部后 channel 自动关闭、done 不等于消费者排空、queue Wait 需要 worker。
+- [x] 给 ADR-0033 D5 新增带日期的“由后续决策替代”说明与新 ADR 链接；保留其余 D1-D4 和背景，不静默改历史决策。
+- [x] 新 ADR 正式决定：普通 Run.Wait 仍惰性启动；queue.Handle.Wait 纯等待；queue worker 取得 slot 后启动；Prepared cancel 只产生内存结局，无 worker 不写 terminal checkpoint；重复 Iter 不重跑；Lossless 普通进度仍可能背压。
+- [x] 发布说明含可执行迁移步骤：原靠 Handle.Wait 驱动的调用方启动 Pool/worker；需要直接执行则调用普通 Agent.Run；普通 Run 的等待超时使用 Run.Await(waitCtx)；queue.Handle 没有 Await/Start，停止其工作用 Handle.Cancel，不能把 Handle.Wait 当成超时/取消 API；Events 退出始终 unsubscribe；改掉非阻塞 drain 终态模式。
+- [x] 执行 `git diff --check` 与 markdown 链接/路径核验；新 ADR 决策和生产代码最终逐条比对。
+- [x] 生成提交候选：`docs(agent): document lazy run and queue lifecycle contracts`。
 
 **DoD：** GoDoc 是新契约的单一 API 入口；ADR-0033 历史可追溯；队列行为变化和迁移方法显式发布；没有把尚未实现的行为写成当前保证。
 
@@ -485,12 +485,12 @@ func (r *Recorder) Settled()
 
 **依赖：** T13a。**文件：** 修改 `README.md`、`README-en.md`、`examples/quickstart-stream/main.go`、`examples/background/main.go`；新增 `examples/lazy-run-lifecycle/main.go`。
 
-- [ ] 两份 README 的对应概念保持一致：普通流式 for-range 消费时自动启动；Events 模式明确 Events→Start→Await；等待且要停止执行时先 `Run.Cancel()` 再 `Await()`；仅停止等待者用 `Await(waitCtx)`；队列示例先启动 Pool，再等待 Handle。
-- [ ] 更新 queue/background 示例实际启动 Pool/worker，并分别展示 `Handle.Wait` 与 `WaitRecorded` 的语义；不使用 Handle.Start 或隐藏驱动 Wait。
-- [ ] Events 示例始终 `defer unsubscribe()`；不把 wait done 当作所有事件已被消费；不展示已封闭 Run 有历史 progress replay。
-- [ ] 新 example 使用项目 `mock` 模型，不访问真实 API；展示 `Stream` 后模型调用次数仍是 0、消费/Start 后恰好 1、late Iter 收到尾部且不重跑、Run.Wait 与 queue.Handle.Wait 的差异。
-- [ ] 执行 `go test ./examples/... -run '^$'`（编译所有 example 包）以及 `go run ./examples/lazy-run-lifecycle`；README 内链接/命令指向存在的文件。
-- [ ] 生成提交候选：`docs(examples): show explicit lazy run ownership`。
+- [x] 两份 README 的对应概念保持一致：普通流式 for-range 消费时自动启动；Events 模式明确 Events→Start→Await；等待且要停止执行时先 `Run.Cancel()` 再 `Await()`；仅停止等待者用 `Await(waitCtx)`；队列示例先启动 Pool，再等待 Handle。
+- [x] 更新 queue/background 示例实际启动 Pool/worker，并分别展示 `Handle.Wait` 与 `WaitRecorded` 的语义；不使用 Handle.Start 或隐藏驱动 Wait。
+- [x] Events 示例始终 `defer unsubscribe()`；不把 wait done 当作所有事件已被消费；不展示已封闭 Run 有历史 progress replay。
+- [x] 新 example 使用项目 `mock` 模型，不访问真实 API；展示 `Stream` 后模型调用次数仍是 0、消费/Start 后恰好 1、late Iter 收到尾部且不重跑、Run.Wait 与 queue.Handle.Wait 的差异。
+- [x] 执行 `go test ./examples/... -run '^$'`（编译所有 example 包）以及 `go run ./examples/lazy-run-lifecycle`；README 内链接/命令指向存在的文件。
+- [x] 生成提交候选：`docs(examples): show explicit lazy run ownership`。
 
 **DoD：** 中英文契约等价；所有示例编译并离线通过；队列例子确实有 worker；订阅退出清理没有遗漏。
 
@@ -630,3 +630,6 @@ T03 整包回归发现原 `TestPlanParentCancelReturnsContextError` 和 `TestRun
 | 2026-10-28，T12b | timing字段缺失红→绿；internal/runobs+agent+obs/otel全包；五家族race15轮 | 通过；Start唯一owner和Settled时点、派生指针继承、无新增span，原OTel父子树回归通过 |
 
 | 2026-10-28，T12c | 准入/first-response/Resume真实时点红→绿；internal/runobs+agent+obs/otel全包；五家族race15轮；otel example编译 | 通过；忽略nil response、不改span父子树，Resume pre-acquired时间保留；raw inflight fixture显式未知admission零值 |
+
+| 2026-10-28，T13a/T13b | GoDoc逐条核对；ADR0033仅D5替代说明；ADR0035/迁移说明；中英文README；所有example编译、离线lifecycle和background运行 | 通过；草稿状态已校准；普通Stream/等待/队列/观察/指标契约等价，无真实provider请求 |
+| 2026-10-28，补强副本出口 | WaitRecorded无法复制时共享fallback红→绿；queue定向race20轮及整包 | 通过；返回零结果并Join复制错误，保留原记录错误 |

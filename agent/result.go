@@ -45,7 +45,7 @@ type RunResult struct {
 // copy: the exported Run.ID and Run.ThreadID are a caller's to rewrite, and they are
 // not consulted here — before the run settles the identifiers reported are the ones
 // fixed when the handle was created, with an empty result, no boundary and Paused
-// false. Use Wait or an iterator to reach a settled run.
+// false. Use Start followed by Await, Wait, or consume Iter to reach settlement.
 func (r *Run) DetailedResult() RunResult {
 	r.terminalMu.Lock()
 	defer r.terminalMu.Unlock()

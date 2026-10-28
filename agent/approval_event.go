@@ -85,8 +85,10 @@ func (a *Agent) RecordApproval(ctx context.Context, threadID string, decision Ap
 	return durable.RecordDecision(ctx, threadID, decision)
 }
 
-// RecordApproval records a structured decision against this run's thread and
-// publishes its audit event immediately on the run topic.
+// RecordApproval durably records a decision against this run's thread.
+// The receipt is authoritative even when observational notification is canceled.
+// A sealed run's stream stays closed; Resume replays durable approval audit
+// events on the new run rather than reopening this run.
 func (r *Run) RecordApproval(ctx context.Context, decision ApprovalDecision) (checkpoint.DecisionReceipt, error) {
 	receipt, err := r.agent.RecordApproval(ctx, r.identity.threadID, decision)
 	if err != nil {

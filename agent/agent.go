@@ -176,9 +176,11 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) (strin
 	return res.Message.Text(), err
 }
 
-// Stream starts a run and returns a non-blocking *Run handle for live events
-// (Iter/Events), settlement (Wait), and control (Steer/Cancel/Decide). The loop
-// is driven lazily on first observation, so no events are missed.
+// Stream creates a lazy Run and freezes input without store or model work.
+// Start, Wait, or consuming Iter requests execution once. History is restored
+// only after admission; creation order does not promise execution order.
+// Events and Await only observe or wait. A canceled parent context settles an
+// unstarted handle after construction and resource handoff are complete.
 func (a *Agent) Stream(ctx context.Context, input string, opts ...RunOption) *Run {
 	return a.streamConfigured(ctx, resolveRunConfig(input, core.NewID("thread"), opts...))
 }

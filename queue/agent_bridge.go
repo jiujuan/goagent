@@ -16,14 +16,13 @@ import (
 // and it cannot interrupt a store that ignores context.
 const terminalRecordTimeout = 30 * time.Second
 
-// Handle is the producer-side reference to a background agent run. The worker
-// drives the run; the holder can stream its events (Events) or block for the
-// result (Wait) whenever — both fan out from the agent's bus, so calling them is
-// independent of the worker.
+// Handle observes a run owned by a background worker. Wait never starts work;
+// the worker must acquire its pool slot and start the run. Events only subscribes.
+// Wait reports memory settlement, while WaitRecorded also waits for the worker's
+// terminal-record attempt. Cancel can settle an unstarted handle in memory.
 //
-// The run executes on a context the queue owns, not the submitter's: canceling
-// the context passed to EnqueueAgent only stops submission, and an already
-// enqueued run keeps going. Handle.Cancel is the explicit way to stop execution.
+// The run executes on a context owned by the queue. Canceling EnqueueAgent's
+// context only controls submission; use Handle.Cancel to stop accepted work.
 type Handle struct {
 	ID  string
 	run *agent.Run
@@ -59,8 +58,7 @@ func (h *Handle) Wait() (core.Result, error) { return h.run.Await(context.Backgr
 // errors.Join(runErr, recordErr).
 //
 // It waits on the worker and never starts the run itself: if no worker picks the
-// job up, this blocks (cancelling the Handle does not settle an unconsumed job —
-// see EnqueueAgent's lifecycle note). A run that paused for a human decision has
+// job up, this blocks even if Cancel already settled that run in memory. A run that paused for a human decision has
 // no terminal state to record, so it returns its result and no record error.
 //
 // For a completed run a nil error means the terminal record was confirmed by the
@@ -83,15 +81,19 @@ func (h *Handle) WaitRecorded() (core.Result, error) {
 	return core.Result{Message: cloned}, err
 }
 
-// Events subscribes to the run's live events (e.g. bus.Lossy for a UI).
+// Events subscribes without starting work. A settled run returns only its
+// finite terminal tail; the channel closes after the tail. Always defer the
+// returned unsubscribe function when leaving early. Ordinary Lossless events
+// can back-pressure the worker; Wait does not wait for observers to drain.
 func (h *Handle) Events(mode bus.DeliveryMode) (<-chan core.Event, func()) {
 	return h.run.Events(mode)
 }
 
-// Cancel aborts the background run and releases the queue-owned execution
-// context. The run's own context is a child of that context, so cancelling the
-// run alone would leave the parent alive; both layers are cancelled here. It is
-// idempotent.
+// Cancel requests execution cancellation and releases the queue-owned context.
+// For prepared work it synchronously settles memory after cleanup attempts;
+// started work remains in flight until its execution owner actually settles.
+// The run's context is a child of the queue context; both are canceled here.
+// Cancel is idempotent.
 func (h *Handle) Cancel() {
 	h.run.Cancel()
 	h.cancelWork()
@@ -100,7 +102,7 @@ func (h *Handle) Cancel() {
 // EnqueueAgent submits an agent run as a background job and returns immediately
 // with a Handle. The run is created lazily (not driven until a worker picks the
 // job up), so nothing executes on the caller's goroutine. Watch progress via
-// Handle.Events / Handle.Wait or the agent's own bus.
+// Handle.Events; Handle.Wait only waits for memory settlement.
 //
 // ctx owns submission only: it must not already be cancelled, and a cancel that
 // arrives after Enqueue has accepted the job does not stop the run. A cancel
@@ -110,9 +112,9 @@ func (h *Handle) Cancel() {
 // jobs, and a job that is never dequeued keeps its execution context until its
 // Handle is cancelled.
 //
-// The caller must also run a worker: only the worker's closure ends the run and
-// attempts the terminal record, so Handle.WaitRecorded waits on it and a job that
-// is never picked up leaves that call blocked.
+// The caller must run a worker to execute accepted work and attempt its terminal
+// record. Prepared cancellation can finish memory settlement without a worker,
+// but WaitRecorded still waits until a worker has made the recording attempt.
 func EnqueueAgent(ctx context.Context, q Queue, a *agent.Agent, input string, opts ...agent.RunOption) (*Handle, error) {
 	h, err := submitAgentRun(ctx, q, a, input, opts...)
 	if err != nil {

@@ -18,13 +18,15 @@ type runIdentity struct {
 	threadID string
 }
 
-// Run is a non-blocking handle to one in-flight (or paused) run. The loop is
-// driven lazily on first observation, so subscribing via Iter/Events before
-// driving means no events are missed.
+// Run is a lazy execution handle with independent execution, waiting and
+// observation. Stream freezes its input when creating the handle; execution
+// restores history only after admission. Start, Wait or consuming Iter starts
+// execution once. Events and Await never start it.
 //
-// Stream with Iter() (which also records the terminal result for Wait), or call
-// Wait() for just the result. On an Interrupted (HITL) pause, record decisions
-// with Decide(...) then call Resume(ctx) to continue.
+// Results are frozen by the settlement owner. Wait/Await do not wait for event
+// observers to drain their terminal tails. A paused run returns a zero Result
+// and nil error; inspect Paused or DetailedResult after settlement, then record
+// decisions and Resume to continue.
 type Run struct {
 	// ID and ThreadID are the run's identifiers as created. They are exported and
 	// therefore writable by any caller holding the handle, so nothing internal reads
@@ -99,9 +101,10 @@ type Run struct {
 	recordedSet bool
 }
 
-// Iter streams the run's events as a pull iterator. The run starts on first
-// iteration (after subscribing), so no events are missed. It records the
-// terminal result/error for Wait().
+// Iter subscribes before starting execution when consumed. Returning false
+// from yield (including a range break) unsubscribes. Late consumption after
+// settlement returns only the finite terminal tail, without replaying progress
+// or executing again. Observation never decides the run's outcome.
 func (r *Run) Iter() iter.Seq2[core.Event, error] {
 	return func(yield func(core.Event, error) bool) {
 		ch, cancel := r.subscribeRun(bus.Lossless)
@@ -115,8 +118,12 @@ func (r *Run) Iter() iter.Seq2[core.Event, error] {
 	}
 }
 
-// Events returns a raw subscription channel and cancel func for a chosen
-// DeliveryMode (e.g. Lossy for a UI). Call Iter or Wait to begin driving.
+// Events subscribes without starting execution. Register before Start when
+// initial events matter. The channel closes after its reliable terminal tail;
+// a settled run returns only that finite tail, with no progress replay.
+// Always defer the returned unsubscribe function when leaving early: a stalled
+// observer can retain its terminal finisher. Ordinary Lossless progress still
+// back-pressures execution; Wait/Await do not mean the observer has drained.
 func (r *Run) Events(mode bus.DeliveryMode) (<-chan core.Event, func()) {
 	return r.subscribeRun(mode)
 }
