@@ -421,8 +421,8 @@ h.recordCompletion = func(ctx context.Context, run *agent.Run) error {
 
 **依赖：** T00；可与 T01～T11 并行。**文件：** 新增 `internal/runobs/timing.go`、`internal/runobs/timing_test.go`。
 
-- [ ] 使用已在 go.mod 的 OpenTelemetry API，不增加 SDK 运行依赖或第三方模块。`New` 从 context 取得现有 span，以事件承载 CreatedAt/StartRequestedAt/AdmittedAt/FirstModelResponseAt/SettledAt；不创建新的 root/child span，不改变现有 obs/otel 的父子树。
-- [ ] 内部完整接口如下；记录器仅供本仓库 agent 使用，外部公共 API 不变。
+- [x] 使用已在 go.mod 的 OpenTelemetry API，不增加 SDK 运行依赖或第三方模块。`New` 从 context 取得现有 span，以事件承载 CreatedAt/StartRequestedAt/AdmittedAt/FirstModelResponseAt/SettledAt；不创建新的 root/child span，不改变现有 obs/otel 的父子树。
+- [x] 内部完整接口如下；记录器仅供本仓库 agent 使用，外部公共 API 不变。
 
 ```go
 func New(ctx context.Context, runID, threadID string) *Recorder
@@ -432,13 +432,13 @@ func (r *Recorder) FirstModelResponse()
 func (r *Recorder) Settled()
 ```
 
-- [ ] Recorder 使用短临界区保护阶段时间，重复标记不重复输出；运行时输出放锁外。Created 在 New 时记录。模型/工具 span 继续由 obs/otel middleware 创建；生命周期事件加在调用方已有 span 上。
-- [ ] Metrics 使用全局 `otel.GetMeterProvider()`，单位秒，固定名称 `agent.run.creation_to_start`、`agent.run.start_to_admission`、`agent.run.admission_to_first_response`、`agent.run.start_to_settlement`。仅在起止均存在且终点不早于起点时记录，阶段未出现时省略，不填假 0 值。
-- [ ] Resume 可先获得 gate 再创建 Run，AdmittedAt 可以早于 CreatedAt/StartRequestedAt；保留真实绝对时间，不修改为 Start 时刻，不输出负的 start_to_admission 指标。span event 可在附加时携带真实 admitted_at 属性，不能伪造严格顺序。
-- [ ] 指标不含 runID/threadID/prompt/tool args 等高基数/内容字段；runID/threadID 仅为 span event 属性。无 provider 时 no-op。独立配置的 obs/otel.WithMeterProvider 仅影响其 middleware；要采集生命周期 metrics 使用应用全局 MeterProvider，文档必须说明。
-- [ ] 用 SDK test span recorder/ManualReader 建立 `TestRecorderRecordsOnlyObservedPhases`、`TestRecorderIsIdempotentConcurrent`、`TestRecorderKeepsExistingSpanTree`、`TestRecorderPreacquiredAdmissionHasNoNegativeDuration`、`TestRecorderDoesNotRecordPayloadOrHighCardinalityMetricAttrs`。测试暂设全局 meter 时保存/恢复旧 provider，禁止 t.Parallel。
-- [ ] 执行 `go test ./internal/runobs -count=1 -timeout=60s` 和 `go test -race ./internal/runobs -count=10 -timeout=120s`；预期通过，依赖图无 agent import 回环。
-- [ ] 生成提交候选：`feat(obs): add run lifecycle timing recorder`。
+- [x] Recorder 使用短临界区保护阶段时间，重复标记不重复输出；运行时输出放锁外。Created 在 New 时记录。模型/工具 span 继续由 obs/otel middleware 创建；生命周期事件加在调用方已有 span 上。
+- [x] Metrics 使用全局 `otel.GetMeterProvider()`，单位秒，固定名称 `agent.run.creation_to_start`、`agent.run.start_to_admission`、`agent.run.admission_to_first_response`、`agent.run.start_to_settlement`。仅在起止均存在且终点不早于起点时记录，阶段未出现时省略，不填假 0 值。
+- [x] Resume 可先获得 gate 再创建 Run，AdmittedAt 可以早于 CreatedAt/StartRequestedAt；保留真实绝对时间，不修改为 Start 时刻，不输出负的 start_to_admission 指标。span event 可在附加时携带真实 admitted_at 属性，不能伪造严格顺序。
+- [x] 指标不含 runID/threadID/prompt/tool args 等高基数/内容字段；runID/threadID 仅为 span event 属性。无 provider 时 no-op。独立配置的 obs/otel.WithMeterProvider 仅影响其 middleware；要采集生命周期 metrics 使用应用全局 MeterProvider，文档必须说明。
+- [x] 用 SDK test span recorder/ManualReader 建立 `TestRecorderRecordsOnlyObservedPhases`、`TestRecorderIsIdempotentConcurrent`、`TestRecorderKeepsExistingSpanTree`、`TestRecorderPreacquiredAdmissionHasNoNegativeDuration`、`TestRecorderDoesNotRecordPayloadOrHighCardinalityMetricAttrs`。测试暂设全局 meter 时保存/恢复旧 provider，禁止 t.Parallel。
+- [x] 执行 `go test ./internal/runobs -count=1 -timeout=60s` 和 `go test -race ./internal/runobs -count=10 -timeout=120s`；预期通过，依赖图无 agent import 回环。
+- [x] 生成提交候选：`feat(obs): add run lifecycle timing recorder`。
 
 **DoD：** 无新依赖；事件附着既有 span；五个时点真实；metric 不输出不存在/负的间隔；并发重复标记不重复记录。
 
@@ -624,3 +624,5 @@ T03 整包回归发现原 `TestPlanParentCancelReturnsContextError` 和 `TestRun
 | 2026-10-28，T11/M4 | go test ./bus ./agent ./queue -count=1 -timeout=240s；三包race全量一次；计划新竞争模式race20轮 | 全通过；含callback等done、Lossy可靠tail、100并发可变读副本、hook/Wait修改不污染RecordCompletion |
 | 2026-10-28，T11修复 | TestCleanupFailureTurnsPauseTaskIntoFailure 红→绿及race20轮 | 释放失败时清除旧Interrupt，TaskDone/RunFailed各1、Err一致、无Interrupted |
 | 2026-10-28，T10/T11独立审核 | worker入口/cleanup屏障/并发上限/终态一致性与跨层退出定向race20轮 | 通过，无未解决finding；M4 P0/P1完成 |
+
+| 2026-10-28，T12a | Recorder五家族红→绿；go test ./internal/runobs -count=1 -timeout=60s；race10轮 | 通过；短锁登记、锁外输出、已有span不新增、无负interval/高基数标签，nil-safe |
