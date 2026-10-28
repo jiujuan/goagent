@@ -378,11 +378,11 @@ func (r *Run) Wait() (core.Result, error) {
 
 **依赖：** T06、T09。**文件：** 修改 `queue/agent_bridge.go`、`queue/agent_bridge_test.go`、`queue/agent_terminal_test.go`；新增 `queue/agent_ownership_test.go`。
 
-- [ ] 测试：`TestHandleWaitWithoutWorkerDoesNotStartRun`、`TestWorkerStartsRunBeforeAwait`、`TestHandleWaitersRespectPoolLimit`、`TestCanceledRunIsNotRecordedBeforeSettlement`、`TestHandleWaitStillReleasesWorkContext`、`TestHandleWaitRecordedWaitsForRecordAttempt`。
-- [ ] Handle.Wait 精确改为 `return h.run.Await(context.Background())`，不调用 Start。worker closure 明确 `h.run.Start()`，随后 `Await(context.Background())`；只能在 Await 完成、FrozenOutcome 已冻结后调用 `commitTerminal`/RecordCompletion，之后 `recordSettled`，保持现有错误合并与 workCtx release。
-- [ ] 无 worker 测试用有界 queue enqueue 后调用 Handle.Wait；它应因等待执行结算而仍阻塞，执行次数必须是 0。取消这个 waiter 的等待不能靠 Handle.Wait 控制，测试应使用独立等待 goroutine和 Run.Cancel 后 Await 结束；不要把 Queue worker 未启动误判为 Wait 能驱动。
-- [ ] 并发上限测试使用 `NewPool(q, N)`、原子 active/max 计数工具或模型 gate；多个 Handle.Wait 观察时最大模型并发始终 `<= N`，且 worker 未 dequeue 前为 0。不得通过绕开 Pool semaphore 启动 job。
-- [ ] 记录入口可测试性：把 Handle 的私有 owner 字段替换成 `recordCompletion func(context.Context, *agent.Run) error`，构造时唯一绑定为 `a.RecordCompletion`；commitTerminal 使用这个函数。它不对外暴露，也不允许调用方改记录 owner；身份校验仍由绑定的 Agent.RecordCompletion 执行。测试在启动 worker 前将其包一层计数，禁止 worker 开始后再替换以免产生 data race。
+- [x] 测试：`TestHandleWaitWithoutWorkerDoesNotStartRun`、`TestWorkerStartsRunBeforeAwait`、`TestHandleWaitersRespectPoolLimit`、`TestCanceledRunIsNotRecordedBeforeSettlement`、`TestHandleWaitStillReleasesWorkContext`、`TestHandleWaitRecordedWaitsForRecordAttempt`。
+- [x] Handle.Wait 精确改为 `return h.run.Await(context.Background())`，不调用 Start。worker closure 明确 `h.run.Start()`，随后 `Await(context.Background())`；只能在 Await 完成、FrozenOutcome 已冻结后调用 `commitTerminal`/RecordCompletion，之后 `recordSettled`，保持现有错误合并与 workCtx release。
+- [x] 无 worker 测试用有界 queue enqueue 后调用 Handle.Wait；它应因等待执行结算而仍阻塞，执行次数必须是 0。取消这个 waiter 的等待不能靠 Handle.Wait 控制，测试应使用独立等待 goroutine和 Run.Cancel 后 Await 结束；不要把 Queue worker 未启动误判为 Wait 能驱动。
+- [x] 并发上限测试使用 `NewPool(q, N)`、原子 active/max 计数工具或模型 gate；多个 Handle.Wait 观察时最大模型并发始终 `<= N`，且 worker 未 dequeue 前为 0。不得通过绕开 Pool semaphore 启动 job。
+- [x] 记录入口可测试性：把 Handle 的私有 owner 字段替换成 `recordCompletion func(context.Context, *agent.Run) error`，构造时唯一绑定为 `a.RecordCompletion`；commitTerminal 使用这个函数。它不对外暴露，也不允许调用方改记录 owner；身份校验仍由绑定的 Agent.RecordCompletion 执行。测试在启动 worker 前将其包一层计数，禁止 worker 开始后再替换以免产生 data race。
 
 ```go
 boundRecord := h.recordCompletion
@@ -393,10 +393,10 @@ h.recordCompletion = func(ctx context.Context, run *agent.Run) error {
 }
 ```
 
-- [ ] 取消-记录屏障使用已有本次提交边界的运行：执行 context 已取消但 cleanup 仍挡在 channel 时，recordCalls、终态 Commit 均为 0，worker 闭包和 WaitRecorded 均未返回；放行后入口与终态提交各恰好一次，最终错误不含 ErrRunNotFinished。仅统计 store Commit=0 不足以证明方法入口未被提前调用。
-- [ ] 在新 API 语义下重测既有 TestQueueCallerCancelDoesNotStopRun、Enqueue failure 释放 context、Handle cancel、多个 WaitRecorded waiter、record failure 和 pause skip。确认取消尚未消费任务时内存 Wait 与持久 WaitRecorded 的差异符合 T08 预期。
-- [ ] 执行 `go test ./queue -run 'Test(HandleWait|WorkerStarts|CanceledRunIsNotRecorded|QueueCallerCancel|QueueEnqueue|QueueHandleCancel|QueueContextReleased|QueueWaitRecorded)' -count=1 -timeout=120s` 和 `go test -race ./queue -run 'Test(HandleWait|WorkerStarts|CanceledRunIsNotRecorded)' -count=20 -timeout=180s`。
-- [ ] 生成提交候选：`fix(queue): let workers exclusively start queued runs`。
+- [x] 取消-记录屏障使用已有本次提交边界的运行：执行 context 已取消但 cleanup 仍挡在 channel 时，recordCalls、终态 Commit 均为 0，worker 闭包和 WaitRecorded 均未返回；放行后入口与终态提交各恰好一次，最终错误不含 ErrRunNotFinished。仅统计 store Commit=0 不足以证明方法入口未被提前调用。
+- [x] 在新 API 语义下重测既有 TestQueueCallerCancelDoesNotStopRun、Enqueue failure 释放 context、Handle cancel、多个 WaitRecorded waiter、record failure 和 pause skip。确认取消尚未消费任务时内存 Wait 与持久 WaitRecorded 的差异符合 T08 预期。
+- [x] 执行 `go test ./queue -run 'Test(HandleWait|WorkerStarts|CanceledRunIsNotRecorded|QueueCallerCancel|QueueEnqueue|QueueHandleCancel|QueueContextReleased|QueueWaitRecorded)' -count=1 -timeout=120s` 和 `go test -race ./queue -run 'Test(HandleWait|WorkerStarts|CanceledRunIsNotRecorded)' -count=20 -timeout=180s`。
+- [x] 生成提交候选：`fix(queue): let workers exclusively start queued runs`。
 
 **DoD：** 无 worker 时 Wait 不启动/不记录；worker 显式启动并等真实结算才写记录；Pool semaphore 对大量 Wait 保持上限；waiter 取消不会成为早记完成理由；记录 context 仍独立于 workCtx 取消。
 
@@ -617,3 +617,6 @@ T03 整包回归发现原 `TestPlanParentCancelReturnsContextError` 和 `TestRun
 
 | 2026-10-28，T09 | 工厂激活接口缺失红灯；Stream/Managed/Resume三普通分支/InFlight与握手定向；race30轮；agent/queue全包 | 通过；所有工厂末步激活，stop摘取后锁外调用，不join取消callback |
 | 2026-10-28，T06独立审核 | 八项定向race20轮 | 通过；done优先、等待context隔离、独立副本与100waiters零订阅符合规格 |
+
+| 2026-10-28，T10/M3 | 无worker旧Wait执行模型红灯；queue七项定向、queue整包、ownership race20轮；三包普通/race全量 | 通过；192waiters受3worker限额，cleanup屏障前记录入口/Commit均0、放行后各1 |
+| 2026-10-28，T07-T09独立审核 | 清理、唯一owner、六工厂激活、stop=false callback屏障，定向race20/30轮 | 通过，无未解决finding |

@@ -691,7 +691,7 @@ func TestQueueWaitRecordedMultipleWaiters(t *testing.T) {
 }
 
 // TestQueueWaitRecordedIsolatedFromWaitEdits：收尾结果必须取自运行自己冻结的结局，
-// 不能是 Wait 递出去的那个活对象。两种时序都要挡住：提交期间被改写、worker 消费前被改写。
+// 不能受 Wait 返回值的改写影响。覆盖提交期间与闭包收尾前两种时序。
 func TestQueueWaitRecordedIsolatedFromWaitEdits(t *testing.T) {
 	const original = "原始结果"
 	const edited = "调用方改写"
@@ -748,26 +748,31 @@ func TestQueueWaitRecordedIsolatedFromWaitEdits(t *testing.T) {
 		assertBothOriginal(t, settled, store, threadID)
 	})
 
-	t.Run("worker 消费前被改写", func(t *testing.T) {
-		threadID := "q-isolate-before-consume"
+	t.Run("worker 收尾前被改写", func(t *testing.T) {
+		threadID := "q-isolate-before-settle"
 		store := newSettleStore()
+		store.gateOn = true
 		a := durableTextAgent(t, store, original)
-		rq := &recordQueue{} // 接收任务但没有 worker
+		rq := &recordQueue{}
 
 		h, err := EnqueueAgent(context.Background(), rq, a, "go", agent.OnThread(threadID))
 		if err != nil {
 			t.Fatalf("EnqueueAgent: %v", err)
 		}
 		_, accepted := rq.snapshot()
+		workerDone := make(chan error, 1)
+		go func() { workerDone <- runQueueJob(accepted[0]) }()
+		<-store.entered
 
-		// 调用方先自己把运行驱动到结束，再改写拿到的结果，然后才让 worker 消费。
+		// 只有 worker 可以启动运行；Wait 返回后改写结果，闭包仍在记录闸门中。
 		res, err := h.Wait()
 		if err != nil {
 			t.Fatalf("运行失败: %v", err)
 		}
 		res.Message.Parts[0] = core.Text{Text: edited}
+		close(store.release)
 
-		if err := runQueueJob(accepted[0]); err != nil {
+		if err := <-workerDone; err != nil {
 			t.Fatalf("消费任务失败: %v", err)
 		}
 		settled, err := h.WaitRecorded()

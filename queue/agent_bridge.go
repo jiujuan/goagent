@@ -28,9 +28,9 @@ type Handle struct {
 	ID  string
 	run *agent.Run
 
-	// owner records the agent so the worker can commit this run's terminal record
-	// after the run settles; RecordCompletion rejects a run from another agent.
-	owner *agent.Agent
+	// recordCompletion is bound to the submitting agent once, preserving its
+	// run ownership check when the worker records the settled outcome.
+	recordCompletion func(context.Context, *agent.Run) error
 	// cancelWork releases the queue-owned execution context. Enqueue failure,
 	// Cancel, and the worker closure (defer) all call it; it is idempotent.
 	cancelWork context.CancelFunc
@@ -49,9 +49,10 @@ type Handle struct {
 	settleErr  error
 }
 
-// Wait blocks until the background run settles and returns its result. Success
-// does not mean the terminal record has been written — that is WaitRecorded.
-func (h *Handle) Wait() (core.Result, error) { return h.run.Wait() }
+// Wait observes settlement without starting the run. A worker must pick up the
+// job, or Cancel must settle the prepared run. Success does not mean the
+// terminal record has been written — that is WaitRecorded.
+func (h *Handle) Wait() (core.Result, error) { return h.run.Await(context.Background()) }
 
 // WaitRecorded blocks until the worker has settled the run and attempted to
 // commit its terminal record, then returns the run's result with
@@ -131,12 +132,12 @@ func submitAgentRun(ctx context.Context, q Queue, a *agent.Agent, input string, 
 	// that has already been handed over.
 	workCtx, cancelWork := context.WithCancel(context.WithoutCancel(ctx))
 	h := &Handle{
-		ID:         core.NewID("job"),
-		run:        a.Stream(workCtx, input, opts...),
-		owner:      a,
-		cancelWork: cancelWork,
-		workDone:   workCtx.Done(),
-		settle:     make(chan struct{}),
+		ID:               core.NewID("job"),
+		run:              a.Stream(workCtx, input, opts...),
+		recordCompletion: a.RecordCompletion,
+		cancelWork:       cancelWork,
+		workDone:         workCtx.Done(),
+		settle:           make(chan struct{}),
 	}
 	job := Job{
 		ID: h.ID,
@@ -146,12 +147,11 @@ func submitAgentRun(ctx context.Context, q Queue, a *agent.Agent, input string, 
 			// run that ended in error or pause.
 			defer h.cancelWork()
 
-			// Wait only drives the run to its own settlement. The outcome reported
-			// below comes from what drive froze, because Wait hands out the run's live
-			// result object: a caller editing that — while the record is still being
-			// written, or before this job was even picked up — must not change what
-			// WaitRecorded returns, and it must keep agreeing with the terminal record.
-			h.run.Wait()
+			// Pool owns the execution slot before invoking this closure. Only the
+			// worker starts the run, then waits through cleanup even if workCtx is
+			// canceled. Recording must use the outcome frozen after full settlement.
+			h.run.Start()
+			h.run.Await(context.Background())
 			res, runErr := h.run.FrozenOutcome()
 			err := errors.Join(runErr, h.commitTerminal(workCtx))
 			// The settled outcome is stored and WaitRecorded unblocked before the
@@ -180,7 +180,7 @@ func (h *Handle) commitTerminal(workCtx context.Context) error {
 	}
 	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(workCtx), terminalRecordTimeout)
 	defer cancel()
-	return h.owner.RecordCompletion(recordCtx, h.run)
+	return h.recordCompletion(recordCtx, h.run)
 }
 
 // recordSettled freezes the worker's joined outcome and releases WaitRecorded.
