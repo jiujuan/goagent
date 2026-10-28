@@ -22,6 +22,14 @@ func (r *Run) Cancel() {
 		r.lifecycleMu.Unlock()
 		return
 	}
+	// Register the request before canceling the context outside the lock.
+	// The execution owner may reach settlement before that call runs.
+	if phase < runSettling && r.cancelErr == nil {
+		r.cancelErr = r.rc.Context.Err()
+		if r.cancelErr == nil {
+			r.cancelErr = context.Canceled
+		}
+	}
 	owner := phase == runPrepared
 	if owner {
 		r.phase = runSettling
@@ -38,10 +46,16 @@ func (r *Run) Cancel() {
 	}
 }
 
-func (r *Run) beginSettlement() {
+// beginSettlement fixes the cancellation cutoff under the same lock as Cancel.
+// Parent context cancellation is visible even before its AfterFunc is scheduled.
+func (r *Run) beginSettlement() error {
 	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.cancelErr == nil {
+		r.cancelErr = r.rc.Context.Err()
+	}
 	r.phase = runSettling
-	r.lifecycleMu.Unlock()
+	return r.cancelErr
 }
 func (r *Run) completeSettlement() {
 	r.lifecycleMu.Lock()

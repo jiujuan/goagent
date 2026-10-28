@@ -65,6 +65,7 @@ type Run struct {
 
 	lifecycleMu        sync.Mutex
 	phase              runPhase
+	cancelErr          error // cancellation registered before the Settling cutoff
 	preparedSettlement bool
 	activated          bool
 	stopParent         func() bool
