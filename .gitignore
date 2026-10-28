@@ -25,6 +25,7 @@ _cgo_export.h
 *~
 .claude
 
+.scratch/
 
 
 # 忽略本地开发环境和凭证文件
