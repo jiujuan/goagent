@@ -99,11 +99,9 @@ func (a *Agent) Bus() *bus.Bus { return a.bus }
 // finishRun notifies the run-end capability of each configured middleware, in
 // registration order. Workflow agents have no loop, so the hook walks the
 // configured middleware list rather than the loop's stack.
-func (a *Agent) finishRun(rc *RunContext, res core.Result, err error) {
-	for _, m := range a.cfg.middleware {
-		if f, ok := m.(RunFinisher); ok {
-			f.FinishRun(rc, res, err)
-		}
+func (a *Agent) finishRun(rc *RunContext, calls []runFinishCall, err error) {
+	for _, call := range calls {
+		call.hook.FinishRun(rc, call.result, err)
 	}
 }
 

@@ -144,20 +144,20 @@ func pausingAgent(t *testing.T) (*agent.Agent, *atomic.Int64) {
 // terminalEvent 排空 Wait 之后仍缓冲着的订阅事件，返回其中最后出现的终态事件。
 // 终态由 drive 的同一个 goroutine 发布，且先于 done 关闭，所以 Wait 返回后排空即可见。
 func terminalEvent(ch <-chan core.Event) (core.Event, bool) {
-	var last core.Event
-	var found bool
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
 	for {
 		select {
 		case ev, ok := <-ch:
 			if !ok {
-				return last, found
+				return nil, false
 			}
 			switch ev.(type) {
 			case core.RunDone, core.RunFailed, core.Interrupted:
-				last, found = ev, true
+				return ev, true
 			}
-		default:
-			return last, found
+		case <-deadline.C:
+			return nil, false
 		}
 	}
 }

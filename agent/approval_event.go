@@ -92,6 +92,12 @@ func (r *Run) RecordApproval(ctx context.Context, decision ApprovalDecision) (ch
 	if err != nil {
 		return checkpoint.DecisionReceipt{}, err
 	}
+	r.observationMu.Lock()
+	sealed := r.eventsSealed
+	r.observationMu.Unlock()
+	if sealed {
+		return receipt, nil
+	}
 	// The durable receipt is authoritative; observer cancellation cannot undo it.
 	_ = r.bus.PublishContext(ctx, r.topic, core.ApprovalDecided{Decision: receipt.Decision, Duplicate: receipt.Duplicate})
 	return receipt, nil

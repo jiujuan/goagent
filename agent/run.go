@@ -53,13 +53,14 @@ type Run struct {
 	admission AdmissionOptions
 
 	startOnce sync.Once
-	doneOnce  sync.Once
 	done      chan struct{}
-	result    core.Result
-	err       error
 
 	mu        sync.Mutex
 	decisions []Approval
+
+	observationMu sync.Mutex
+	eventsSealed  bool
+	eventTail     []core.Event
 
 	lifecycleMu  sync.Mutex
 	driveStarted bool
@@ -102,11 +103,10 @@ type Run struct {
 // terminal result/error for Wait().
 func (r *Run) Iter() iter.Seq2[core.Event, error] {
 	return func(yield func(core.Event, error) bool) {
-		ch, cancel := r.bus.Subscribe(r.topic, bus.Lossless)
+		ch, cancel := r.subscribeRun(bus.Lossless)
 		defer cancel()
 		r.drive()
 		for ev, err := range bus.Adapt(ch) {
-			r.capture(ev)
 			if !yield(ev, err) {
 				return
 			}
@@ -117,7 +117,7 @@ func (r *Run) Iter() iter.Seq2[core.Event, error] {
 // Events returns a raw subscription channel and cancel func for a chosen
 // DeliveryMode (e.g. Lossy for a UI). Call Iter or Wait to begin driving.
 func (r *Run) Events(mode bus.DeliveryMode) (<-chan core.Event, func()) {
-	return r.bus.Subscribe(r.topic, mode)
+	return r.subscribeRun(mode)
 }
 
 // Wait blocks until the run settles and returns its result or error. It drives
@@ -125,24 +125,22 @@ func (r *Run) Events(mode bus.DeliveryMode) (<-chan core.Event, func()) {
 func (r *Run) Wait() (core.Result, error) {
 	select {
 	case <-r.done:
-		return r.result, r.err
+		return r.FrozenOutcome()
 	default:
 	}
-	ch, cancel := r.bus.Subscribe(r.topic, bus.Lossless)
+	ch, cancel := r.subscribeRun(bus.Lossless)
 	defer cancel()
 	r.drive()
 	for {
 		select {
 		case <-r.done:
-			return r.result, r.err
+			return r.FrozenOutcome()
 		case ev, ok := <-ch:
 			if !ok {
 				<-r.done
-				return r.result, r.err
+				return r.FrozenOutcome()
 			}
-			if r.capture(ev) {
-				return r.result, r.err
-			}
+			_ = ev // Observation does not decide settlement.
 		}
 	}
 }
@@ -205,166 +203,38 @@ func (r *Run) FrozenOutcome() (core.Result, error) {
 	if !r.terminalFrozen {
 		return core.Result{}, nil
 	}
-	out := r.terminalResult
-	if cloned, err := core.CloneMessage(r.terminalResult.Message); err == nil {
-		out = core.Result{Message: cloned}
+	out, err := cloneResult(r.terminalResult)
+	if err != nil {
+		return core.Result{}, errors.Join(r.terminalErr, err)
 	}
 	return out, r.terminalErr
 }
 
-// freezeTerminal records how this run ended together with the boundary it last
-// committed and the identity that produced it. drive() calls it before publishing
-// any lifecycle event, so an observer that sees the terminal result always finds a
-// complete record, and the stored result is a deep copy — a caller editing what
-// Wait returned cannot reach it. The thread, run and turn identifiers are copied
-// here rather than read back from the exported Run fields later, so rewriting those
-// fields cannot reattribute a finished run.
-func (r *Run) freezeTerminal(boundaryID string, boundaryRev uint64, boundaryOK bool, res core.Result, err error, paused bool) {
-	frozen := res
-	if cloned, cloneErr := core.CloneMessage(res.Message); cloneErr == nil {
-		frozen = core.Result{Message: cloned}
-	}
-	// Read the turn before taking terminalMu so the lineage mutex is never nested
-	// under it.
-	turnID := r.rc.runTurnID()
-
-	r.terminalMu.Lock()
-	defer r.terminalMu.Unlock()
-	if r.terminalFrozen {
-		return
-	}
-	r.terminalFrozen = true
-	r.terminalPaused = paused
-	r.terminalResult = frozen
-	r.terminalErr = err
-	r.terminalThreadID = r.identity.threadID
-	r.terminalRunID = r.identity.runID
-	r.terminalTurnID = turnID
-	r.boundaryID, r.boundaryRev, r.boundaryOK = boundaryID, boundaryRev, boundaryOK
-}
-
-// freezeFailure records a run that ended without executing (or before it could
-// commit anything), so its boundary is whatever the run did commit by that point.
-func (r *Run) freezeFailure(err error) {
-	id, revision, ok := r.rc.committedBoundary()
-	r.freezeTerminal(id, revision, ok, core.Result{}, err, false)
-}
-
-// drive launches the run exactly once. It owns the lifecycle events: RunStarted
-// before, and the single terminal event (RunDone/RunFailed/Interrupted) derived
-// from the runnable's outcome. Runnables (including nested workflow children)
-// never publish lifecycle, so the shared topic carries exactly one of each.
+// drive launches the execution owner once. Observers never settle a run.
 func (r *Run) drive() {
 	r.startOnce.Do(func() {
 		r.lifecycleMu.Lock()
 		r.driveStarted = true
 		r.lifecycleMu.Unlock()
 		go func() {
-			defer r.releaseAdmission()
-			_ = r.bus.PublishContext(r.rc.Context, r.topic, core.RunStarted{RunID: r.identity.runID, ThreadID: r.identity.threadID})
+			r.rc.publish(core.RunStarted{RunID: r.identity.runID, ThreadID: r.identity.threadID})
 			if r.startErr != nil {
-				r.rc.steering.close(ErrRunClosed)
-				err := errors.Join(r.startErr, r.rc.releaseDurableClaim())
-				r.freezeFailure(err)
-				r.bus.Publish(r.topic, core.RunFailed{Err: err})
-				r.finish(core.Result{}, err)
+				r.settleExecution(runOutcome{Err: r.startErr}, false, false)
 				return
 			}
 			if err := r.prepare(); err != nil {
-				r.rc.steering.close(ErrRunClosed)
 				r.lifecycleMu.Lock()
 				cancelErr := r.cancelErr
 				r.lifecycleMu.Unlock()
-				err = errors.Join(err, cancelErr, r.rc.releaseDurableClaim())
-				r.freezeFailure(err)
-				r.bus.Publish(r.topic, core.RunFailed{Err: err})
-				r.finish(core.Result{}, err)
+				r.settleExecution(runOutcome{Err: errors.Join(err, cancelErr)}, false, false)
 				return
 			}
 			task := r.rc.taskInfo()
-			_ = r.bus.PublishContext(r.rc.Context, r.topic, core.TaskStarted{
-				TaskID:   task.ID,
-				ParentID: task.ParentID,
-				ThreadID: task.ThreadID,
-				Kind:     string(task.Kind),
-				Depth:    task.Depth,
-			})
+			r.rc.publish(core.TaskStarted{TaskID: task.ID, ParentID: task.ParentID, ThreadID: task.ThreadID, Kind: string(task.Kind), Depth: task.Depth})
 			for _, ev := range r.rc.drainApprovalEvents() {
-				_ = r.bus.PublishContext(r.rc.Context, r.topic, ev)
+				r.rc.publish(ev)
 			}
-			out := r.runnable.run(r.rc)
-			r.rc.steering.close(out.inputCloseReason())
-			// The boundary is captured while the claim is still held, and the
-			// outcome is frozen with it before any terminal event goes out.
-			boundaryID, boundaryRev, boundaryOK := r.rc.committedBoundary()
-			cleanupErr := r.rc.releaseDurableClaim()
-			// Release the thread only after the claim, so the next admitted
-			// run begins on a settled thread rather than colliding with a
-			// claim this one still holds.
-			r.releaseAdmission()
-			res, err, paused := terminalOutcome(out, cleanupErr)
-			r.freezeTerminal(boundaryID, boundaryRev, boundaryOK, res, err, paused)
-
-			// TaskDone reports the terminal outcome, including a failed claim
-			// release, but is still published before the run's terminal event.
-			statusOut := out
-			if err != nil {
-				statusOut.Err = err
-			}
-			if paused {
-				statusOut.Control = core.Directive{Kind: core.Interrupt}
-			}
-			r.bus.Publish(r.topic, core.TaskDone{
-				TaskID: task.ID,
-				Kind:   string(task.Kind),
-				Status: taskStatus(statusOut),
-				Err:    err,
-			})
-
-			switch {
-			case err != nil:
-				r.agent.finishRun(r.rc, core.Result{}, err)
-				r.bus.Publish(r.topic, core.RunFailed{Err: err})
-				r.finish(core.Result{}, err)
-			case paused:
-				// Paused, not finished: run-end hooks wait for the eventual
-				// completion (or failure) after a resume.
-				r.bus.Publish(r.topic, core.Interrupted{
-					Pending:  out.Pending,
-					Phase:    out.Phase,
-					Reason:   out.Reason,
-					Recovery: out.Recovery,
-				})
-				r.finish(core.Result{}, nil)
-			default:
-				r.agent.finishRun(r.rc, out.Result, nil)
-				r.bus.Publish(r.topic, core.RunDone{Result: out.Result})
-				r.finish(out.Result, nil)
-			}
+			r.settleExecution(r.runnable.run(r.rc), true, true)
 		}()
-	})
-}
-
-// capture records a terminal event and reports whether it was terminal.
-func (r *Run) capture(ev core.Event) bool {
-	switch e := ev.(type) {
-	case core.RunDone:
-		r.finish(e.Result, nil)
-		return true
-	case core.RunFailed:
-		r.finish(core.Result{}, e.Err)
-		return true
-	case core.Interrupted:
-		r.finish(core.Result{}, nil)
-		return true
-	default:
-		return false
-	}
-}
-
-func (r *Run) finish(res core.Result, err error) {
-	r.doneOnce.Do(func() {
-		r.result, r.err = res, err
-		close(r.done)
 	})
 }

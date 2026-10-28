@@ -100,12 +100,27 @@ func TestApprovalDecisionIdempotency(t *testing.T) {
 	if err != nil || first.Duplicate {
 		t.Fatalf("first approval = %+v, %v", first, err)
 	}
-	waitForApprovalEvent(t, events, "approval-1", false)
 	duplicate, err := run.RecordApproval(ctx, decision)
 	if err != nil || !duplicate.Duplicate || duplicate.Decision != first.Decision {
 		t.Fatalf("duplicate approval = %+v, %v", duplicate, err)
 	}
-	waitForApprovalEvent(t, events, "approval-1", true)
+	// Recording against a settled pause must not reopen its sealed stream.
+	pausedEvents := 0
+	for ev := range events {
+		switch ev.(type) {
+		case core.ApprovalDecided:
+			t.Fatal("approval reopened a sealed run stream")
+		case core.Interrupted:
+			pausedEvents++
+		}
+	}
+	if pausedEvents != 1 {
+		t.Fatalf("pause terminal events=%d", pausedEvents)
+	}
+	recorded, err := store.Decisions(ctx, "t1", first.Decision.PauseID)
+	if err != nil || len(recorded) != 1 || recorded[0] != first.Decision {
+		t.Fatalf("durable decisions=%+v, %v", recorded, err)
+	}
 
 	conflict := decision
 	conflict.DecisionID = "approval-2"
@@ -378,22 +393,6 @@ func waitForPause(t *testing.T, run *agent.Run) []core.ApprovalRequest {
 		t.Fatal("expected an interrupted run with pending approval")
 	}
 	return pending
-}
-
-func waitForApprovalEvent(t *testing.T, events <-chan core.Event, decisionID string, duplicate bool) {
-	t.Helper()
-	timeout := time.NewTimer(2 * time.Second)
-	defer timeout.Stop()
-	for {
-		select {
-		case event := <-events:
-			if decided, ok := event.(core.ApprovalDecided); ok && decided.Decision.DecisionID == decisionID && decided.Duplicate == duplicate {
-				return
-			}
-		case <-timeout.C:
-			t.Fatalf("did not receive approval event decision=%q duplicate=%t", decisionID, duplicate)
-		}
-	}
 }
 
 func phase2Invocation(threadID string, step int, call core.ToolCall) (string, string) {

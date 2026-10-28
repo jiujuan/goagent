@@ -229,14 +229,14 @@ Bus.mu: 摘除当前 topic 的订阅集合 → 解锁
 
 **依赖：** T01。**文件：** 修改 `agent/runtime.go`、`agent/run.go`、`agent/approval_event.go`；在 `agent/run_integration_internal_test.go` 新增本任务用例。核验 workflow.go、plan.go 及所有直接发布点。
 
-- [ ] 新增 `TestFrameworkPublishCancelledWhenFull`，分别覆盖 RunStarted、TaskStarted 和 RunContext.publish；执行入口普通事件统一走 rc.publish；在隔离测试中用三种事件填满缓冲后取消执行 context，确认这一次普通发布调用退出。T03 不以“根运行在满缓冲、无人消费时 done 关闭”为验收条件；该条件依赖 T05。
-- [ ] 新增 `TestApprovalReceiptSurvivesObserverCancellation`：先阻塞通知再取消通知 context，durable receipt 仍可从 store 查询；不能因为观测失败重写或否认已提交的审批。
-- [ ] 执行 `go test ./agent -run 'Test(FrameworkPublish|ApprovalReceipt)' -count=1 -timeout=30s` 观察缺口。
-- [ ] RunContext.publish 保持现有无返回值的内部签名，使用 `rc.Bus.PublishContext(rc.Context, rc.Topic, ev)`；退出由执行 context 和既有循环取消检查传播，不凭观察者退订创建运行错误。执行入口的 RunStarted、TaskStarted 等普通发布点同样使用运行 context；根 TaskDone 与 RunDone/RunFailed/Interrupted 在 T03/T04 暂保留原 Bus.Publish，确保已取消运行仍能向旧 Iter 交付终态；T05 再一次性换成 sealEvents/FinishTopic。
-- [ ] RecordApproval 的通知用调用方 ctx 发布；持久化成功是权威结果，忽略单纯通知交付失败，T05 再加入 Run 已封闭检查。不可把调用方 context 替换为 Background 重新无限等待。
-- [ ] 检索 `rg -n '\.Publish\(' agent`：在 T03/T04 只允许根 TaskDone 与 Run 终态继续使用兼容 Publish，并写明临时原因；T05 后这些调用全部迁移到 FinishTopic。子任务 TaskDone 始终不迁移到 FinishTopic。
-- [ ] 执行 `go test ./agent ./queue -count=1 -timeout=120s`；预期既有失败/取消/并行 workflow 回归继续通过。
-- [ ] 生成提交候选：`fix(agent): cancel blocked framework event publishing`。
+- [x] 新增 `TestFrameworkPublishCancelledWhenFull`，分别覆盖 RunStarted、TaskStarted 和 RunContext.publish；执行入口普通事件统一走 rc.publish；在隔离测试中用三种事件填满缓冲后取消执行 context，确认这一次普通发布调用退出。T03 不以“根运行在满缓冲、无人消费时 done 关闭”为验收条件；该条件依赖 T05。
+- [x] 新增 `TestApprovalReceiptSurvivesObserverCancellation`：先阻塞通知再取消通知 context，durable receipt 仍可从 store 查询；不能因为观测失败重写或否认已提交的审批。
+- [x] 执行 `go test ./agent -run 'Test(FrameworkPublish|ApprovalReceipt)' -count=1 -timeout=30s` 观察缺口。
+- [x] RunContext.publish 保持现有无返回值的内部签名，使用 `rc.Bus.PublishContext(rc.Context, rc.Topic, ev)`；退出由执行 context 和既有循环取消检查传播，不凭观察者退订创建运行错误。执行入口的 RunStarted、TaskStarted 等普通发布点同样使用运行 context；根 TaskDone 与 RunDone/RunFailed/Interrupted 在 T03/T04 暂保留原 Bus.Publish，确保已取消运行仍能向旧 Iter 交付终态；T05 再一次性换成 sealEvents/FinishTopic。
+- [x] RecordApproval 的通知用调用方 ctx 发布；持久化成功是权威结果，忽略单纯通知交付失败，T05 再加入 Run 已封闭检查。不可把调用方 context 替换为 Background 重新无限等待。
+- [x] 检索 `rg -n '\.Publish\(' agent`：在 T03/T04 只允许根 TaskDone 与 Run 终态继续使用兼容 Publish，并写明临时原因；T05 后这些调用全部迁移到 FinishTopic。子任务 TaskDone 始终不迁移到 FinishTopic。
+- [x] 执行 `go test ./agent ./queue -count=1 -timeout=120s`；预期既有失败/取消/并行 workflow 回归继续通过。
+- [x] 生成提交候选：`fix(agent): cancel blocked framework event publishing`。
 
 **DoD：** 框架运行 context 能打断普通事件背压；根尾部的旧交付方式仅保留到 T05，禁止提前改成已取消 context 的 PublishContext；派生 RunContext 沿用正确执行取消；审批 receipt 与观察交付脱钩；尚未宣称满缓冲根终态和 Prepared Cancel 验收完成。
 
@@ -246,19 +246,19 @@ Bus.mu: 摘除当前 topic 的订阅集合 → 解锁
 
 **依赖：** T03。**文件：** 修改 `agent/run.go`、`agent/agent.go`、`agent/run_prepare.go`；新增 `agent/run_outcome.go`、`agent/run_outcome_internal_test.go`。
 
-- [ ] 新增下列测试；用 channel 控制 store 和 hook，不以 sleep 推断先后：
+- [x] 新增下列测试；用 channel 控制 store 和 hook，不以 sleep 推断先后：
   - `TestPrepareFailureReleasesClaimBeforeAdmission`：A 已获 gate/claim，prepare 失败且 claim release 被屏障挡住；B 的 BeginRun 计数保持 0，放行 A 的释放尝试后 B 才能进入。
   - `TestFreezeFailurePrecedesFinishRun`：构造 `core.CloneMessage` 必定失败的合法测试消息，最终 hook/Wait/FrozenOutcome/终态均报告失败；T06 后补验 Await，hook 不得先收到成功。
   - `TestFinishRunMutationDoesNotChangeOutcome`：hook 改写结果消息与可变片段，FrozenOutcome、DetailedResult、RunDone 与 RecordCompletion 仍是相同冻结值。
   - `TestPrepareFailurePreservesHookEligibility`、`TestPausedRunSkipsFinishRun`：准备失败不新增旧代码没有的 hook；无错误暂停不调用 FinishRun。
-- [ ] 修改 prepare：删除“prepare 任意错误时 defer 先 releaseAdmission”的路径。只有真正取得 gate 才交 Run 结算权；prepare 错误也由结算者先尝试释放 durable claim/guard，再释放 gate。未取得 gate 时不释放。
-- [ ] 统一所有成功、startErr、prepare 错误、执行错误、取消/暂停路径进入 `settleExecution(out, rootStarted, hooksEligible)`。它是唯一的结果写入者和 done 关闭者；彻底移除 `capture`、`finish`、`doneOnce` 等观察者结算路径。
-- [ ] 顺序固定：关闭 steering → 在仍持有 claim 时捕获 checkpoint boundary → 停止/释放 guard 与 claim（T07 补齐全部路径的有界性） → 释放 gate → 合并 cleanup 错误 → 完成结果规范化、hook 参数副本和终态尾部 payload 副本准备 → 冻结结果/身份/boundary → 用独立副本调用既有 eligible hooks → 取出已准备的尾部 → T05 封闭观察 → T09 取出 AfterFunc stop 并在锁外 stop/release context → T08 发布 Settled 与关闭 done。本任务先保留现有 Bus.Publish 根尾部交付和 done 结束入口；不得使用已取消的执行 context 发布终态，T05 替换为 sealEvents；最终协议在 M2 联合验收，不提前引用尚未新增的函数/字段。
-- [ ] `cloneResult` 失败必须改成零结果失败 outcome，再冻结并交给 hook；不返回/保存原对象。hook 不改变结局且不逐个 hook 重新判错。FrozenOutcome、DetailedResult、T06 的 Await 和队列记录读取一致冻结 outcome。FrozenOutcome/Await 有 error 出口，二次 Clone 失败返回明确错误且绝不共享；DetailedResult 不改签名，只从已验证规范数据复制，防御性复制失败时返回零 Result，不能回退共享原值。
-- [ ] 对 `rootStarted=false` 的尾部只构造 `RunFailed`，不伪造 TaskDone；`rootStarted=true` 尾部为根 TaskDone + 且仅一个 RunDone/RunFailed/Interrupted。未启动取消（T08）不发 RunStarted。workflow/plan child TaskDone 不在此处封闭。
-- [ ] `RunContext.releaseDurableClaim` 的所有错误进入冻结失败结局；若 guard 释放失败保留原 fencing/retry 行为，先记录错误再释放 gate，不谎称资源释放成功。
-- [ ] 执行 `go test ./agent -run 'Test(PrepareFailureReleasesClaimBeforeAdmission|FreezeFailurePrecedesFinishRun|FinishRunMutationDoesNotChangeOutcome|PrepareFailurePreservesHookEligibility|PausedRunSkipsFinishRun|RunFinisher)' -count=1 -timeout=90s`，再执行 `go test ./agent ./queue -count=1 -timeout=150s`。
-- [ ] 生成提交候选：`refactor(agent): centralize run outcome settlement`。
+- [x] 修改 prepare：删除“prepare 任意错误时 defer 先 releaseAdmission”的路径。只有真正取得 gate 才交 Run 结算权；prepare 错误也由结算者先尝试释放 durable claim/guard，再释放 gate。未取得 gate 时不释放。
+- [x] 统一所有成功、startErr、prepare 错误、执行错误、取消/暂停路径进入 `settleExecution(out, rootStarted, hooksEligible)`。它是唯一的结果写入者和 done 关闭者；彻底移除 `capture`、`finish`、`doneOnce` 等观察者结算路径。
+- [x] 顺序固定：关闭 steering → 在仍持有 claim 时捕获 checkpoint boundary → 停止/释放 guard 与 claim（T07 补齐全部路径的有界性） → 释放 gate → 合并 cleanup 错误 → 完成结果规范化、hook 参数副本和终态尾部 payload 副本准备 → 冻结结果/身份/boundary → 用独立副本调用既有 eligible hooks → 取出已准备的尾部 → T05 封闭观察 → T09 取出 AfterFunc stop 并在锁外 stop/release context → T08 发布 Settled 与关闭 done。本任务先保留现有 Bus.Publish 根尾部交付和 done 结束入口；不得使用已取消的执行 context 发布终态，T05 替换为 sealEvents；最终协议在 M2 联合验收，不提前引用尚未新增的函数/字段。
+- [x] `cloneResult` 失败必须改成零结果失败 outcome，再冻结并交给 hook；不返回/保存原对象。hook 不改变结局且不逐个 hook 重新判错。FrozenOutcome、DetailedResult、T06 的 Await 和队列记录读取一致冻结 outcome。FrozenOutcome/Await 有 error 出口，二次 Clone 失败返回明确错误且绝不共享；DetailedResult 不改签名，只从已验证规范数据复制，防御性复制失败时返回零 Result，不能回退共享原值。
+- [x] 对 `rootStarted=false` 的尾部只构造 `RunFailed`，不伪造 TaskDone；`rootStarted=true` 尾部为根 TaskDone + 且仅一个 RunDone/RunFailed/Interrupted。未启动取消（T08）不发 RunStarted。workflow/plan child TaskDone 不在此处封闭。
+- [x] `RunContext.releaseDurableClaim` 的所有错误进入冻结失败结局；若 guard 释放失败保留原 fencing/retry 行为，先记录错误再释放 gate，不谎称资源释放成功。
+- [x] 执行 `go test ./agent -run 'Test(PrepareFailureReleasesClaimBeforeAdmission|FreezeFailurePrecedesFinishRun|FinishRunMutationDoesNotChangeOutcome|PrepareFailurePreservesHookEligibility|PausedRunSkipsFinishRun|RunFinisher)' -count=1 -timeout=90s`，再执行 `go test ./agent ./queue -count=1 -timeout=150s`。
+- [x] 生成提交候选：`refactor(agent): centralize run outcome settlement`。
 
 **DoD：** 只有一个结算 owner；claim/gate 顺序覆盖正常和 prepare 错误；冻结失败先于 hook；hook/观察者可变输入不能污染结局；暂停与既有 hook eligibility 未变化。
 
@@ -266,16 +266,16 @@ Bus.mu: 摘除当前 topic 的订阅集合 → 解锁
 
 **依赖：** T02、T04。**文件：** 修改 `agent/run.go`、`agent/approval_event.go`、`queue/agent_bridge_test.go`；新增 `agent/run_observation.go`、`agent/run_observation_internal_test.go`。
 
-- [ ] 测试：`TestIterAfterSuccessfulWaitReturnsTerminalTail`、`TestEventsAfterFailureAreFinite`、`TestIterAfterPauseDoesNotRestart`、`TestLateSubscriberGetsNoProgressReplay`、`TestSubscribeAndSealRace`、`TestSlowTerminalObserverDoesNotBlockWait`、`TestEarlyBreakUnsubscribesTailSender`、`TestWorkflowChildTaskDoneRemainsCancelable`、`TestTerminalCopiesAreIndependent`。
-- [ ] 将原 `queue/agent_bridge_test.go` 中 `terminalEvent` 从“Wait 后立即非阻塞排空”改为接收至终态、channel close 或测试 deadline。保留事件顺序断言；测试 deadline 仅为失败保护，不作为生产语义。
-- [ ] 所有 `Iter` 消费时必须在 `subscribeRun(Lossless)` 成功后调用当前唯一执行入口 `drive()`；T06 再将调用替换为公开 `Start()`。`defer unsubscribe` 在 yield 返回 false、panic unwind 及正常结束路径均运行。Iter 不再调用 capture。
-- [ ] `Events(mode)` 仍不启动；只返回 `subscribeRun(mode)` 的 `(channel, unsubscribe)`。活动 Run 的订阅不 replay 历史；已封闭 Run 返回只含隔离终态尾部且已关闭的有限 channel。
-- [ ] `subscribeRun` 与 `sealEvents` 使用同一个 `observationMu`。锁内选择订阅分支或发布 sealed 标记/尾部缓存，并调用不等待消费的 FinishTopic 完成摘除；不在锁内等待、发送或执行可失败规范化。缓存和每订阅的已规范化副本均不能暴露共享可变引用。
-- [ ] `settleExecution` 中完成封闭调用前已冻结所有可能失败的数据；此处不再 clone 并改变 run outcome。FinishTopic 不等待 channel 腾空间，故满缓冲普通事件可先留在通道里，消费者恢复后依次读到普通事件和尾部。
-- [ ] RecordApproval 的 receipt 写入仍是权威操作；如果所属 Run 已 sealed，不调用 generic Publish 重新开旧流、不改变 receipt 结果。活动时仅通过 PublishContext 尝试通知。
-- [ ] workflow.go/plan.go 的子 TaskDone 在子任务正常结束时仍是 PublishContext 普通事件；只测取消可打断，禁止调用 FinishTopic 或把 child 完成提升成根终态尾部。
-- [ ] 执行 `go test ./agent ./queue -run 'Test(IterAfter|EventsAfter|LateSubscriber|SubscribeAndSeal|SlowTerminal|EarlyBreak|WorkflowChild|TerminalCopies|Queue)' -count=1 -timeout=120s` 及 `go test -race ./bus ./agent ./queue -run 'Test(SubscribeAndSeal|FinishTopic|SlowTerminal|EarlyBreak)' -count=20 -timeout=180s`。
-- [ ] 生成提交候选：`fix(agent): seal run events without blocking settlement`。
+- [x] 测试：`TestIterAfterSuccessfulWaitReturnsTerminalTail`、`TestEventsAfterFailureAreFinite`、`TestIterAfterPauseDoesNotRestart`、`TestLateSubscriberGetsNoProgressReplay`、`TestSubscribeAndSealRace`、`TestSlowTerminalObserverDoesNotBlockWait`、`TestEarlyBreakUnsubscribesTailSender`、`TestWorkflowChildTaskDoneRemainsCancelable`、`TestTerminalCopiesAreIndependent`。
+- [x] 将原 `queue/agent_bridge_test.go` 中 `terminalEvent` 从“Wait 后立即非阻塞排空”改为接收至终态、channel close 或测试 deadline。保留事件顺序断言；测试 deadline 仅为失败保护，不作为生产语义。
+- [x] 所有 `Iter` 消费时必须在 `subscribeRun(Lossless)` 成功后调用当前唯一执行入口 `drive()`；T06 再将调用替换为公开 `Start()`。`defer unsubscribe` 在 yield 返回 false、panic unwind 及正常结束路径均运行。Iter 不再调用 capture。
+- [x] `Events(mode)` 仍不启动；只返回 `subscribeRun(mode)` 的 `(channel, unsubscribe)`。活动 Run 的订阅不 replay 历史；已封闭 Run 返回只含隔离终态尾部且已关闭的有限 channel。
+- [x] `subscribeRun` 与 `sealEvents` 使用同一个 `observationMu`。锁内选择订阅分支或发布 sealed 标记/尾部缓存，并调用不等待消费的 FinishTopic 完成摘除；不在锁内等待、发送或执行可失败规范化。缓存和每订阅的已规范化副本均不能暴露共享可变引用。
+- [x] `settleExecution` 中完成封闭调用前已冻结所有可能失败的数据；此处不再 clone 并改变 run outcome。FinishTopic 不等待 channel 腾空间，故满缓冲普通事件可先留在通道里，消费者恢复后依次读到普通事件和尾部。
+- [x] RecordApproval 的 receipt 写入仍是权威操作；如果所属 Run 已 sealed，不调用 generic Publish 重新开旧流、不改变 receipt 结果。活动时仅通过 PublishContext 尝试通知。
+- [x] workflow.go/plan.go 的子 TaskDone 在子任务正常结束时仍是 PublishContext 普通事件；只测取消可打断，禁止调用 FinishTopic 或把 child 完成提升成根终态尾部。
+- [x] 执行 `go test ./agent ./queue -run 'Test(IterAfter|EventsAfter|LateSubscriber|SubscribeAndSeal|SlowTerminal|EarlyBreak|WorkflowChild|TerminalCopies|Queue)' -count=1 -timeout=120s` 及 `go test -race ./bus ./agent ./queue -run 'Test(SubscribeAndSeal|FinishTopic|SlowTerminal|EarlyBreak)' -count=20 -timeout=180s`。
+- [x] 生成提交候选：`fix(agent): seal run events without blocking settlement`。
 
 **DoD：** 每个终态路径只有一份规范尾部；慢/弃读观察者不拖住根结算；不 replay；多次迟到消费有限结束且不重跑；Lossy 不丢终态；已入队普通 Lossless 事件仍先于尾部。
 
@@ -603,3 +603,6 @@ T03 整包回归发现原 `TestPlanParentCancelReturnsContextError` 和 `TestRun
 | --- | --- | --- |
 | 2026-10-28，T03 | FrameworkPublish/ApprovalReceipt 定向红→绿，synctest 确定性等待；取消诊断新测试红→绿 | 通过；durable receipt 不受通知取消影响 |
 | 2026-10-28，M1 | go test ./agent ./queue -count=1 -timeout=120s；go test -race ./bus ./agent -count=1 -timeout=180s | 通过；原取消诊断断言保留，两项定向另重复20轮通过 |
+
+| 2026-10-28，T04/T05 | 冻结失败、hook别名、prepare gate顺序红→绿；late/slow/seal/child定向通过；跨包对应race20轮 | 通过；done 不保证尾部已经进入或读出观察通道 |
+| 2026-10-28，M2 | go test ./agent ./queue -count=1 -timeout=150s | 通过；旧审批幂等测试按已批准sealed契约验证不重开流，保留durable幂等、冲突和Resume audit replay断言 |

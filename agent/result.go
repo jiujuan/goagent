@@ -60,7 +60,6 @@ func (r *Run) DetailedResult() RunResult {
 		return out
 	}
 	out.Paused = r.terminalPaused
-	out.Result = r.terminalResult
 	if cloned, err := core.CloneMessage(r.terminalResult.Message); err == nil {
 		out.Result = core.Result{Message: cloned}
 	}
