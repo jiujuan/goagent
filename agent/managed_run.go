@@ -101,5 +101,6 @@ func (a *Agent) streamManaged(ctx context.Context, rc RunConfig, spec ManagedRun
 		restoreCurrent: true,
 		turnID:         spec.TurnID,
 	}
+	run.activateLifecycle()
 	return run
 }

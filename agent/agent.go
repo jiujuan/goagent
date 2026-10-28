@@ -221,6 +221,7 @@ func (a *Agent) streamConfigured(ctx context.Context, rc RunConfig) *Run {
 	run.admission = rc.admission
 	run.startErr = err
 	run.preparation = &runPreparation{message: message, files: rc.Files, restoreCurrent: true}
+	run.activateLifecycle()
 	return run
 }
 

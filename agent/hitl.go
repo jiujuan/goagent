@@ -214,6 +214,7 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		if a.cfg.stepSnapshotPolicy != StepSnapshotOff && cp.Snapshot != nil {
 			run.rc.replayBaseline = cloneStepSnapshot(cp.Snapshot)
 		}
+		run.activateLifecycle()
 		return run, nil
 	}
 	if a.loop == nil {
@@ -225,11 +226,13 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 			parts = append(parts, errResult(c, "not executed: the thread was resumed by a workflow agent, which has no tool table of its own"))
 		}
 		run.rc.State.Messages = append(run.rc.State.Messages, core.Message{Role: core.RoleTool, Parts: parts})
+		run.activateLifecycle()
 		return run, nil
 	}
 	batch := newResumeBatch(cp.Pending.Step, cp.Pending.Pending, allApprovals, lastAssistant(state.Messages))
 	batch.snapshot = cloneStepSnapshot(cp.Snapshot)
 	run.rc.resumed = batch
+	run.activateLifecycle()
 	return run, nil
 }
 
@@ -308,6 +311,7 @@ func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, a
 		claim:        copyClaim(claim),
 		headRevision: cp.Revision,
 	}
+	run.activateLifecycle()
 	return run, nil
 }
 

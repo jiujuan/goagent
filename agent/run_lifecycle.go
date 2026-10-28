@@ -32,7 +32,7 @@ func (r *Run) Cancel() {
 	r.cancel()
 	r.rc.steering.close(ErrRunStopped)
 	if owner {
-		r.settleExecution(runOutcome{Err: context.Canceled}, false, false)
+		r.settleExecution(runOutcome{Err: r.rc.Context.Err()}, false, false)
 	} else if wait {
 		<-r.done
 	}
@@ -45,7 +45,31 @@ func (r *Run) beginSettlement() {
 }
 func (r *Run) completeSettlement() {
 	r.lifecycleMu.Lock()
+	stop := r.stopParent
+	r.stopParent = nil
+	r.lifecycleMu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	r.cancel()
+	// A callback can be waiting on done. Never join it before publishing done.
+	r.lifecycleMu.Lock()
 	r.phase = runSettled
 	close(r.done)
 	r.lifecycleMu.Unlock()
+}
+
+// activateLifecycle is the final construction step, after all preparation,
+// claims and admission resources have been handed to the handle.
+func (r *Run) activateLifecycle() {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.activated {
+		return
+	}
+	r.activated = true
+	if r.phase == runSettled {
+		return
+	}
+	r.stopParent = context.AfterFunc(r.rc.Context, r.Cancel)
 }

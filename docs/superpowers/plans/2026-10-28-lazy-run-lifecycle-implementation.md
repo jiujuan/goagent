@@ -363,14 +363,14 @@ func (r *Run) Wait() (core.Result, error) {
 
 **依赖：** T08。**文件：** 修改 `agent/agent.go`、`agent/managed_run.go`、`agent/hitl.go`、`agent/run_lifecycle.go`；新增/扩展 `agent/run_lifecycle_internal_test.go`。
 
-- [ ] 工厂覆盖用例：`TestExpiredContextBeforeFirstConsumptionSettles`、`TestActivationAfterResumeResourcesAttached`、`TestAfterFuncRegistrationHandshake`、`TestConcurrentContextCancelAndStart`、`TestCompletedRunIgnoresLaterParentCancel`、`TestResumeInFlightActivatesAfterConstruction`。
-- [ ] 加 `activateLifecycle()`，明确只能在资源全部装配后调用：`streamConfigured` 返回前、`streamManaged` 完成 preparation 后、`Agent.Resume` 每个成功返回分支（包括各 paused/inflight/approval 分支）、`resumeInFlight` 最后；激活后禁止追加 claim/gate/preparation。失败且不返回句柄的分支在本地同步清理其已有资源。
-- [ ] `activateLifecycle` 在 lifecycleMu 内调用 `context.AfterFunc(r.rc.Context, callback)`，保存 stop Func 并发布 activated 标记，再解锁。callback 首先取同一把锁进入 Cancel 状态机；callback 不直接清理未注册资源。
-- [ ] 结算者在 lifecycleMu 内摘取并清空 stop Func、释放锁，再调用 stop；**不得等待回调退出作为 close(done) 前置条件**。stop=false 不是 join 信号；如测试需要确认 callback 退出，用独立 callbackDone，在 done 已关闭后等待。
-- [ ] 激活后已过期 context 可以立即触发完整取消。它必须等所有 Resume claim/gate/preparation 已属于 Run；不得在 newRunHandleWithID 的半构造阶段安装 callback。
-- [ ] 检索所有 `newRunHandle`/`newRunHandleWithID` 用例和工厂；工厂必须激活，直接构造的内部测试 fixture 明确保持未激活或调用完整 helper。没有用户可见的无效窗口。
-- [ ] 执行 `go test ./agent -run 'Test(ExpiredContext|ActivationAfterResume|AfterFunc|ConcurrentContextCancel|CompletedRunIgnores|ResumeInFlightActivates|ResumeCancelBeforeDrive)' -count=1 -timeout=120s` 和 `go test -race ./agent -run 'Test(ExpiredContext|ActivationAfterResume|AfterFunc|ConcurrentContextCancel|CompletedRunIgnores|ResumeInFlightActivates)' -count=30 -timeout=240s`。
-- [ ] 生成提交候选：`fix(agent): activate run cancellation after resource handoff`。
+- [x] 工厂覆盖用例：`TestExpiredContextBeforeFirstConsumptionSettles`、`TestActivationAfterResumeResourcesAttached`、`TestAfterFuncRegistrationHandshake`、`TestConcurrentContextCancelAndStart`、`TestCompletedRunIgnoresLaterParentCancel`、`TestResumeInFlightActivatesAfterConstruction`。
+- [x] 加 `activateLifecycle()`，明确只能在资源全部装配后调用：`streamConfigured` 返回前、`streamManaged` 完成 preparation 后、`Agent.Resume` 每个成功返回分支（包括各 paused/inflight/approval 分支）、`resumeInFlight` 最后；激活后禁止追加 claim/gate/preparation。失败且不返回句柄的分支在本地同步清理其已有资源。
+- [x] `activateLifecycle` 在 lifecycleMu 内调用 `context.AfterFunc(r.rc.Context, callback)`，保存 stop Func 并发布 activated 标记，再解锁。callback 首先取同一把锁进入 Cancel 状态机；callback 不直接清理未注册资源。
+- [x] 结算者在 lifecycleMu 内摘取并清空 stop Func、释放锁，再调用 stop；**不得等待回调退出作为 close(done) 前置条件**。stop=false 不是 join 信号；如测试需要确认 callback 退出，用独立 callbackDone，在 done 已关闭后等待。
+- [x] 激活后已过期 context 可以立即触发完整取消。它必须等所有 Resume claim/gate/preparation 已属于 Run；不得在 newRunHandleWithID 的半构造阶段安装 callback。
+- [x] 检索所有 `newRunHandle`/`newRunHandleWithID` 用例和工厂；工厂必须激活，直接构造的内部测试 fixture 明确保持未激活或调用完整 helper。没有用户可见的无效窗口。
+- [x] 执行 `go test ./agent -run 'Test(ExpiredContext|ActivationAfterResume|AfterFunc|ConcurrentContextCancel|CompletedRunIgnores|ResumeInFlightActivates|ResumeCancelBeforeDrive)' -count=1 -timeout=120s` 和 `go test -race ./agent -run 'Test(ExpiredContext|ActivationAfterResume|AfterFunc|ConcurrentContextCancel|CompletedRunIgnores|ResumeInFlightActivates)' -count=30 -timeout=240s`。
+- [x] 生成提交候选：`fix(agent): activate run cancellation after resource handoff`。
 
 **DoD：** 每个公开工厂恰好一次末步激活；立即 AfterFunc 回调不能越过资源登记；无 callback/done 环形等待；完成后父取消不能改 outcome。
 
@@ -614,3 +614,6 @@ T03 整包回归发现原 `TestPlanParentCancelReturnsContextError` 和 `TestRun
 
 | 2026-10-28，T08 | Prepared Cancel 原实现不能关闭done的红灯；状态机七项绿灯；agent/queue全包；生命周期race20轮 | 通过；Prepared Cancel同步清理且并发调用等done，Started Cancel等实际执行者，claim先于gate |
 | 2026-10-28，M1独立审核 | eaac602及取消即时诊断兼容修正，bus/agent定向race30轮 | 通过，无未解决finding |
+
+| 2026-10-28，T09 | 工厂激活接口缺失红灯；Stream/Managed/Resume三普通分支/InFlight与握手定向；race30轮；agent/queue全包 | 通过；所有工厂末步激活，stop摘取后锁外调用，不join取消callback |
+| 2026-10-28，T06独立审核 | 八项定向race20轮 | 通过；done优先、等待context隔离、独立副本与100waiters零订阅符合规格 |

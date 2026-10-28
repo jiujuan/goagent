@@ -64,6 +64,8 @@ type Run struct {
 	lifecycleMu        sync.Mutex
 	phase              runPhase
 	preparedSettlement bool
+	activated          bool
+	stopParent         func() bool
 	// gateRelease frees the thread slot this run holds. It is nil until
 	// prepare acquires the slot (or a resume hands one over); lifecycleMu
 	// guards it.
