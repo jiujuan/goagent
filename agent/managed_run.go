@@ -45,7 +45,7 @@ func (s ManagedRunSpec) Validate() error {
 	return nil
 }
 
-// StreamManaged starts a run whose identity comes from the caller instead of being
+// StreamManaged creates a lazy run whose identity comes from the caller instead of being
 // generated, and returns the handle without driving it. It is the entry point for a queue
 // worker: the identity, the thread and the run id stamped into every checkpoint this run
 // commits are the ones in spec, fixed when the handle is created.
@@ -101,5 +101,6 @@ func (a *Agent) streamManaged(ctx context.Context, rc RunConfig, spec ManagedRun
 		restoreCurrent: true,
 		turnID:         spec.TurnID,
 	}
+	run.activateLifecycle()
 	return run
 }

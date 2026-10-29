@@ -17,6 +17,7 @@ import (
 	"github.com/jiujuan/goagent/bus"
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
+	"github.com/jiujuan/goagent/internal/runobs"
 	"github.com/jiujuan/goagent/vfs"
 )
 
@@ -99,11 +100,9 @@ func (a *Agent) Bus() *bus.Bus { return a.bus }
 // finishRun notifies the run-end capability of each configured middleware, in
 // registration order. Workflow agents have no loop, so the hook walks the
 // configured middleware list rather than the loop's stack.
-func (a *Agent) finishRun(rc *RunContext, res core.Result, err error) {
-	for _, m := range a.cfg.middleware {
-		if f, ok := m.(RunFinisher); ok {
-			f.FinishRun(rc, res, err)
-		}
+func (a *Agent) finishRun(rc *RunContext, calls []runFinishCall, err error) {
+	for _, call := range calls {
+		call.hook.FinishRun(rc, call.result, err)
 	}
 }
 
@@ -177,9 +176,11 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) (strin
 	return res.Message.Text(), err
 }
 
-// Stream starts a run and returns a non-blocking *Run handle for live events
-// (Iter/Events), settlement (Wait), and control (Steer/Cancel/Decide). The loop
-// is driven lazily on first observation, so no events are missed.
+// Stream creates a lazy Run and freezes input without store or model work.
+// Start, Wait, or consuming Iter requests execution once. History is restored
+// only after admission; creation order does not promise execution order.
+// Events and Await only observe or wait. A canceled parent context settles an
+// unstarted handle after construction and resource handoff are complete.
 func (a *Agent) Stream(ctx context.Context, input string, opts ...RunOption) *Run {
 	return a.streamConfigured(ctx, resolveRunConfig(input, core.NewID("thread"), opts...))
 }
@@ -223,6 +224,7 @@ func (a *Agent) streamConfigured(ctx context.Context, rc RunConfig) *Run {
 	run.admission = rc.admission
 	run.startErr = err
 	run.preparation = &runPreparation{message: message, files: rc.Files, restoreCurrent: true}
+	run.activateLifecycle()
 	return run
 }
 
@@ -307,6 +309,7 @@ func (a *Agent) newRunHandleWithID(ctx context.Context, runID, threadID string, 
 		Topic:    topic,
 		Store:    a.store,
 		State:    state,
+		timing:   runobs.New(runCtx, runID, threadID),
 		task:     &taskRuntime{rootID: taskID, budget: normalizeTaskBudget(a.cfg.taskBudget)},
 		info:     TaskInfo{ID: taskID, ThreadID: threadID, Kind: a.taskKind()},
 		durable:  newDurableRunState(),

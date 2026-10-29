@@ -727,6 +727,10 @@ func (l *AgentLoop) streamModel(genCtx context.Context, rc *RunContext, lc *Loop
 			}
 			return nil, false, emitted, err
 		}
+		if resp == nil {
+			continue
+		}
+		rc.timing.FirstModelResponse()
 		if resp.Partial {
 			emitted = true
 			rc.publish(core.MessageDelta{Delta: resp.Message})

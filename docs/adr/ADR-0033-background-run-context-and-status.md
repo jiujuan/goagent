@@ -82,6 +82,8 @@ freezeCheckpoint/cloneCheckpoint 必须深拷贝 Completion，Result.Message 使
 
 ### D5. 等待与查询分别表达执行结果、记录结果和存储事实
 
+> **2026-10-28 替代说明：** 本节旧决定中“Wait 可能触发惰性执行”由 [ADR-0035：惰性 Run 生命周期](ADR-0035-lazy-run-lifecycle.md) D1、D4 替代：queue.Handle.Wait 改为纯 Await，只有 worker 可以启动队列运行；普通 Run.Wait 仍启动并等待。prepared 任务取消后，无 worker 的 Wait 可以返回内存取消结局，WaitRecorded 仍等 worker 的记录尝试；后续 worker 不执行模型，无本次提交边界时保留 ErrNoCommittedBoundary。新契约与验证范围见新 ADR。以下 D5 原文保留为历史决定，D1–D4 不受此次替代影响。
+
 队列提供两种等待：
 
     func (h *Handle) Wait() (core.Result, error)

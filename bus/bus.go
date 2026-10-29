@@ -11,10 +11,12 @@
 //   - Lossless: block the publisher when full, giving back-pressure (tracing /
 //     persistence sinks that must not drop).
 //
-// A stalled Lossless subscriber back-pressures the whole bus by design.
+// A stalled Lossless subscriber back-pressures its publisher. Index operations
+// and publishers on other topics remain independent.
 package bus
 
 import (
+	"context"
 	"sync"
 
 	"github.com/jiujuan/goagent/core"
@@ -34,11 +36,6 @@ const (
 )
 
 const defaultBufferSize = 64
-
-type subscriber struct {
-	ch   chan core.Event
-	mode DeliveryMode
-}
 
 // Bus is a topic-based pub/sub fan-out. The zero value is not usable; call New.
 type Bus struct {
@@ -71,29 +68,22 @@ func New(opts ...Option) *Bus {
 	return b
 }
 
-// Subscribe registers a subscriber on topic and returns its receive channel
-// plus a cancel func. cancel removes the subscriber and closes the channel; it
-// is idempotent. Publish (under RLock) and cancel (under Lock) are mutually
-// exclusive, so a send can never race a close.
+// Subscribe registers an observer. The returned idempotent cancel function
+// stops blocked sends and waits until the channel is closed. Always cancel
+// when abandoning an observer.
 func (b *Bus) Subscribe(topic Topic, mode DeliveryMode) (<-chan core.Event, func()) {
-	s := &subscriber{ch: make(chan core.Event, b.bufSize), mode: mode}
-
+	s := newSubscriber(b.bufSize, mode)
 	b.mu.Lock()
 	if b.subs[topic] == nil {
 		b.subs[topic] = map[*subscriber]struct{}{}
 	}
 	b.subs[topic][s] = struct{}{}
 	b.mu.Unlock()
-
-	var once sync.Once
-	cancel := func() {
-		once.Do(func() {
+	return s.ch, func() {
+		s.cancel(func() {
 			b.mu.Lock()
 			if set := b.subs[topic]; set != nil {
-				if _, ok := set[s]; ok {
-					delete(set, s)
-					close(s.ch)
-				}
+				delete(set, s)
 				if len(set) == 0 {
 					delete(b.subs, topic)
 				}
@@ -101,25 +91,40 @@ func (b *Bus) Subscribe(topic Topic, mode DeliveryMode) (<-chan core.Event, func
 			b.mu.Unlock()
 		})
 	}
-	return s.ch, cancel
 }
 
-// Publish fans ev out to every subscriber on topic. Call it from a single
-// goroutine per topic to preserve ordering.
+// Publish sends with a background context. Use PublishContext for cancellable
+// back-pressure. Publish calls must be serialized per topic to preserve order.
 func (b *Bus) Publish(topic Topic, ev core.Event) {
+	_ = b.PublishContext(context.Background(), topic, ev)
+}
+
+// PublishContext fans ev out without holding the topic index lock while sending.
+// Cancellation can occur after delivery to some subscribers; retrying may
+// duplicate events. An already canceled context permits only immediately ready
+// sends and still returns its error. A canceled subscription is skipped.
+func (b *Bus) PublishContext(ctx context.Context, topic Topic, ev core.Event) error {
+	startErr := ctx.Err()
 	b.mu.RLock()
-	defer b.mu.RUnlock()
+	subs := make([]*subscriber, 0, len(b.subs[topic]))
 	for s := range b.subs[topic] {
-		switch s.mode {
-		case Lossy:
-			select {
-			case s.ch <- ev:
-			default: // buffer full: drop
-			}
-		default: // Lossless: block for back-pressure
-			s.ch <- ev
+		subs = append(subs, s)
+	}
+	b.mu.RUnlock()
+	// Preserve immediately deliverable cancellation diagnostics, while a canceled
+	// publisher never waits for buffer space. Delivery remains best effort.
+	if startErr != nil {
+		for _, s := range subs {
+			s.trySend(ev)
+		}
+		return startErr
+	}
+	for _, s := range subs {
+		if err := s.send(ctx, ev); err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
 // Subscribers reports the live subscriber count on topic.
@@ -127,4 +132,19 @@ func (b *Bus) Subscribers(topic Topic) int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return len(b.subs[topic])
+}
+
+// FinishTopic detaches current subscribers and schedules their ordered terminal
+// tail after in-flight normal sends exit. It never waits for observers. Tail
+// payloads must be normalized core values (as produced by Run settlement).
+// Subscribers must drain the channel or cancel. Later generic subscriptions
+// are new subscriptions: Bus retains no terminal history.
+func (b *Bus) FinishTopic(topic Topic, tail ...core.Event) {
+	b.mu.Lock()
+	subs := b.subs[topic]
+	delete(b.subs, topic)
+	b.mu.Unlock()
+	for s := range subs {
+		s.seal(cloneTerminalTail(tail))
+	}
 }

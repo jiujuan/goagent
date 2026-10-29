@@ -18,13 +18,15 @@ type runIdentity struct {
 	threadID string
 }
 
-// Run is a non-blocking handle to one in-flight (or paused) run. The loop is
-// driven lazily on first observation, so subscribing via Iter/Events before
-// driving means no events are missed.
+// Run is a lazy execution handle with independent execution, waiting and
+// observation. Stream freezes its input when creating the handle; execution
+// restores history only after admission. Start, Wait or consuming Iter starts
+// execution once. Events and Await never start it.
 //
-// Stream with Iter() (which also records the terminal result for Wait), or call
-// Wait() for just the result. On an Interrupted (HITL) pause, record decisions
-// with Decide(...) then call Resume(ctx) to continue.
+// Results are frozen by the settlement owner. Wait/Await do not wait for event
+// observers to drain their terminal tails. A paused run returns a zero Result
+// and nil error; inspect Paused or DetailedResult after settlement, then record
+// decisions and Resume to continue.
 type Run struct {
 	// ID and ThreadID are the run's identifiers as created. They are exported and
 	// therefore writable by any caller holding the handle, so nothing internal reads
@@ -52,18 +54,21 @@ type Run struct {
 	// was created; prepare reads it before touching the thread.
 	admission AdmissionOptions
 
-	startOnce sync.Once
-	doneOnce  sync.Once
-	done      chan struct{}
-	result    core.Result
-	err       error
+	done chan struct{}
 
 	mu        sync.Mutex
 	decisions []Approval
 
-	lifecycleMu  sync.Mutex
-	driveStarted bool
-	cancelErr    error
+	observationMu sync.Mutex
+	eventsSealed  bool
+	eventTail     []core.Event
+
+	lifecycleMu        sync.Mutex
+	phase              runPhase
+	cancelErr          error // cancellation registered before the Settling cutoff
+	preparedSettlement bool
+	activated          bool
+	stopParent         func() bool
 	// gateRelease frees the thread slot this run holds. It is nil until
 	// prepare acquires the slot (or a resume hands one over); lifecycleMu
 	// guards it.
@@ -97,16 +102,16 @@ type Run struct {
 	recordedSet bool
 }
 
-// Iter streams the run's events as a pull iterator. The run starts on first
-// iteration (after subscribing), so no events are missed. It records the
-// terminal result/error for Wait().
+// Iter subscribes before starting execution when consumed. Returning false
+// from yield (including a range break) unsubscribes. Late consumption after
+// settlement returns only the finite terminal tail, without replaying progress
+// or executing again. Observation never decides the run's outcome.
 func (r *Run) Iter() iter.Seq2[core.Event, error] {
 	return func(yield func(core.Event, error) bool) {
-		ch, cancel := r.bus.Subscribe(r.topic, bus.Lossless)
+		ch, cancel := r.subscribeRun(bus.Lossless)
 		defer cancel()
-		r.drive()
+		r.Start()
 		for ev, err := range bus.Adapt(ch) {
-			r.capture(ev)
 			if !yield(ev, err) {
 				return
 			}
@@ -114,37 +119,57 @@ func (r *Run) Iter() iter.Seq2[core.Event, error] {
 	}
 }
 
-// Events returns a raw subscription channel and cancel func for a chosen
-// DeliveryMode (e.g. Lossy for a UI). Call Iter or Wait to begin driving.
+// Events subscribes without starting execution. Register before Start when
+// initial events matter. The channel closes after its reliable terminal tail;
+// a settled run returns only that finite tail, with no progress replay.
+// Always defer the returned unsubscribe function when leaving early: a stalled
+// observer can retain its terminal finisher. Ordinary Lossless progress still
+// back-pressures execution; Wait/Await do not mean the observer has drained.
 func (r *Run) Events(mode bus.DeliveryMode) (<-chan core.Event, func()) {
-	return r.bus.Subscribe(r.topic, mode)
+	return r.subscribeRun(mode)
 }
 
-// Wait blocks until the run settles and returns its result or error. It drives
-// and drains the run itself if no Iter consumer is active.
-func (r *Run) Wait() (core.Result, error) {
+// Start requests execution once and returns without waiting for it. It does
+// not subscribe; register Events first when the initial events matter.
+func (r *Run) Start() {
+	r.lifecycleMu.Lock()
+	if r.phase != runPrepared {
+		r.lifecycleMu.Unlock()
+		return
+	}
+	r.phase = runStarting
+	r.lifecycleMu.Unlock()
+	r.rc.timing.StartRequested()
+	go r.execute()
+}
+
+// Await waits for settlement without starting or canceling the run. Canceling
+// waitCtx only stops this waiter. A settled result takes precedence when both
+// settlement and waitCtx are ready. Every caller receives an independent copy.
+func (r *Run) Await(waitCtx context.Context) (core.Result, error) {
 	select {
 	case <-r.done:
-		return r.result, r.err
+		return r.settledCopy()
 	default:
 	}
-	ch, cancel := r.bus.Subscribe(r.topic, bus.Lossless)
-	defer cancel()
-	r.drive()
-	for {
+	select {
+	case <-r.done:
+		return r.settledCopy()
+	case <-waitCtx.Done():
 		select {
 		case <-r.done:
-			return r.result, r.err
-		case ev, ok := <-ch:
-			if !ok {
-				<-r.done
-				return r.result, r.err
-			}
-			if r.capture(ev) {
-				return r.result, r.err
-			}
+			return r.settledCopy()
+		default:
+			return core.Result{}, waitCtx.Err()
 		}
 	}
+}
+
+// Wait starts the run if necessary, then waits for settlement. It creates no
+// observation subscription and does not wait for observers to drain the tail.
+func (r *Run) Wait() (core.Result, error) {
+	r.Start()
+	return r.Await(context.Background())
 }
 
 // Steer injects a message to be delivered before the next model call. The
@@ -163,25 +188,6 @@ func (r *Run) SteerWith(msg core.Message, opts SteerOptions) (*SteerTicket, erro
 // depth are fixed when the handle is created; the turn id is filled once
 // prepare resolves it, so it may be empty before the run is driven.
 func (r *Run) Task() TaskInfo { return r.rc.taskInfo() }
-
-// Cancel aborts the run. A Resume owns a durable claim before lazy execution
-// starts, so canceling that prepared handle releases the claim synchronously.
-// The steering queue closes in the same call, so a message that will never be
-// delivered settles as stopped instead of waiting for the run to wind down.
-func (r *Run) Cancel() {
-	r.lifecycleMu.Lock()
-	r.cancel()
-	r.rc.steering.close(ErrRunStopped)
-	undriven := !r.driveStarted
-	if undriven {
-		r.cancelErr = errors.Join(r.cancelErr, r.rc.releaseDurableClaim())
-	}
-	r.lifecycleMu.Unlock()
-	if undriven {
-		// A prepared resume may hold the thread slot before its first drive.
-		r.releaseAdmission()
-	}
-}
 
 // Paused reports whether this run ended by pausing for a human decision instead
 // of finishing. It reads the outcome drive() froze, not the store: while the run
@@ -205,166 +211,33 @@ func (r *Run) FrozenOutcome() (core.Result, error) {
 	if !r.terminalFrozen {
 		return core.Result{}, nil
 	}
-	out := r.terminalResult
-	if cloned, err := core.CloneMessage(r.terminalResult.Message); err == nil {
-		out = core.Result{Message: cloned}
+	out, err := cloneResult(r.terminalResult)
+	if err != nil {
+		return core.Result{}, errors.Join(r.terminalErr, err)
 	}
 	return out, r.terminalErr
 }
 
-// freezeTerminal records how this run ended together with the boundary it last
-// committed and the identity that produced it. drive() calls it before publishing
-// any lifecycle event, so an observer that sees the terminal result always finds a
-// complete record, and the stored result is a deep copy — a caller editing what
-// Wait returned cannot reach it. The thread, run and turn identifiers are copied
-// here rather than read back from the exported Run fields later, so rewriting those
-// fields cannot reattribute a finished run.
-func (r *Run) freezeTerminal(boundaryID string, boundaryRev uint64, boundaryOK bool, res core.Result, err error, paused bool) {
-	frozen := res
-	if cloned, cloneErr := core.CloneMessage(res.Message); cloneErr == nil {
-		frozen = core.Result{Message: cloned}
-	}
-	// Read the turn before taking terminalMu so the lineage mutex is never nested
-	// under it.
-	turnID := r.rc.runTurnID()
+// drive remains an internal alias for fixtures and legacy package helpers.
+func (r *Run) drive() { r.Start() }
 
-	r.terminalMu.Lock()
-	defer r.terminalMu.Unlock()
-	if r.terminalFrozen {
+func (r *Run) execute() {
+	r.rc.publish(core.RunStarted{RunID: r.identity.runID, ThreadID: r.identity.threadID})
+	if r.startErr != nil {
+		r.settleExecution(runOutcome{Err: r.startErr}, false, false)
 		return
 	}
-	r.terminalFrozen = true
-	r.terminalPaused = paused
-	r.terminalResult = frozen
-	r.terminalErr = err
-	r.terminalThreadID = r.identity.threadID
-	r.terminalRunID = r.identity.runID
-	r.terminalTurnID = turnID
-	r.boundaryID, r.boundaryRev, r.boundaryOK = boundaryID, boundaryRev, boundaryOK
-}
-
-// freezeFailure records a run that ended without executing (or before it could
-// commit anything), so its boundary is whatever the run did commit by that point.
-func (r *Run) freezeFailure(err error) {
-	id, revision, ok := r.rc.committedBoundary()
-	r.freezeTerminal(id, revision, ok, core.Result{}, err, false)
-}
-
-// drive launches the run exactly once. It owns the lifecycle events: RunStarted
-// before, and the single terminal event (RunDone/RunFailed/Interrupted) derived
-// from the runnable's outcome. Runnables (including nested workflow children)
-// never publish lifecycle, so the shared topic carries exactly one of each.
-func (r *Run) drive() {
-	r.startOnce.Do(func() {
-		r.lifecycleMu.Lock()
-		r.driveStarted = true
-		r.lifecycleMu.Unlock()
-		go func() {
-			defer r.releaseAdmission()
-			r.bus.Publish(r.topic, core.RunStarted{RunID: r.identity.runID, ThreadID: r.identity.threadID})
-			if r.startErr != nil {
-				r.rc.steering.close(ErrRunClosed)
-				err := errors.Join(r.startErr, r.rc.releaseDurableClaim())
-				r.freezeFailure(err)
-				r.bus.Publish(r.topic, core.RunFailed{Err: err})
-				r.finish(core.Result{}, err)
-				return
-			}
-			if err := r.prepare(); err != nil {
-				r.rc.steering.close(ErrRunClosed)
-				r.lifecycleMu.Lock()
-				cancelErr := r.cancelErr
-				r.lifecycleMu.Unlock()
-				err = errors.Join(err, cancelErr, r.rc.releaseDurableClaim())
-				r.freezeFailure(err)
-				r.bus.Publish(r.topic, core.RunFailed{Err: err})
-				r.finish(core.Result{}, err)
-				return
-			}
-			task := r.rc.taskInfo()
-			r.bus.Publish(r.topic, core.TaskStarted{
-				TaskID:   task.ID,
-				ParentID: task.ParentID,
-				ThreadID: task.ThreadID,
-				Kind:     string(task.Kind),
-				Depth:    task.Depth,
-			})
-			for _, ev := range r.rc.drainApprovalEvents() {
-				r.bus.Publish(r.topic, ev)
-			}
-			out := r.runnable.run(r.rc)
-			r.rc.steering.close(out.inputCloseReason())
-			// The boundary is captured while the claim is still held, and the
-			// outcome is frozen with it before any terminal event goes out.
-			boundaryID, boundaryRev, boundaryOK := r.rc.committedBoundary()
-			cleanupErr := r.rc.releaseDurableClaim()
-			// Release the thread only after the claim, so the next admitted
-			// run begins on a settled thread rather than colliding with a
-			// claim this one still holds.
-			r.releaseAdmission()
-			res, err, paused := terminalOutcome(out, cleanupErr)
-			r.freezeTerminal(boundaryID, boundaryRev, boundaryOK, res, err, paused)
-
-			// TaskDone reports the terminal outcome, including a failed claim
-			// release, but is still published before the run's terminal event.
-			statusOut := out
-			if err != nil {
-				statusOut.Err = err
-			}
-			if paused {
-				statusOut.Control = core.Directive{Kind: core.Interrupt}
-			}
-			r.bus.Publish(r.topic, core.TaskDone{
-				TaskID: task.ID,
-				Kind:   string(task.Kind),
-				Status: taskStatus(statusOut),
-				Err:    err,
-			})
-
-			switch {
-			case err != nil:
-				r.agent.finishRun(r.rc, core.Result{}, err)
-				r.bus.Publish(r.topic, core.RunFailed{Err: err})
-				r.finish(core.Result{}, err)
-			case paused:
-				// Paused, not finished: run-end hooks wait for the eventual
-				// completion (or failure) after a resume.
-				r.bus.Publish(r.topic, core.Interrupted{
-					Pending:  out.Pending,
-					Phase:    out.Phase,
-					Reason:   out.Reason,
-					Recovery: out.Recovery,
-				})
-				r.finish(core.Result{}, nil)
-			default:
-				r.agent.finishRun(r.rc, out.Result, nil)
-				r.bus.Publish(r.topic, core.RunDone{Result: out.Result})
-				r.finish(out.Result, nil)
-			}
-		}()
-	})
-}
-
-// capture records a terminal event and reports whether it was terminal.
-func (r *Run) capture(ev core.Event) bool {
-	switch e := ev.(type) {
-	case core.RunDone:
-		r.finish(e.Result, nil)
-		return true
-	case core.RunFailed:
-		r.finish(core.Result{}, e.Err)
-		return true
-	case core.Interrupted:
-		r.finish(core.Result{}, nil)
-		return true
-	default:
-		return false
+	if err := r.prepare(); err != nil {
+		r.settleExecution(runOutcome{Err: err}, false, false)
+		return
 	}
-}
-
-func (r *Run) finish(res core.Result, err error) {
-	r.doneOnce.Do(func() {
-		r.result, r.err = res, err
-		close(r.done)
-	})
+	r.lifecycleMu.Lock()
+	r.phase = runRunning
+	r.lifecycleMu.Unlock()
+	task := r.rc.taskInfo()
+	r.rc.publish(core.TaskStarted{TaskID: task.ID, ParentID: task.ParentID, ThreadID: task.ThreadID, Kind: string(task.Kind), Depth: task.Depth})
+	for _, ev := range r.rc.drainApprovalEvents() {
+		r.rc.publish(ev)
+	}
+	r.settleExecution(r.runnable.run(r.rc), true, true)
 }

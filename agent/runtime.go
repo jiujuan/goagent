@@ -7,6 +7,7 @@ import (
 	"github.com/jiujuan/goagent/bus"
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
+	"github.com/jiujuan/goagent/internal/runobs"
 	"github.com/jiujuan/goagent/tool"
 )
 
@@ -27,6 +28,7 @@ type RunContext struct {
 	Store    checkpoint.Checkpointer
 	State    *core.State
 	branch   string // set for a parallel sub-branch (isolation label)
+	timing   *runobs.Recorder
 
 	// task is the budget runtime shared by the whole task tree; info is this
 	// environment's identity within it. taskMu guards both because the root
@@ -106,6 +108,7 @@ func (rc *RunContext) deeper() *RunContext {
 		info:          info,
 		transferDepth: rc.transferDepth + 1,
 		durable:       rc.durable,
+		timing:        rc.timing,
 		preemptedStep: -1,
 	}
 }
@@ -142,6 +145,7 @@ func (rc *RunContext) subRunWithContext(ctx context.Context, input core.Message,
 		task:          task,
 		info:          child,
 		durable:       rc.durable,
+		timing:        rc.timing,
 		preemptedStep: -1,
 	}, nil
 }
@@ -180,6 +184,7 @@ func (rc *RunContext) forBranchWithContext(ctx context.Context, branch string, k
 		task:          task,
 		info:          child,
 		durable:       rc.durable,
+		timing:        rc.timing,
 		preemptedStep: -1,
 	}, nil
 }
@@ -267,7 +272,9 @@ func (rc *RunContext) requestPreemption(reason string) bool {
 }
 
 // publish is the loop's single-goroutine event sink.
-func (rc *RunContext) publish(ev core.Event) { rc.Bus.Publish(rc.Topic, ev) }
+func (rc *RunContext) publish(ev core.Event) {
+	_ = rc.Bus.PublishContext(rc.Context, rc.Topic, ev)
+}
 
 // dynamicTools is a goroutine-safe name-to-tool table of run-scoped tools. The loop
 // writes it while preparing a step and reads it from the tool goroutines, so both

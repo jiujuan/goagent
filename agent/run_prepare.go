@@ -31,11 +31,6 @@ func (r *Run) prepare() (err error) {
 	if err = r.acquireAdmission(); err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil {
-			r.releaseAdmission()
-		}
-	}()
 	if r.preparation == nil {
 		return nil
 	}

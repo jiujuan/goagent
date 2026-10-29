@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
@@ -155,7 +156,7 @@ func TestResumeInFlightRejectsConflictingHead(t *testing.T) {
 		Pause:    &checkpoint.Pause{Phase: "before_tool", Recovery: checkpoint.RecoveryResumeTools},
 		Snapshot: internalInFlightSnapshot(0, internalRecTool("rec")),
 	}
-	_, err = a.resumeInFlight(context.Background(), cp, nil, func() {})
+	_, err = a.resumeInFlight(context.Background(), cp, nil, func() {}, time.Time{})
 	if !errors.Is(err, ErrInFlightUnrecoverable) {
 		t.Fatalf("resumeInFlight with a conflicting head = %v, want ErrInFlightUnrecoverable", err)
 	}

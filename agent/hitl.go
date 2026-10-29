@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jiujuan/goagent/checkpoint"
 	"github.com/jiujuan/goagent/core"
@@ -89,6 +91,7 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 	if err != nil {
 		return nil, err
 	}
+	admittedAt := time.Now()
 	// Every error path below drops the slot; it is handed to the returned run
 	// only once one exists, and that run releases it when driven or canceled.
 	handedOff := false
@@ -107,7 +110,7 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 	if cp.InFlight != nil {
 		// resumeInFlight owns the slot from here and attaches it to the run.
 		handedOff = true
-		return a.resumeInFlight(ctx, cp, approvals, releaseGate)
+		return a.resumeInFlight(ctx, cp, approvals, releaseGate, admittedAt)
 	}
 	if err := validatePause(cp); err != nil {
 		return nil, err
@@ -120,6 +123,14 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		claim            *checkpoint.Claim
 		durableDecisions []core.ApprovalDecision
 	)
+	release := func() error {
+		if claim == nil {
+			return nil
+		}
+		cleanupCtx, cancel := newRunCleanupContext(ctx)
+		defer cancel()
+		return durable.ReleaseClaim(cleanupCtx, *claim)
+	}
 	if store, ok := a.store.(checkpoint.Durable); ok {
 		durable = store
 		claimed, err := durable.Claim(ctx, checkpoint.ClaimRequest{
@@ -135,30 +146,20 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		claim = &claimed
 		durableDecisions, err = durable.Decisions(ctx, threadID, claimed.PauseID)
 		if err != nil {
-			_ = durable.ReleaseClaim(context.Background(), claimed)
-			return nil, err
+			return nil, errors.Join(err, release())
 		}
 	}
 	durableApprovals, err := approvalsFromDurable(cp, durableDecisions)
 	if err != nil {
-		if claim != nil {
-			_ = durable.ReleaseClaim(context.Background(), *claim)
-		}
-		return nil, err
+		return nil, errors.Join(err, release())
 	}
 	allApprovals := append(durableApprovals, approvals...)
 	state, err := cloneState(cp.State)
 	if err != nil {
-		if claim != nil {
-			_ = durable.ReleaseClaim(context.Background(), *claim)
-		}
-		return nil, err
+		return nil, errors.Join(err, release())
 	}
 	if err := applyFileSnapshot(&state, cp.FileSnapshot); err != nil {
-		if claim != nil {
-			_ = durable.ReleaseClaim(context.Background(), *claim)
-		}
-		return nil, err
+		return nil, errors.Join(err, release())
 	}
 	if state.Files == nil {
 		state.Files = vfs.NewInState()
@@ -187,6 +188,7 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		state.KV[approvalsKey] = merged
 	}
 	run := a.newRunHandle(ctx, threadID, &state)
+	run.rc.timing.Admitted(admittedAt)
 	run.setGateRelease(releaseGate)
 	handedOff = true
 	run.rc.setDurableClaim(claim)
@@ -215,6 +217,7 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 		if a.cfg.stepSnapshotPolicy != StepSnapshotOff && cp.Snapshot != nil {
 			run.rc.replayBaseline = cloneStepSnapshot(cp.Snapshot)
 		}
+		run.activateLifecycle()
 		return run, nil
 	}
 	if a.loop == nil {
@@ -226,11 +229,13 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 			parts = append(parts, errResult(c, "not executed: the thread was resumed by a workflow agent, which has no tool table of its own"))
 		}
 		run.rc.State.Messages = append(run.rc.State.Messages, core.Message{Role: core.RoleTool, Parts: parts})
+		run.activateLifecycle()
 		return run, nil
 	}
 	batch := newResumeBatch(cp.Pending.Step, cp.Pending.Pending, allApprovals, lastAssistant(state.Messages))
 	batch.snapshot = cloneStepSnapshot(cp.Snapshot)
 	run.rc.resumed = batch
+	run.activateLifecycle()
 	return run, nil
 }
 
@@ -243,7 +248,7 @@ func (a *Agent) Resume(ctx context.Context, threadID string, approvals ...Approv
 // The caller hands in the thread slot it acquired before reading the head; this
 // function owns it from here, releases it on every error path, and attaches it
 // to the returned run.
-func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, approvals []Approval, releaseGate func()) (*Run, error) {
+func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, approvals []Approval, releaseGate func(), admittedAt time.Time) (*Run, error) {
 	if cp.Pending != nil || cp.Pause != nil || cp.Completion != nil {
 		releaseGate()
 		return nil, fmt.Errorf("%w: checkpoint %s carries work state that conflicts with an in-flight batch", ErrInFlightUnrecoverable, cp.ID)
@@ -270,15 +275,19 @@ func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, a
 		return nil, err
 	}
 	claim := &claimed
-	release := func() { _ = durable.ReleaseClaim(context.Background(), *claim) }
+	release := func() error {
+		cleanupCtx, cancel := newRunCleanupContext(ctx)
+		defer cancel()
+		return durable.ReleaseClaim(cleanupCtx, *claim)
+	}
 	state, err := cloneState(cp.State)
 	if err != nil {
-		release()
+		err = errors.Join(err, release())
 		releaseGate()
 		return nil, err
 	}
 	if err := applyFileSnapshot(&state, cp.FileSnapshot); err != nil {
-		release()
+		err = errors.Join(err, release())
 		releaseGate()
 		return nil, err
 	}
@@ -289,12 +298,13 @@ func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, a
 	// issued it is matched there rather than in the preflight copy.
 	final, err := matchInFlightMessage(state.Messages, batch.calls)
 	if err != nil {
-		release()
+		err = errors.Join(err, release())
 		releaseGate()
 		return nil, err
 	}
 	batch.final = final
 	run := a.newRunHandle(ctx, cp.ThreadID, &state)
+	run.rc.timing.Admitted(admittedAt)
 	run.setGateRelease(releaseGate)
 	run.rc.setDurableClaim(claim)
 	run.rc.continuedTurn = true
@@ -305,6 +315,7 @@ func (a *Agent) resumeInFlight(ctx context.Context, cp *checkpoint.Checkpoint, a
 		claim:        copyClaim(claim),
 		headRevision: cp.Revision,
 	}
+	run.activateLifecycle()
 	return run, nil
 }
 
